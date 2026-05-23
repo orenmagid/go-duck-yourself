@@ -1,0 +1,2012 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Go Duck Yourself</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #1a1a2e;
+    font-family: 'Comic Sans MS', 'Trebuchet MS', sans-serif;
+    color: #fff;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  #wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+  }
+  #game {
+    background: #87CEEB;
+    border: 6px solid #FFD700;
+    border-radius: 12px;
+    box-shadow: 0 0 40px rgba(255, 215, 0, 0.4);
+    cursor: pointer;
+    max-width: 100vw;
+    max-height: 100vh;
+    touch-action: none;
+  }
+  #photo {
+    display: none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="800" height="600"></canvas>
+</div>
+<input type="file" id="photo" accept="image/*">
+
+<script>
+const W = 800, H = 600;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const photoInput = document.getElementById('photo');
+
+// --- Game state ---
+const STATES = {
+  TITLE: 'TITLE',
+  SCAN: 'SCAN',
+  DUCKIFYING: 'DUCKIFYING',
+  DUCKTOPIA: 'DUCKTOPIA',
+  ADVERT: 'ADVERT',
+  LEVEL_END: 'LEVEL_END',
+  DUCK_OFF_INTRO: 'DUCK_OFF_INTRO',
+  DUCK_OFF_ROLL: 'DUCK_OFF_ROLL',
+  WIN: 'WIN',
+  LOSE: 'LOSE',
+  HELP: 'HELP',
+};
+let state = STATES.TITLE;
+
+// --- Help walkthrough state ---
+let helpPage = 0;
+let helpReturnTo = null;  // STATES.TITLE or STATES.LEVEL_END, set when entering HELP
+const HELP_PAGES = [
+  {
+    title: 'THE MISSION',
+    lines: [
+      "You are a duck infiltrator deep in Ducktopia.",
+      "Build the biggest duck collection you can.",
+      "Then face the goose, Mr. Man Mas Mr. Mas Diva Mr. Man Mas Diva,",
+      "in a Duck Off.",
+    ],
+    visual: (cx, cy) => {
+      drawDuck(cx - 80, cy, 1.3, performance.now() / 250, player && player.faceImg);
+      drawText('vs.', cx, cy + 8, 24, '#FFD700');
+      drawGoose(cx + 80, cy - 10, 1.1, performance.now() / 230, { diva: true });
+    },
+  },
+  {
+    title: 'MOVING + SEARCHING',
+    lines: [
+      "Desktop: arrow keys or WASD.",
+      "iPad: drag your finger to summon a joystick.",
+      "Walk into bushes and rocks. Most hide a duck.",
+      "A few are empty. One is an ad. (sorry.)",
+    ],
+    visual: (cx, cy) => {
+      drawDuck(cx - 40, cy, 1.0, performance.now() / 250, null);
+      // a tiny bush
+      ctx.save();
+      ctx.translate(cx + 40, cy + 8);
+      ctx.fillStyle = '#2d8a3e';
+      ctx.beginPath();
+      ctx.arc(-10, 0, 14, 0, Math.PI * 2);
+      ctx.arc(10, 0, 14, 0, Math.PI * 2);
+      ctx.arc(0, -10, 16, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#1a5028';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+    },
+  },
+  {
+    title: 'RIVALS',
+    lines: [
+      "The goose has minions: red-eyed ducks",
+      "in bandanas. Anything they find",
+      "goes to the goose's hoard.",
+      "Sometimes they get to ad rocks first — bless them.",
+    ],
+    visual: (cx, cy) => {
+      drawDuck(cx, cy, 1.3, performance.now() / 230, null, { evil: true, bandana: '#c0392b' });
+    },
+  },
+  {
+    title: 'DUCKLINGS',
+    lines: [
+      "Sometimes a bush or rock hides a DUCKLING.",
+      "When you have one, press SPACE (or tap) to throw.",
+      "Lands as a worker — finds ducks for you.",
+      "Throw it at a rival to defeat them.",
+    ],
+    visual: (cx, cy) => {
+      drawDuckling(cx, cy, 1.4);
+    },
+  },
+  {
+    title: 'DUCKLINGS ARE FOREVER',
+    lines: [
+      "Every duckling you find is yours for keeps.",
+      "At level's end, they return to your pocket.",
+      "Throw them again on the next level. And the next.",
+      "Build an army.",
+    ],
+    visual: (cx, cy) => {
+      // a row of 4 ducklings
+      for (let i = 0; i < 4; i++) drawDuckling(cx - 60 + i * 40, cy, 0.9);
+    },
+  },
+  {
+    title: 'THE DUCK OFF',
+    lines: [
+      "When you've had your fill, hit ENTER DUCK OFF.",
+      "The goose's collection is hidden — only a vibe gives a hint.",
+      "More ducks = better odds. Trust the vibe.",
+      "Or chicken out and keep collecting. Up to you.",
+    ],
+    visual: (cx, cy) => {
+      drawGoose(cx, cy, 1.2, performance.now() / 230, { diva: true });
+    },
+  },
+];
+
+// Player
+const player = {
+  x: W / 2,
+  y: H / 2,
+  r: 28,
+  speed: 3.2,
+  faceImg: null,  // HTMLCanvasElement of cropped circular face
+};
+
+// --- Audio (Web Audio API, synthesized — no assets) ---
+let audioCtx = null;
+function ensureAudio() {
+  if (audioCtx === false) return null;
+  if (!audioCtx) {
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) {
+      audioCtx = false;
+      return null;
+    }
+  }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+  return audioCtx;
+}
+
+function playQuack(pitch = 1, vol = 0.3) {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  osc.type = 'sawtooth';
+  const baseF = 350 * pitch;
+  osc.frequency.setValueAtTime(baseF, t);
+  osc.frequency.linearRampToValueAtTime(baseF * 0.4, t + 0.12);
+  gain.gain.setValueAtTime(vol, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+  osc.connect(gain).connect(ac.destination);
+  osc.start(t);
+  osc.stop(t + 0.2);
+}
+
+function playWhoosh() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const bufferSize = ac.sampleRate * 0.3;
+  const buffer = ac.createBuffer(1, bufferSize, ac.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+  const src = ac.createBufferSource();
+  src.buffer = buffer;
+  const filter = ac.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.setValueAtTime(500, t);
+  filter.frequency.linearRampToValueAtTime(2000, t + 0.3);
+  const gain = ac.createGain();
+  gain.gain.setValueAtTime(0.25, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+  src.connect(filter).connect(gain).connect(ac.destination);
+  src.start(t);
+}
+
+function playSplat() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(180, t);
+  osc.frequency.exponentialRampToValueAtTime(60, t + 0.15);
+  gain.gain.setValueAtTime(0.5, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+  osc.connect(gain).connect(ac.destination);
+  osc.start(t);
+  osc.stop(t + 0.25);
+  // noise overlay
+  const bufferSize = ac.sampleRate * 0.1;
+  const buffer = ac.createBuffer(1, bufferSize, ac.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1);
+  const src = ac.createBufferSource();
+  src.buffer = buffer;
+  const nf = ac.createBiquadFilter();
+  nf.type = 'lowpass';
+  nf.frequency.value = 800;
+  const ngain = ac.createGain();
+  ngain.gain.setValueAtTime(0.4, t);
+  ngain.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+  src.connect(nf).connect(ngain).connect(ac.destination);
+  src.start(t);
+}
+
+function playBushRustle() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const bufferSize = ac.sampleRate * 0.25;
+  const buffer = ac.createBuffer(1, bufferSize, ac.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * 0.5;
+  const src = ac.createBufferSource();
+  src.buffer = buffer;
+  const filter = ac.createBiquadFilter();
+  filter.type = 'highpass';
+  filter.frequency.value = 2000;
+  const gain = ac.createGain();
+  gain.gain.setValueAtTime(0.18, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+  src.connect(filter).connect(gain).connect(ac.destination);
+  src.start(t);
+}
+
+function playRockKnock() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(160, t);
+  osc.frequency.exponentialRampToValueAtTime(80, t + 0.1);
+  gain.gain.setValueAtTime(0.35, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+  osc.connect(gain).connect(ac.destination);
+  osc.start(t);
+  osc.stop(t + 0.15);
+}
+
+function playTwinkle() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const notes = [660, 880, 1100, 1320];
+  for (let i = 0; i < notes.length; i++) {
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = notes[i];
+    const tt = t + i * 0.08;
+    gain.gain.setValueAtTime(0.22, tt);
+    gain.gain.exponentialRampToValueAtTime(0.001, tt + 0.15);
+    osc.connect(gain).connect(ac.destination);
+    osc.start(tt);
+    osc.stop(tt + 0.16);
+  }
+}
+
+function playAdStinger() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  osc.type = 'square';
+  osc.frequency.setValueAtTime(440, t);
+  osc.frequency.setValueAtTime(660, t + 0.1);
+  osc.frequency.setValueAtTime(880, t + 0.2);
+  gain.gain.setValueAtTime(0.18, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+  osc.connect(gain).connect(ac.destination);
+  osc.start(t);
+  osc.stop(t + 0.32);
+}
+
+function playFanfare() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const notes = [
+    { f: 392, start: 0,    dur: 0.15 },
+    { f: 392, start: 0.15, dur: 0.15 },
+    { f: 523, start: 0.30, dur: 0.45 },
+  ];
+  for (const n of notes) {
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = n.f;
+    const tt = t + n.start;
+    gain.gain.setValueAtTime(0.28, tt);
+    gain.gain.exponentialRampToValueAtTime(0.001, tt + n.dur);
+    osc.connect(gain).connect(ac.destination);
+    osc.start(tt);
+    osc.stop(tt + n.dur + 0.02);
+  }
+}
+
+function playDrumroll() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  for (let i = 0; i < 20; i++) {
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = 100;
+    const tt = t + i * 0.08;
+    gain.gain.setValueAtTime(0.15, tt);
+    gain.gain.exponentialRampToValueAtTime(0.001, tt + 0.06);
+    osc.connect(gain).connect(ac.destination);
+    osc.start(tt);
+    osc.stop(tt + 0.08);
+  }
+}
+
+function playWinCheer() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const notes = [523, 659, 783, 1046];
+  for (let i = 0; i < notes.length; i++) {
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = notes[i];
+    const tt = t + i * 0.1;
+    gain.gain.setValueAtTime(0.28, tt);
+    gain.gain.exponentialRampToValueAtTime(0.001, tt + 0.3);
+    osc.connect(gain).connect(ac.destination);
+    osc.start(tt);
+    osc.stop(tt + 0.32);
+  }
+  // celebratory quacks
+  setTimeout(() => playQuack(1.1), 500);
+  setTimeout(() => playQuack(0.8), 700);
+  setTimeout(() => playQuack(1.2), 900);
+}
+
+function playSadTrombone() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const notes = [440, 392, 349, 311];
+  for (let i = 0; i < notes.length; i++) {
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.value = notes[i];
+    const tt = t + i * 0.2;
+    const dur = (i === 3) ? 0.6 : 0.2;
+    gain.gain.setValueAtTime(0.22, tt);
+    gain.gain.exponentialRampToValueAtTime(0.001, tt + dur);
+    osc.connect(gain).connect(ac.destination);
+    osc.start(tt);
+    osc.stop(tt + dur + 0.02);
+  }
+}
+
+function playStep() {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime;
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(80 + Math.random() * 30, t);
+  gain.gain.setValueAtTime(0.04, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+  osc.connect(gain).connect(ac.destination);
+  osc.start(t);
+  osc.stop(t + 0.05);
+}
+
+let stepCounter = 0;
+let prevState = null;
+let lastChaosQuack = 0;
+function maybeChaosQuack() {
+  const now = performance.now();
+  if (now - lastChaosQuack > 200 + Math.random() * 400) {
+    playQuack(0.6 + Math.random() * 1.0, 0.25);
+    lastChaosQuack = now;
+  }
+}
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => { ensureAudio(); keys[e.key.toLowerCase()] = true; });
+window.addEventListener('keyup',   e => { keys[e.key.toLowerCase()] = false; });
+
+// Mouse
+let mouse = { x: 0, y: 0, down: false, clicked: false, clickConsumed: false };
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - rect.left) * (canvas.width / rect.width);
+  mouse.y = (e.clientY - rect.top)  * (canvas.height / rect.height);
+});
+canvas.addEventListener('mousedown', () => { ensureAudio(); mouse.down = true; mouse.clicked = true; });
+canvas.addEventListener('mouseup',   () => { mouse.down = false; });
+
+// Touch (iPad / mobile) — translates the first touch into the mouse model
+let touchState = { active: false, startX: 0, startY: 0, currentX: 0, currentY: 0 };
+
+function touchPos(t) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (t.clientX - rect.left) * (canvas.width / rect.width),
+    y: (t.clientY - rect.top)  * (canvas.height / rect.height),
+  };
+}
+
+canvas.addEventListener('touchstart', e => {
+  ensureAudio();
+  e.preventDefault();
+  if (e.touches.length > 1) return;
+  const pos = touchPos(e.touches[0]);
+  touchState.active = true;
+  touchState.startX = pos.x;
+  touchState.startY = pos.y;
+  touchState.currentX = pos.x;
+  touchState.currentY = pos.y;
+  mouse.x = pos.x;
+  mouse.y = pos.y;
+}, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (e.touches.length > 1) return;
+  const pos = touchPos(e.touches[0]);
+  touchState.currentX = pos.x;
+  touchState.currentY = pos.y;
+  mouse.x = pos.x;
+  mouse.y = pos.y;
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  const dx = touchState.currentX - touchState.startX;
+  const dy = touchState.currentY - touchState.startY;
+  const moved = Math.hypot(dx, dy);
+  if (touchState.active && moved < 12) {
+    // It's a tap — synthesize a click. mouse.x/y is already at the tap location.
+    mouse.clicked = true;
+  }
+  touchState.active = false;
+}, { passive: false });
+
+canvas.addEventListener('touchcancel', e => {
+  touchState.active = false;
+}, { passive: false });
+
+// --- Ducklings (player-thrown helpers) ---
+let ducklings = 0;           // how many the player has on hand
+let throwers = [];           // active duckling helpers (flying or working)
+
+// --- Hiding spots (ducks hidden inside some of them) ---
+let totalSpotsThisLevel = 18;
+let ducksHiddenThisLevel = 12;
+let level = 1;
+const BOSS_PER_LEVEL = 10;
+
+function configureLevel(n) {
+  level = n;
+  totalSpotsThisLevel = 16 + n * 2;          // 18, 20, 22, ...
+  ducksHiddenThisLevel = Math.min(totalSpotsThisLevel - 4, 10 + n);  // 11, 12, 13, capped
+}
+let spots = [];
+let collected = 0;
+
+function spawnSpots() {
+  spots = [];
+  const pond = { x: W/2, y: H/2 - 30, rx: 140, ry: 100 };
+  const positions = [];
+  let tries = 0;
+  while (positions.length < totalSpotsThisLevel && tries < 800) {
+    tries++;
+    const x = 80 + Math.random() * (W - 160);
+    const y = 110 + Math.random() * (H - 240);
+    if (((x - pond.x) / (pond.rx + 30)) ** 2 + ((y - pond.y) / (pond.ry + 30)) ** 2 < 1) continue;
+    if (positions.some(p => Math.hypot(p.x - x, p.y - y) < 72)) continue;
+    positions.push({ x, y });
+  }
+  const indices = positions.map((_, i) => i);
+  for (let i = indices.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [indices[i], indices[j]] = [indices[j], indices[i]];
+  }
+  const duckIdx = new Set(indices.slice(0, ducksHiddenThisLevel));
+  positions.forEach((p, i) => {
+    spots.push({
+      x: p.x,
+      y: p.y,
+      hasDuck: duckIdx.has(i),
+      hasDuckling: false,
+      hasAd: false,
+      revealed: false,
+      wobble: 0,
+      type: Math.random() < 0.5 ? 'bush' : 'rock',
+    });
+  });
+  // One duckling per level, demoted from a regular duck spot
+  const duckSpots = spots.filter(s => s.hasDuck);
+  if (duckSpots.length > 0) {
+    const d = duckSpots[Math.floor(Math.random() * duckSpots.length)];
+    d.hasDuck = false;
+    d.hasDuckling = true;
+  }
+  // One ad per level — prefer empty spots; fall back to any non-duckling spot
+  const emptySpots = spots.filter(s => !s.hasDuck && !s.hasDuckling);
+  const adPool = emptySpots.length > 0 ? emptySpots : spots.filter(s => !s.hasDuckling);
+  if (adPool.length > 0) {
+    const adSpot = adPool[Math.floor(Math.random() * adPool.length)];
+    adSpot.hasAd = true;
+    adSpot.hasDuck = false;  // ad spot doesn't also give a duck
+  }
+}
+spawnSpots();
+
+let rivals = [];
+function spawnRivals(n) {
+  rivals = [];
+  const colors = ['#c0392b', '#8e44ad', '#16a085'];
+  for (let i = 0; i < n; i++) {
+    rivals.push({
+      x: 80 + Math.random() * (W - 160),
+      y: 110 + Math.random() * (H - 240),
+      speed: 1.7 + Math.random() * 0.3,
+      target: null,
+      bandana: colors[i % colors.length],
+    });
+  }
+}
+
+let bossStolen = 0;  // ducks the rivals grabbed for the goose
+
+function updateRivals() {
+  for (const r of rivals) {
+    if (!r.target || r.target.revealed) {
+      // find the nearest unclaimed unrevealed spot
+      let best = null, bestD = Infinity;
+      for (const s of spots) {
+        if (s.revealed) continue;
+        const claimed = rivals.some(o => o !== r && o.target === s);
+        if (claimed) continue;
+        const d = Math.hypot(s.x - r.x, s.y - r.y);
+        if (d < bestD) { bestD = d; best = s; }
+      }
+      r.target = best;
+    }
+    if (!r.target) continue;
+    const dx = r.target.x - r.x, dy = r.target.y - r.y;
+    const len = Math.hypot(dx, dy) || 1;
+    r.x += (dx / len) * r.speed;
+    r.y += (dy / len) * r.speed;
+    if (len < 28) {
+      r.target.revealed = true;
+      r.target.wobble = 0.6;
+      if (r.target.type === 'bush') playBushRustle(); else playRockKnock();
+      if (r.target.hasDuck) {
+        bossStolen++;
+        flash = { msg: 'rival got one!', until: performance.now() + 800, x: r.target.x, y: r.target.y - 30, color: '#c0392b' };
+        playQuack(0.85);
+      } else if (r.target.hasDuckling) {
+        flash = { msg: 'rival scared off a duckling!', until: performance.now() + 1000, x: r.target.x, y: r.target.y - 30, color: '#FF6B6B' };
+        fireBigFlash({
+          durationMs: 900,
+          shake: 4,
+          flashColor: '#c0392b',
+          flashAlphaMax: 0.35,
+          msg: 'rival scared off a duckling!',
+          msgColor: '#fff',
+          msgSize: 36,
+        });
+        playQuack(1.3, 0.18);
+      } else if (r.target.hasAd) {
+        flash = { msg: 'rival ate an ad!', until: performance.now() + 1000, x: r.target.x, y: r.target.y - 30, color: '#2ecc71' };
+        playAdStinger();
+      }
+      r.target = null;
+    }
+  }
+}
+
+function drawRivals() {
+  for (const r of rivals) {
+    drawDuck(r.x, r.y, 1, performance.now() / 200, null, { evil: true, bandana: r.bandana });
+  }
+}
+
+const THROW_FRAMES = 30;
+function throwDuckling(targetX, targetY) {
+  if (ducklings <= 0) return;
+  ducklings--;
+  playWhoosh();
+  // Lock onto a rival if landing point is close to one
+  let attackTarget = null;
+  for (const r of rivals) {
+    if (Math.hypot(r.x - targetX, r.y - targetY) < 40) {
+      attackTarget = r;
+      break;
+    }
+  }
+  throwers.push({
+    startX: player.x,
+    startY: player.y,
+    endX: targetX,
+    endY: targetY,
+    x: player.x,
+    y: player.y,
+    phase: 'flying',
+    flyT: 0,
+    attackTarget,
+    target: null,
+  });
+}
+
+function updateThrowers() {
+  for (const t of throwers) {
+    if (t.phase === 'flying') {
+      t.flyT++;
+      if (t.attackTarget && rivals.includes(t.attackTarget)) {
+        t.endX = t.attackTarget.x;
+        t.endY = t.attackTarget.y;
+      }
+      const p = t.flyT / THROW_FRAMES;
+      t.x = t.startX + (t.endX - t.startX) * p;
+      t.y = t.startY + (t.endY - t.startY) * p;
+      if (t.flyT >= THROW_FRAMES) {
+        if (t.attackTarget) {
+          const idx = rivals.indexOf(t.attackTarget);
+          if (idx >= 0) {
+            rivals.splice(idx, 1);
+            playSplat();
+            playQuack(0.5);
+            flash = { msg: 'rival DEFEATED!', until: performance.now() + 1100, x: t.x, y: t.y - 30, color: '#FFD700' };
+            fireBigFlash({
+              durationMs: 1200,
+              shake: 10,
+              flashColor: '#FFD700',
+              flashAlphaMax: 0.5,
+              msg: 'RIVAL DEFEATED!',
+              msgColor: '#1a1a2e',
+              msgSize: 56,
+            });
+          }
+          t.attackTarget = null;
+        }
+        t.phase = 'working';
+      }
+    } else if (t.phase === 'working') {
+      // Find the nearest rival (any distance)
+      let nearestRival = null, rivalD = Infinity;
+      for (const r of rivals) {
+        const d = Math.hypot(r.x - t.x, r.y - t.y);
+        if (d < rivalD) { nearestRival = r; rivalD = d; }
+      }
+      // Find the nearest unclaimed unrevealed spot
+      let nearestSpot = null, spotD = Infinity;
+      for (const s of spots) {
+        if (s.revealed) continue;
+        const claimed = throwers.some(o => o !== t && o.target === s);
+        if (claimed) continue;
+        const d = Math.hypot(s.x - t.x, s.y - t.y);
+        if (d < spotD) { nearestSpot = s; spotD = d; }
+      }
+
+      // Pick whichever target is closer (rival preferred on ties)
+      if (nearestRival && rivalD <= spotD) {
+        t.target = null;  // not pursuing a spot
+        const dx = nearestRival.x - t.x, dy = nearestRival.y - t.y;
+        const len = Math.hypot(dx, dy) || 1;
+        t.x += (dx / len) * 1.9;
+        t.y += (dy / len) * 1.9;
+        if (len < 24) {
+          const idx = rivals.indexOf(nearestRival);
+          if (idx >= 0) {
+            rivals.splice(idx, 1);
+            playSplat();
+            playQuack(0.5);
+            flash = { msg: 'rival DEFEATED!', until: performance.now() + 1100, x: t.x, y: t.y - 30, color: '#FFD700' };
+            fireBigFlash({
+              durationMs: 1200,
+              shake: 10,
+              flashColor: '#FFD700',
+              flashAlphaMax: 0.5,
+              msg: 'RIVAL DEFEATED!',
+              msgColor: '#1a1a2e',
+              msgSize: 56,
+            });
+          }
+        }
+      } else if (nearestSpot) {
+        t.target = nearestSpot;
+        const dx = nearestSpot.x - t.x, dy = nearestSpot.y - t.y;
+        const len = Math.hypot(dx, dy) || 1;
+        t.x += (dx / len) * 1.9;
+        t.y += (dy / len) * 1.9;
+        if (len < 24) {
+          nearestSpot.revealed = true;
+          nearestSpot.wobble = 0.6;
+          if (nearestSpot.type === 'bush') playBushRustle(); else playRockKnock();
+          if (nearestSpot.hasDuck) {
+            collected++;
+            flash = { msg: '+1 (duckling helped)', until: performance.now() + 900, x: nearestSpot.x, y: nearestSpot.y - 30, color: '#FFD700' };
+            playQuack(1.0);
+          } else if (nearestSpot.hasDuckling) {
+            ducklings++;
+            flash = { msg: 'DUCKLING!', until: performance.now() + 1100, x: nearestSpot.x, y: nearestSpot.y - 30, color: '#FFEFA0' };
+            fireBigFlash({
+              durationMs: 1500,
+              shake: 8,
+              flashColor: '#FFEFA0',
+              flashAlphaMax: 0.7,
+              msg: 'DUCKLING FOUND!',
+              msgColor: '#1a1a2e',
+              msgSize: 64,
+            });
+            playTwinkle();
+          } else if (nearestSpot.hasAd) {
+            flash = { msg: 'duckling ate an ad!', until: performance.now() + 1000, x: nearestSpot.x, y: nearestSpot.y - 30, color: '#2ecc71' };
+            playAdStinger();
+          }
+          t.target = null;
+        }
+      }
+      // else: nothing to do this frame (no rivals, no spots) — worker stands still
+    }
+  }
+}
+
+function drawThrowers() {
+  for (const t of throwers) {
+    if (t.phase === 'flying') {
+      const p = t.flyT / THROW_FRAMES;
+      const arcY = -50 * Math.sin(p * Math.PI);
+      drawDuckling(t.x, t.y + arcY, 0.7);
+    } else {
+      drawDuckling(t.x, t.y, 0.75);
+    }
+  }
+}
+
+function drawSpot(s) {
+  ctx.save();
+  const wobX = s.wobble > 0 ? Math.sin(performance.now() / 30) * s.wobble * 6 : 0;
+  ctx.translate(s.x + wobX, s.y);
+
+  if (s.revealed && s.hasAd) {
+    // tiny billboard
+    ctx.fillStyle = '#444';
+    ctx.fillRect(-1, -4, 2, 12);  // post
+    ctx.fillStyle = '#FFD700';
+    ctx.fillRect(-10, -12, 20, 10);  // sign
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(-10, -12, 20, 10);
+    ctx.fillStyle = '#000';
+    ctx.font = 'bold 9px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('AD', 0, -7);
+    ctx.textBaseline = 'alphabetic';
+  } else if (s.revealed && s.hasDuck) {
+    // feathers left behind
+    ctx.fillStyle = '#FFD700';
+    for (let i = 0; i < 3; i++) {
+      const a = i * 2.1;
+      ctx.beginPath();
+      ctx.ellipse(Math.cos(a) * 8, Math.sin(a) * 4, 4, 2, a, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else if (s.revealed && s.hasDuckling) {
+    // pale-yellow fluff left behind from a duckling
+    ctx.fillStyle = '#FFEFA0';
+    for (let i = 0; i < 4; i++) {
+      const a = i * 1.7;
+      ctx.beginPath();
+      ctx.ellipse(Math.cos(a) * 6, Math.sin(a) * 3, 3, 2, a, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else if (s.revealed) {
+    // disturbed earth — no duck here
+    ctx.fillStyle = '#5a4a2a';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 18, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (s.type === 'bush') {
+    ctx.fillStyle = '#2d8a3e';
+    ctx.beginPath();
+    ctx.arc(-10, 0, 14, 0, Math.PI * 2);
+    ctx.arc(10, 0, 14, 0, Math.PI * 2);
+    ctx.arc(0, -10, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#1a5028';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = '#1a5028';
+    ctx.beginPath();
+    ctx.arc(-6, -2, 1.5, 0, Math.PI * 2);
+    ctx.arc(4, -8, 1.5, 0, Math.PI * 2);
+    ctx.arc(8, 4, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.fillStyle = '#8a8a8a';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 20, 14, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#4a4a4a';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = '#b0b0b0';
+    ctx.beginPath();
+    ctx.ellipse(-6, -4, 6, 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// --- Helpers ---
+function drawButton(x, y, minW, h, label, hot) {
+  ctx.font = 'bold 28px sans-serif';
+  const textW = ctx.measureText(label).width;
+  const w = Math.max(minW, textW + 60);
+  const hover = mouse.x > x - w/2 && mouse.x < x + w/2 && mouse.y > y - h/2 && mouse.y < y + h/2;
+  ctx.fillStyle = hover ? '#FF8C00' : (hot ? '#FFA500' : '#E6960A');
+  ctx.fillRect(x - w/2, y - h/2, w, h);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(x - w/2, y - h/2, w, h);
+  ctx.fillStyle = '#000';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, x, y);
+  ctx.textBaseline = 'alphabetic';
+  const hit = hover && mouse.clicked;
+  if (hit) mouse.clickConsumed = true;
+  return hit;
+}
+
+function drawText(txt, x, y, size, color, align) {
+  ctx.fillStyle = color || '#fff';
+  ctx.font = `bold ${size}px sans-serif`;
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(txt, x, y);
+}
+
+// Draw a duck at (x, y) facing direction, with optional face image inside
+function drawDuck(x, y, scale, bob, faceImg, opts) {
+  opts = opts || {};
+  const s = scale;
+  ctx.save();
+  ctx.translate(x, y + Math.sin(bob) * 2);
+
+  // body shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(0, 24 * s, 28 * s, 6 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // body
+  ctx.fillStyle = opts.bodyColor || '#FFD700';
+  ctx.beginPath();
+  ctx.ellipse(0, 8 * s, 28 * s, 20 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // head (yellow circle)
+  ctx.fillStyle = opts.headColor || '#FFE94A';
+  ctx.beginPath();
+  ctx.arc(0, -10 * s, 22 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // face photo inside head, if present
+  if (faceImg) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, -10 * s, 16 * s, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.drawImage(faceImg, -16 * s, -26 * s, 32 * s, 32 * s);
+    ctx.restore();
+  } else {
+    // default cartoon eyes
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(-7 * s, -12 * s, 5 * s, 0, Math.PI * 2);
+    ctx.arc( 7 * s, -12 * s, 5 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = opts.evil ? '#c0392b' : '#000';
+    ctx.beginPath();
+    ctx.arc(-6 * s, -11 * s, 2.5 * s, 0, Math.PI * 2);
+    ctx.arc( 8 * s, -11 * s, 2.5 * s, 0, Math.PI * 2);
+    ctx.fill();
+    if (opts.evil) {
+      // angry eyebrows
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(-12 * s, -20 * s);
+      ctx.lineTo(-2 * s, -15 * s);
+      ctx.moveTo( 12 * s, -20 * s);
+      ctx.lineTo( 2 * s, -15 * s);
+      ctx.stroke();
+      ctx.lineWidth = 2;
+    }
+  }
+
+  // beak
+  ctx.fillStyle = '#FF8C00';
+  ctx.beginPath();
+  ctx.ellipse(0, 4 * s, 12 * s, 6 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // bandana
+  if (opts.bandana) {
+    ctx.fillStyle = opts.bandana;
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(-22 * s, 6 * s);
+    ctx.lineTo( 22 * s, 6 * s);
+    ctx.lineTo( 16 * s, 14 * s);
+    ctx.lineTo(-16 * s, 14 * s);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.lineWidth = 2;
+  }
+
+  // diva flair (top hat + sunglasses)
+  if (opts.diva) {
+    // top hat
+    ctx.fillStyle = '#222';
+    ctx.fillRect(-18 * s, -36 * s, 36 * s, 4 * s);
+    ctx.fillRect(-12 * s, -56 * s, 24 * s, 22 * s);
+    ctx.fillStyle = '#B8860B';
+    ctx.fillRect(-12 * s, -42 * s, 24 * s, 4 * s);
+    // sunglasses
+    ctx.fillStyle = '#000';
+    ctx.fillRect(-14 * s, -14 * s, 12 * s, 5 * s);
+    ctx.fillRect(  2 * s, -14 * s, 12 * s, 5 * s);
+    ctx.fillRect( -2 * s, -12 * s,  4 * s, 1 * s);
+  }
+
+  ctx.restore();
+}
+
+function drawGoose(x, y, scale, bob, opts) {
+  opts = opts || {};
+  const s = scale;
+  ctx.save();
+  ctx.translate(x, y + Math.sin(bob) * 2);
+
+  // body shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(0, 30 * s, 32 * s, 7 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // body — white, bigger than a duck
+  ctx.fillStyle = '#F5F5F0';
+  ctx.beginPath();
+  ctx.ellipse(0, 14 * s, 32 * s, 24 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // gray wing accent
+  ctx.fillStyle = '#9aa0a8';
+  ctx.beginPath();
+  ctx.ellipse(-10 * s, 16 * s, 14 * s, 9 * s, -0.3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // long neck
+  ctx.fillStyle = '#F5F5F0';
+  ctx.beginPath();
+  ctx.moveTo(-7 * s, 0);
+  ctx.lineTo(-8 * s, -28 * s);
+  ctx.lineTo(7 * s, -28 * s);
+  ctx.lineTo(6 * s, 0);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // head (small, dark gray)
+  ctx.fillStyle = '#3a3a3a';
+  ctx.beginPath();
+  ctx.arc(0, -36 * s, 14 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // beady eye
+  if (!opts.diva) {
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(5 * s, -38 * s, 3 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(6 * s, -38 * s, 1.6 * s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // bill — orange, shorter than a duck, triangular
+  ctx.fillStyle = '#FF8C00';
+  ctx.beginPath();
+  ctx.moveTo(12 * s, -36 * s);
+  ctx.lineTo(22 * s, -34 * s);
+  ctx.lineTo(12 * s, -32 * s);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // diva flair
+  if (opts.diva) {
+    // top hat
+    ctx.fillStyle = '#111';
+    ctx.fillRect(-14 * s, -50 * s, 28 * s, 3 * s);
+    ctx.fillRect(-10 * s, -68 * s, 20 * s, 18 * s);
+    ctx.fillStyle = '#B8860B';
+    ctx.fillRect(-10 * s, -55 * s, 20 * s, 3 * s);
+    // sunglasses
+    ctx.fillStyle = '#000';
+    ctx.fillRect(-8 * s, -38 * s, 7 * s, 4 * s);
+    ctx.fillRect( 1 * s, -38 * s, 7 * s, 4 * s);
+  }
+
+  ctx.restore();
+}
+
+function drawDuckling(x, y, scale) {
+  ctx.save();
+  ctx.translate(x, y);
+  const s = scale;
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(0, 14 * s, 12 * s, 3 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // body
+  ctx.fillStyle = '#FFEFA0';
+  ctx.beginPath();
+  ctx.ellipse(0, 4 * s, 14 * s, 11 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // head
+  ctx.beginPath();
+  ctx.arc(0, -8 * s, 10 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  // eye
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(3 * s, -9 * s, 1.6 * s, 0, Math.PI * 2);
+  ctx.fill();
+  // beak
+  ctx.fillStyle = '#FF8C00';
+  ctx.beginPath();
+  ctx.ellipse(7 * s, -7 * s, 4 * s, 2 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+// --- TITLE ---
+function drawTitle() {
+  // sky gradient
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#87CEEB');
+  g.addColorStop(1, '#FFE5B4');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // title shadow + title
+  drawText('GO DUCK YOURSELF', W/2 + 4, 184, 76, 'rgba(0,0,0,0.3)');
+  drawText('GO DUCK YOURSELF', W/2, 180, 76, '#FF8C00');
+  drawText("The world's premier Duckfiltration game", W/2, 230, 22, '#1a1a2e');
+
+  // floating mascot duck
+  const t = performance.now() / 600;
+  drawDuck(W/2, 380 + Math.sin(t) * 6, 2.2, t, null);
+
+  if (drawButton(W/2, 510, 240, 70, 'BEGIN')) {
+    state = STATES.SCAN;
+  }
+
+  if (drawButton(W/2, 570, 220, 44, 'HOW DO I PLAY?')) {
+    helpReturnTo = STATES.TITLE;
+    helpPage = 0;
+    state = STATES.HELP;
+  }
+}
+
+// --- HELP / walkthrough ---
+function drawHelp() {
+  // dim background
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0a0a1e');
+  g.addColorStop(1, '#1a1a4e');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  drawText('HOW DO I PLAY?', W/2, 60, 36, '#FFD700');
+
+  const page = HELP_PAGES[helpPage];
+  drawText(page.title, W/2, 130, 40, '#FFE94A');
+
+  // body text
+  let y = 200;
+  for (const line of page.lines) {
+    drawText(line, W/2, y, 20, '#fff');
+    y += 32;
+  }
+
+  // visual demo
+  if (page.visual) {
+    page.visual(W/2, 420);
+  }
+
+  // page indicator
+  drawText(`${helpPage + 1} / ${HELP_PAGES.length}`, W/2, 520, 18, '#bbb');
+
+  // BACK / NEXT or DONE
+  if (helpPage > 0) {
+    if (drawButton(W/4, 565, 160, 56, '← BACK')) {
+      helpPage--;
+    }
+  }
+  const onLastPage = helpPage === HELP_PAGES.length - 1;
+  if (drawButton(W * 3/4, 565, 160, 56, onLastPage ? 'DONE' : 'NEXT →')) {
+    if (onLastPage) {
+      state = helpReturnTo || STATES.TITLE;
+      helpPage = 0;
+    } else {
+      helpPage++;
+    }
+  }
+}
+
+// --- SCAN ---
+let scanCanvas = document.createElement('canvas');
+let scanImage = null; // raw uploaded Image
+
+// Preset character avatars — built lazily on first SCAN render.
+let presetAvatars = null;
+function getPresetAvatars() {
+  if (presetAvatars) return presetAvatars;
+  const D = 256;
+  function makeCanvas(drawFn) {
+    const c = document.createElement('canvas');
+    c.width = D; c.height = D;
+    const g = c.getContext('2d');
+    drawFn(g);
+    return c;
+  }
+
+  // Smiley — yellow circle, big eyes, smile
+  const smiley = makeCanvas(g => {
+    g.fillStyle = '#FFE94A';
+    g.beginPath(); g.arc(128, 128, 120, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = '#000'; g.lineWidth = 6; g.stroke();
+    // eyes (whites)
+    g.fillStyle = '#fff';
+    g.beginPath(); g.arc(88, 108, 22, 0, Math.PI * 2); g.fill(); g.stroke();
+    g.beginPath(); g.arc(168, 108, 22, 0, Math.PI * 2); g.fill(); g.stroke();
+    // pupils
+    g.fillStyle = '#000';
+    g.beginPath(); g.arc(92, 112, 10, 0, Math.PI * 2); g.fill();
+    g.beginPath(); g.arc(172, 112, 10, 0, Math.PI * 2); g.fill();
+    // smile
+    g.strokeStyle = '#000'; g.lineWidth = 8; g.lineCap = 'round';
+    g.beginPath(); g.arc(128, 150, 50, 0.15 * Math.PI, 0.85 * Math.PI); g.stroke();
+  });
+
+  // Cool dude — peach face, sunglasses, smirk
+  const coolDude = makeCanvas(g => {
+    g.fillStyle = '#F5C9A0';
+    g.beginPath(); g.arc(128, 128, 120, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = '#000'; g.lineWidth = 6; g.stroke();
+    // sunglasses
+    g.fillStyle = '#000';
+    g.fillRect(54, 102, 60, 28);
+    g.fillRect(142, 102, 60, 28);
+    g.fillRect(110, 114, 36, 4);
+    // glare on lenses
+    g.fillStyle = '#fff';
+    g.fillRect(64, 108, 12, 6);
+    g.fillRect(152, 108, 12, 6);
+    // smirk
+    g.strokeStyle = '#7a3b1b'; g.lineWidth = 7; g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(96, 178);
+    g.quadraticCurveTo(128, 198, 160, 168);
+    g.stroke();
+    // chin shadow
+    g.fillStyle = 'rgba(0,0,0,0.08)';
+    g.beginPath(); g.arc(128, 220, 60, 0, Math.PI * 2); g.fill();
+  });
+
+  // Princess — peach face, pink hair, eyelashes, smile
+  const princess = makeCanvas(g => {
+    // pink hair behind/around face
+    g.fillStyle = '#F48FB1';
+    g.beginPath(); g.arc(128, 120, 130, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = '#000'; g.lineWidth = 6; g.stroke();
+    // face
+    g.fillStyle = '#F5C9A0';
+    g.beginPath(); g.ellipse(128, 144, 86, 100, 0, 0, Math.PI * 2); g.fill();
+    g.stroke();
+    // crown above
+    g.fillStyle = '#FFD700';
+    g.beginPath();
+    g.moveTo(76, 70);
+    g.lineTo(96, 30); g.lineTo(110, 60);
+    g.lineTo(128, 22); g.lineTo(146, 60);
+    g.lineTo(160, 30); g.lineTo(180, 70);
+    g.closePath();
+    g.fill(); g.stroke();
+    // eyes
+    g.fillStyle = '#000';
+    g.beginPath(); g.arc(102, 138, 6, 0, Math.PI * 2); g.fill();
+    g.beginPath(); g.arc(154, 138, 6, 0, Math.PI * 2); g.fill();
+    // eyelashes
+    g.strokeStyle = '#000'; g.lineWidth = 3; g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(94, 130); g.lineTo(88, 122);
+    g.moveTo(102, 128); g.lineTo(100, 118);
+    g.moveTo(110, 130); g.lineTo(114, 122);
+    g.moveTo(146, 130); g.lineTo(142, 122);
+    g.moveTo(154, 128); g.lineTo(156, 118);
+    g.moveTo(162, 130); g.lineTo(168, 122);
+    g.stroke();
+    // smile
+    g.strokeStyle = '#c0392b'; g.lineWidth = 6; g.lineCap = 'round';
+    g.beginPath(); g.arc(128, 178, 26, 0.15 * Math.PI, 0.85 * Math.PI); g.stroke();
+    // cheek blush
+    g.fillStyle = 'rgba(244,143,177,0.5)';
+    g.beginPath(); g.arc(82, 168, 12, 0, Math.PI * 2); g.fill();
+    g.beginPath(); g.arc(174, 168, 12, 0, Math.PI * 2); g.fill();
+  });
+
+  // Robot — silver-gray square face, square eyes, antenna
+  const robot = makeCanvas(g => {
+    // antenna
+    g.strokeStyle = '#000'; g.lineWidth = 6;
+    g.beginPath(); g.moveTo(128, 50); g.lineTo(128, 18); g.stroke();
+    g.fillStyle = '#e74c3c';
+    g.beginPath(); g.arc(128, 14, 12, 0, Math.PI * 2); g.fill(); g.stroke();
+    // head (rounded square)
+    g.fillStyle = '#B0B6BD';
+    const r = 24;
+    g.beginPath();
+    g.moveTo(40 + r, 50);
+    g.lineTo(216 - r, 50);
+    g.quadraticCurveTo(216, 50, 216, 50 + r);
+    g.lineTo(216, 230 - r);
+    g.quadraticCurveTo(216, 230, 216 - r, 230);
+    g.lineTo(40 + r, 230);
+    g.quadraticCurveTo(40, 230, 40, 230 - r);
+    g.lineTo(40, 50 + r);
+    g.quadraticCurveTo(40, 50, 40 + r, 50);
+    g.closePath();
+    g.fill(); g.stroke();
+    // metal highlight
+    g.fillStyle = 'rgba(255,255,255,0.25)';
+    g.fillRect(54, 64, 30, 8);
+    // eyes (square)
+    g.fillStyle = '#0aff0a';
+    g.fillRect(72, 108, 36, 36);
+    g.fillRect(148, 108, 36, 36);
+    g.strokeStyle = '#000'; g.lineWidth = 4;
+    g.strokeRect(72, 108, 36, 36);
+    g.strokeRect(148, 108, 36, 36);
+    // inner pupils
+    g.fillStyle = '#000';
+    g.fillRect(84, 120, 12, 12);
+    g.fillRect(160, 120, 12, 12);
+    // mouth grille
+    g.fillStyle = '#2c3e50';
+    g.fillRect(78, 178, 100, 22);
+    g.strokeStyle = '#000'; g.lineWidth = 3;
+    g.strokeRect(78, 178, 100, 22);
+    g.strokeStyle = '#7f8c8d'; g.lineWidth = 2;
+    for (let i = 1; i < 6; i++) {
+      g.beginPath();
+      g.moveTo(78 + i * (100 / 6), 178);
+      g.lineTo(78 + i * (100 / 6), 200);
+      g.stroke();
+    }
+    // bolts
+    g.fillStyle = '#7f8c8d';
+    g.beginPath(); g.arc(56, 140, 6, 0, Math.PI * 2); g.fill();
+    g.beginPath(); g.arc(200, 140, 6, 0, Math.PI * 2); g.fill();
+  });
+
+  presetAvatars = [
+    { name: 'Smiley',    canvas: smiley },
+    { name: 'Cool Dude', canvas: coolDude },
+    { name: 'Princess',  canvas: princess },
+    { name: 'Robot',     canvas: robot },
+  ];
+  return presetAvatars;
+}
+
+photoInput.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const img = new Image();
+  img.onload = () => {
+    scanImage = img;
+    cropFaceToCircle(img);
+    state = STATES.DUCKIFYING;
+    duckifyStart = performance.now();
+  };
+  img.src = URL.createObjectURL(file);
+});
+
+function cropFaceToCircle(img) {
+  // Scale image so the shorter side fits a 256px circle, centered.
+  const D = 256;
+  scanCanvas.width = D;
+  scanCanvas.height = D;
+  const sctx = scanCanvas.getContext('2d');
+  const scale = D / Math.min(img.width, img.height);
+  const dw = img.width * scale, dh = img.height * scale;
+  sctx.drawImage(img, (D - dw) / 2, (D - dh) / 2, dw, dh);
+  player.faceImg = scanCanvas;
+}
+
+function drawScan() {
+  ctx.fillStyle = '#2a2a4e';
+  ctx.fillRect(0, 0, W, H);
+
+  drawText('SCAN PIC OF YOU', W/2, 90, 52, '#FFD700');
+  drawText('Step 1 of Duckification', W/2, 125, 20, '#aaa');
+
+  // scanner frame (220×220, repositioned to leave room for the presets row below)
+  const frameTop = 145, frameSize = 220;
+  ctx.strokeStyle = '#FFD700';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(W/2 - frameSize/2, frameTop, frameSize, frameSize);
+  // scanline
+  const sy = frameTop + (Math.sin(performance.now() / 400) + 1) / 2 * frameSize;
+  ctx.strokeStyle = 'rgba(255, 215, 0, 0.6)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(W/2 - frameSize/2, sy);
+  ctx.lineTo(W/2 + frameSize/2, sy);
+  ctx.stroke();
+
+  drawText('(your face goes here)', W/2, 255, 16, '#666');
+
+  // Preset avatars row — quick-pick characters that skip the upload flow.
+  const avatars = getPresetAvatars();
+  const rowY = 445;
+  const thumbR = 30; // 60px diameter
+  const spacing = 90;
+  const startX = W/2 - ((avatars.length - 1) * spacing) / 2;
+
+  drawText('Or pick one of these:', W/2, 400, 20, '#FFD700');
+
+  for (let i = 0; i < avatars.length; i++) {
+    const ax = startX + i * spacing;
+    const ay = rowY;
+    const dx = mouse.x - ax, dy = mouse.y - ay;
+    const hover = (dx * dx + dy * dy) <= thumbR * thumbR;
+
+    // soft glow / hover ring
+    if (hover) {
+      ctx.fillStyle = 'rgba(255, 215, 0, 0.25)';
+      ctx.beginPath();
+      ctx.arc(ax, ay, thumbR + 6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // clip and draw the preset canvas into a circle
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(ax, ay, thumbR, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.drawImage(avatars[i].canvas, ax - thumbR, ay - thumbR, thumbR * 2, thumbR * 2);
+    ctx.restore();
+
+    // white stroke ring (thicker on hover)
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = hover ? 4 : 2;
+    ctx.beginPath();
+    ctx.arc(ax, ay, thumbR, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // name label
+    drawText(avatars[i].name, ax, ay + thumbR + 16, 13, hover ? '#FFD700' : '#ccc');
+
+    if (hover && mouse.clicked) {
+      const picked = avatars[i].canvas;
+      player.faceImg = picked;
+      scanImage = picked; // used by DUCKIFYING animation
+      state = STATES.DUCKIFYING;
+      duckifyStart = performance.now();
+      mouse.clickConsumed = true;
+    }
+  }
+
+  if (drawButton(W/2, 555, 240, 50, 'CHOOSE PHOTO')) {
+    photoInput.value = '';
+    photoInput.click();
+  }
+}
+
+// --- DUCKIFYING (animation) ---
+let duckifyStart = 0;
+const DUCKIFY_MS = 3200;
+
+function drawDuckifying() {
+  const t = (performance.now() - duckifyStart) / DUCKIFY_MS;
+  ctx.fillStyle = '#2a2a4e';
+  ctx.fillRect(0, 0, W, H);
+
+  drawText('DUCKIFYING...', W/2, 100, 56, '#FFD700');
+
+  // photo shown shrinking and a duck head expanding over it
+  const cx = W/2, cy = H/2 + 20;
+  const photoR = 140 * (1 - t * 0.4);
+
+  // photo (clipped circle)
+  if (scanImage) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, photoR, 0, Math.PI * 2);
+    ctx.clip();
+    const scale = (photoR * 2) / Math.min(scanImage.width, scanImage.height);
+    const dw = scanImage.width * scale, dh = scanImage.height * scale;
+    ctx.drawImage(scanImage, cx - dw/2, cy - dh/2, dw, dh);
+    ctx.restore();
+    // ring
+    ctx.strokeStyle = `rgba(255, 215, 0, ${0.4 + 0.6 * Math.sin(t * Math.PI * 8)})`;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(cx, cy, photoR + 8, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // duck shape grows in from sides as t advances
+  if (t > 0.45) {
+    const grow = Math.min(1, (t - 0.45) / 0.4);
+    drawDuck(cx, cy, 4 * grow, performance.now() / 300, player.faceImg);
+  }
+
+  // sparkles
+  ctx.fillStyle = '#FFF';
+  for (let i = 0; i < 30; i++) {
+    const a = (i / 30) * Math.PI * 2 + t * 4;
+    const r = 200 + Math.sin(t * 8 + i) * 30;
+    ctx.fillRect(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 3, 3);
+  }
+
+  if (t >= 1) {
+    collected = 0;
+    bossStolen = 0;
+    ducklings = 0;
+    throwers = [];
+    configureLevel(1);
+    spawnSpots();
+    spawnRivals(1);
+    player.x = W/2; player.y = H/2;
+    state = STATES.DUCKTOPIA;
+  }
+}
+
+// --- DUCKTOPIA ---
+function drawDucktopia() {
+  // grass + path
+  ctx.fillStyle = '#7CCD7C';
+  ctx.fillRect(0, 0, W, H);
+  // pond
+  ctx.fillStyle = '#4A90E2';
+  ctx.beginPath();
+  ctx.ellipse(W/2, H/2 - 30, 120, 80, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#2a5d8a';
+  ctx.lineWidth = 4;
+  ctx.stroke();
+  // little dock
+  ctx.fillStyle = '#8B4513';
+  ctx.fillRect(W/2 - 8, H/2 + 30, 16, 60);
+
+  // welcome sign in top corner — auto-sized to text
+  ctx.font = 'bold 22px sans-serif';
+  const lvl = (typeof level === 'undefined' ? 1 : level);
+  const signTxt = `WELCOME TO DUCKTOPIA — LEVEL ${lvl}`;
+  const signW = ctx.measureText(signTxt).width + 24;
+  ctx.fillStyle = '#3a2a1a';
+  ctx.fillRect(20, 20, signW, 50);
+  ctx.fillStyle = '#FFD700';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(signTxt, 32, 45);
+  ctx.textBaseline = 'alphabetic';
+
+  // hiding spots
+  for (const s of spots) drawSpot(s);
+  for (const s of spots) s.wobble = Math.max(0, s.wobble - 0.02);
+
+  // rival ducks (working for the goose)
+  updateRivals();
+  drawRivals();
+
+  // duckling helpers
+  updateThrowers();
+  drawThrowers();
+
+  // movement
+  let dx = 0, dy = 0;
+  if (keys['arrowleft']  || keys['a']) dx -= 1;
+  if (keys['arrowright'] || keys['d']) dx += 1;
+  if (keys['arrowup']    || keys['w']) dy -= 1;
+  if (keys['arrowdown']  || keys['s']) dy += 1;
+  // touch joystick: if dragging far enough, override keyboard direction
+  if (touchState.active) {
+    const tdx = touchState.currentX - touchState.startX;
+    const tdy = touchState.currentY - touchState.startY;
+    const tdist = Math.hypot(tdx, tdy);
+    if (tdist > 12) {  // deadzone
+      dx = tdx / tdist;
+      dy = tdy / tdist;
+    }
+  }
+  if (dx || dy) {
+    const len = Math.hypot(dx, dy);
+    player.x += (dx / len) * player.speed;
+    player.y += (dy / len) * player.speed;
+    stepCounter++;
+    if (stepCounter % 18 === 0) playStep();
+  }
+  player.x = Math.max(40, Math.min(W - 40, player.x));
+  player.y = Math.max(60, Math.min(H - 40, player.y));
+
+  // SPACE to throw a duckling toward the mouse
+  if (keys[' '] && ducklings > 0) {
+    throwDuckling(mouse.x, mouse.y);
+    keys[' '] = false;  // consume — must release and re-press to throw again
+  }
+
+  // check spots — walk into one to see if a duck was hiding
+  for (const s of spots) {
+    if (s.revealed) continue;
+    if (Math.hypot(s.x - player.x, s.y - player.y) < 36) {
+      s.revealed = true;
+      s.wobble = 0.6;
+      if (s.type === 'bush') playBushRustle(); else playRockKnock();
+      if (s.hasDuck) {
+        collected++;
+        flash = { msg: '+1 DUCK!', until: performance.now() + 900, x: s.x, y: s.y - 30, color: '#FFD700' };
+        playQuack(1.0);
+      } else if (s.hasDuckling) {
+        ducklings++;
+        flash = { msg: 'DUCKLING!', until: performance.now() + 1200, x: s.x, y: s.y - 30, color: '#FFEFA0' };
+        fireBigFlash({
+          durationMs: 1500,
+          shake: 8,
+          flashColor: '#FFEFA0',
+          flashAlphaMax: 0.7,
+          msg: 'DUCKLING FOUND!',
+          msgColor: '#1a1a2e',
+          msgSize: 64,
+        });
+        playTwinkle();
+      } else if (s.hasAd) {
+        currentAd = ADS[Math.floor(Math.random() * ADS.length)];
+        state = STATES.ADVERT;
+      } else {
+        flash = { msg: 'empty', until: performance.now() + 700, x: s.x, y: s.y - 20, color: '#666' };
+      }
+    }
+  }
+
+  // draw player
+  drawDuck(player.x, player.y, 1.2, performance.now() / 200, player.faceImg);
+
+  // floating joystick visualization
+  if (touchState.active) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(touchState.startX, touchState.startY, 44, 0, Math.PI * 2);
+    ctx.stroke();
+    // inner dot — capped within outer ring radius
+    const tdx = touchState.currentX - touchState.startX;
+    const tdy = touchState.currentY - touchState.startY;
+    const tdist = Math.hypot(tdx, tdy);
+    const cap = Math.min(tdist, 44);
+    const cx = touchState.startX + (tdist > 0 ? (tdx / tdist) * cap : 0);
+    const cy = touchState.startY + (tdist > 0 ? (tdy / tdist) * cap : 0);
+    ctx.fillStyle = 'rgba(255, 215, 0, 0.7)';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 18, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // HUD
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(W - 220, 20, 200, 80);
+  drawText(`Ducks: ${collected}`, W - 120, 50, 22, '#FFD700');
+  drawText(`Ducklings: ${ducklings}`, W - 120, 82, 20, '#FFEFA0');
+
+  // collected enough? show duck-off button
+  if (collected >= 1) {
+    if (drawButton(W/2, H - 50, 240, 60, 'END LEVEL →')) {
+      state = STATES.LEVEL_END;
+    }
+    if (ducklings > 0) {
+      drawText('SPACE to throw a duckling at your mouse', W/2, H - 90, 16, '#1a1a2e');
+    }
+  } else {
+    drawText('Walk around. Search bushes and rocks.', W/2, H - 32, 18, '#1a1a2e');
+    drawText('Arrow keys or WASD.', W/2, H - 12, 16, '#1a1a2e');
+    if (ducklings > 0) {
+      drawText('SPACE to throw a duckling at your mouse', W/2, H - 52, 16, '#1a1a2e');
+    }
+  }
+
+  // collect flash
+  if (flash && performance.now() < flash.until) {
+    drawText(flash.msg, flash.x, flash.y, 22, flash.color || '#fff');
+  }
+
+  // tap-to-throw on touch (and click-to-throw on desktop): fires only if the click
+  // wasn't consumed by a button and the player has ducklings to throw
+  if (mouse.clicked && !mouse.clickConsumed && ducklings > 0) {
+    throwDuckling(mouse.x, mouse.y);
+  }
+}
+let flash = null;
+let bigFlash = null;  // { startedAt, durationMs, shake, flashColor, flashAlphaMax, msg, msgColor, msgSize }
+let currentAd = null;  // { character, lines } when an ad is being shown
+
+const ADS = [
+  {
+    character: 'Jake from Stateduck',
+    lines: [
+      "Hi, I'm Jake from Stateduck.",
+      "Did you know your duck collection",
+      "might not be insured against goose theft?",
+      "Switch today and save up to 15%!",
+    ],
+  },
+  {
+    character: 'Billy Mallards',
+    lines: [
+      "BILLY MALLARDS HERE!",
+      "Tired of pond scum on your feathers?",
+      "Try QUACK-OFF — the ONLY stain remover",
+      "endorsed by REAL ducks!",
+    ],
+  },
+  {
+    character: 'Flo from Progresspond',
+    lines: [
+      "Hi there, I'm Flo!",
+      "Bundle your duck AND goose policies",
+      "and save BIG on premium feathers!",
+    ],
+  },
+  {
+    character: 'The Most Interesting Duck in the World',
+    lines: [
+      "I don't always collect ducks...",
+      "but when I do, I prefer DUCKVECCHIO.",
+      "Stay thirsty, my friends.",
+    ],
+  },
+  {
+    character: 'CryptoPond Industries',
+    lines: [
+      "ATTENTION DUCK COLLECTORS:",
+      "Now is the time to invest in DUCKCOIN.",
+      "The future of waterfowl finance.",
+      "(Not financial advice. Please don't sue us.)",
+    ],
+  },
+  {
+    character: 'YOUR AD HERE',
+    lines: [
+      "Could YOUR product be advertised",
+      "right here, in this very rock?",
+      "Visit goduckyourself.com/advertise",
+      "to reserve your premium ad slot today.",
+      "(call now — operators are standing duck)",
+    ],
+  },
+];
+
+function fireBigFlash(opts) {
+  bigFlash = {
+    startedAt: performance.now(),
+    durationMs: opts.durationMs,
+    shake: opts.shake || 0,
+    flashColor: opts.flashColor || null,
+    flashAlphaMax: opts.flashAlphaMax || 0.5,
+    msg: opts.msg || null,
+    msgColor: opts.msgColor || '#fff',
+    msgSize: opts.msgSize || 64,
+  };
+}
+
+// --- DUCK OFF ---
+let rollStart = 0;
+let rollResult = null;
+
+function oddsVibe(collected, boss) {
+  const ratio = collected / Math.max(1, boss);
+  if (ratio >= 1.2) return 'Legendary collection.';
+  if (ratio >= 0.9) return 'Strong contender.';
+  if (ratio >= 0.6) return "You're feeling it.";
+  if (ratio >= 0.4) return 'Could go either way...';
+  if (ratio >= 0.2) return 'Long shot.';
+  return 'An act of faith.';
+}
+
+function drawLevelEnd() {
+  ctx.fillStyle = '#1a1a3e';
+  ctx.fillRect(0, 0, W, H);
+  drawText(`LEVEL ${level} COMPLETE`, W/2, 100, 48, '#FFD700');
+  drawText(`Ducks collected so far: ${collected}`, W/2, 170, 26, '#fff');
+  if (bossStolen > 0) {
+    drawText(`(Rivals snagged ${bossStolen} for the goose)`, W/2, 205, 18, '#c0392b');
+  }
+  drawDuck(W/2, 300, 1.8, performance.now() / 250, player.faceImg);
+  drawText('What now?', W/2, 420, 24, '#FFD700');
+
+  if (drawButton(W/4 + 40, 480, 280, 70, 'DUCK OFF NOW')) {
+    state = STATES.DUCK_OFF_INTRO;
+  }
+  if (drawButton(W * 3/4 - 40, 480, 280, 70, `NEXT LEVEL (${level + 1})`)) {
+    configureLevel(level + 1);
+    spawnSpots();
+    spawnRivals(Math.min(3, level));  // level was just incremented, so this is the new level count capped at 3
+    ducklings += throwers.length;  // recall every active worker/flyer to the pocket — permanent ownership
+    throwers = [];
+    player.x = W/2; player.y = H/2;
+    state = STATES.DUCKTOPIA;
+  }
+
+  if (drawButton(W/2, 548, 220, 44, 'HOW DO I PLAY?')) {
+    helpReturnTo = STATES.LEVEL_END;
+    helpPage = 0;
+    state = STATES.HELP;
+  }
+
+  drawText('More levels = more ducks for you, but the goose gets stronger too.', W/2, 590, 16, '#aaa');
+}
+
+function drawAdvert() {
+  // dim full background
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+  ctx.fillRect(0, 0, W, H);
+
+  if (!currentAd) return;
+
+  // modal background
+  const mx = W/2 - 280, my = 100, mw = 560, mh = 380;
+  ctx.fillStyle = '#1a1a4e';
+  ctx.fillRect(mx, my, mw, mh);
+  ctx.strokeStyle = '#FFD700';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(mx, my, mw, mh);
+
+  // blinking ADVERTISEMENT header
+  const blink = (Math.floor(performance.now() / 400) % 2) === 0;
+  drawText('ADVERTISEMENT', W/2, my + 50, 28, blink ? '#FF1493' : '#FF69B4');
+
+  // character name
+  drawText(currentAd.character, W/2, my + 100, 26, '#FFD700');
+
+  // spiel
+  let y = my + 150;
+  for (const line of currentAd.lines) {
+    drawText(line, W/2, y, 18, '#fff');
+    y += 28;
+  }
+
+  // dismiss button
+  if (drawButton(W/2, my + mh - 50, 200, 50, 'DISMISS')) {
+    currentAd = null;
+    state = STATES.DUCKTOPIA;
+  }
+
+  // tiny footer joke
+  drawText('(an ad you saw is one a rival could have eaten)', W/2, H - 30, 13, '#bbb');
+}
+
+function drawDuckOffIntro() {
+  maybeChaosQuack();
+  const bossEffective = BOSS_PER_LEVEL * level + bossStolen;
+  const g = ctx.createRadialGradient(W/2, H/2, 50, W/2, H/2, 500);
+  g.addColorStop(0, '#3a1a3a');
+  g.addColorStop(1, '#0a0a1e');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  drawText('THE DUCK OFF', W/2, 80, 60, '#FF1493');
+  drawText('vs.', W/2, 290, 36, '#fff');
+
+  // your duck
+  drawDuck(W/4, 260, 1.6, performance.now() / 250, player.faceImg);
+  drawText('YOU', W/4, 360, 22, '#FFD700');
+  drawText(`${collected} duck${collected === 1 ? '' : 's'}`, W/4, 390, 20, '#fff');
+
+  // the goose
+  drawGoose(W * 3/4, 260, 1.3, performance.now() / 220, { diva: true });
+  drawText('MR. MAN MAS MR. MAS DIVA', W * 3/4, 360, 13, '#FF69B4');
+  drawText('MR. MAN MAS DIVA', W * 3/4, 378, 13, '#FF69B4');
+  drawText('(yes, a goose)', W * 3/4, 398, 13, '#aaa');
+  drawText('??? ducks', W * 3/4, 422, 22, '#fff');
+
+  // vibe gauge instead of precise odds
+  drawText(oddsVibe(collected, bossEffective), W/2, 472, 26, '#FFD700');
+  drawText('His collection is hidden. Commit blind.', W/2, 500, 16, '#bbb');
+
+  if (drawButton(W/2, 555, 240, 60, 'DUCK OFF!')) {
+    state = STATES.DUCK_OFF_ROLL;
+    rollStart = performance.now();
+    const winPct = collected / (collected + bossEffective);
+    rollResult = Math.random() < winPct;
+  }
+}
+
+function drawDuckOffRoll() {
+  maybeChaosQuack();
+  const t = (performance.now() - rollStart) / 2400;
+  const g = ctx.createRadialGradient(W/2, H/2, 50, W/2, H/2, 500);
+  g.addColorStop(0, '#3a1a3a');
+  g.addColorStop(1, '#0a0a1e');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // shaking ducks
+  const shake = Math.max(0, 1 - t) * 6;
+  const sx = (Math.random() - 0.5) * shake;
+  const sy = (Math.random() - 0.5) * shake;
+
+  drawText('DUCKING...', W/2 + sx, 200 + sy, 64, '#FFD700');
+
+  drawDuck(W/4 + sx, 350 + sy, 1.6, performance.now() / 100, player.faceImg);
+  drawGoose(W * 3/4 + sx, 350 + sy, 1.3, performance.now() / 100, { diva: true });
+
+  // confetti spray
+  for (let i = 0; i < 80; i++) {
+    const a = i * 0.7 + t * 6;
+    const r = t * 600;
+    ctx.fillStyle = `hsl(${(i * 30) % 360}, 100%, 60%)`;
+    ctx.fillRect(W/2 + Math.cos(a) * r, H/2 + Math.sin(a) * r, 4, 4);
+  }
+
+  if (t >= 1) {
+    state = rollResult ? STATES.WIN : STATES.LOSE;
+  }
+}
+
+function drawEnd(win) {
+  if (win) {
+    ctx.fillStyle = '#FFD700';
+    ctx.fillRect(0, 0, W, H);
+    drawText('YOU WON THE DUCK OFF!', W/2, 180, 56, '#1a1a2e');
+    drawText("Mr. Man Mas Mr. Mas Diva Mr. Man Mas Diva", W/2, 240, 18, '#1a1a2e');
+    drawText("hands over his crown.", W/2, 264, 18, '#1a1a2e');
+    drawDuck(W/2, 400, 2.4, performance.now() / 300, player.faceImg);
+    drawText('👑', W/2, 320, 60, '#fff');
+  } else {
+    ctx.fillStyle = '#2a0a0a';
+    ctx.fillRect(0, 0, W, H);
+    drawText('YOU LOST THE DUCK OFF.', W/2, 180, 50, '#FF6B6B');
+    drawText("Mr. Man Mas Mr. Mas Diva Mr. Man Mas Diva", W/2, 240, 18, '#fff');
+    drawText("hoards more ducks. The reign of the goose continues.", W/2, 264, 18, '#fff');
+    drawGoose(W/2, 400, 1.9, performance.now() / 300, { diva: true });
+  }
+  if (drawButton(W/2, 540, 240, 60, 'PLAY AGAIN')) {
+    collected = 0;
+    bossStolen = 0;
+    ducklings = 0;
+    throwers = [];
+    configureLevel(1);
+    spawnSpots();
+    spawnRivals(1);
+    player.x = W/2; player.y = H/2;
+    state = STATES.DUCKTOPIA;
+  }
+}
+
+// --- Game loop ---
+function frame() {
+  if (state !== prevState) {
+    if (state === STATES.DUCK_OFF_INTRO)  playFanfare();
+    if (state === STATES.DUCK_OFF_ROLL)   playDrumroll();
+    if (state === STATES.WIN)             playWinCheer();
+    if (state === STATES.LOSE)            playSadTrombone();
+    if (state === STATES.ADVERT)          playAdStinger();
+    prevState = state;
+  }
+  ctx.clearRect(0, 0, W, H);
+
+  // big event shake (applied before drawing the world)
+  let shakeX = 0, shakeY = 0;
+  if (bigFlash) {
+    const elapsed = performance.now() - bigFlash.startedAt;
+    if (elapsed < bigFlash.durationMs) {
+      const lifeFrac = 1 - (elapsed / bigFlash.durationMs);
+      if (bigFlash.shake) {
+        shakeX = (Math.random() - 0.5) * bigFlash.shake * lifeFrac;
+        shakeY = (Math.random() - 0.5) * bigFlash.shake * lifeFrac;
+      }
+    } else {
+      bigFlash = null;
+    }
+  }
+
+  ctx.save();
+  ctx.translate(shakeX, shakeY);
+
+  switch (state) {
+    case STATES.TITLE:           drawTitle(); break;
+    case STATES.SCAN:            drawScan(); break;
+    case STATES.DUCKIFYING:      drawDuckifying(); break;
+    case STATES.DUCKTOPIA:       drawDucktopia(); break;
+    case STATES.ADVERT:          drawAdvert(); break;
+    case STATES.LEVEL_END:       drawLevelEnd(); break;
+    case STATES.DUCK_OFF_INTRO:  drawDuckOffIntro(); break;
+    case STATES.DUCK_OFF_ROLL:   drawDuckOffRoll(); break;
+    case STATES.WIN:             drawEnd(true); break;
+    case STATES.LOSE:            drawEnd(false); break;
+    case STATES.HELP:            drawHelp(); break;
+  }
+
+  ctx.restore();
+
+  // big event overlay: color flash + center banner (drawn AFTER restore so it's not affected by shake)
+  if (bigFlash) {
+    const elapsed = performance.now() - bigFlash.startedAt;
+    const lifeFrac = 1 - (elapsed / bigFlash.durationMs);
+    if (bigFlash.flashColor) {
+      ctx.save();
+      ctx.globalAlpha = bigFlash.flashAlphaMax * lifeFrac;
+      ctx.fillStyle = bigFlash.flashColor;
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+    if (bigFlash.msg) {
+      const yOffset = -lifeFrac * 40;
+      // shadow first for legibility on any background
+      drawText(bigFlash.msg, W/2 + 3, H/2 - 60 + yOffset + 3, bigFlash.msgSize, 'rgba(0,0,0,0.6)');
+      drawText(bigFlash.msg, W/2, H/2 - 60 + yOffset, bigFlash.msgSize, bigFlash.msgColor);
+    }
+  }
+
+  mouse.clicked = false;
+  mouse.clickConsumed = false;
+  requestAnimationFrame(frame);
+}
+frame();
+</script>
+</body>
+</html>
