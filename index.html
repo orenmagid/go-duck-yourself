@@ -1682,11 +1682,154 @@ function drawDucktopia() {
 }
 let flash = null;
 let bigFlash = null;  // { startedAt, durationMs, shake, flashColor, flashAlphaMax, msg, msgColor, msgSize }
-let currentAd = null;  // { character, lines } when an ad is being shown
+let currentAd = null;  // { character, lines, logo } when an ad is being shown
+
+// --- Fake company logos (silly, on-brand parodies) ---
+function logoStateduck(cx, cy) {
+  ctx.save();
+  // Red shield
+  ctx.fillStyle = '#c0392b';
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - 22);
+  ctx.quadraticCurveTo(cx + 28, cy - 22, cx + 28, cy);
+  ctx.quadraticCurveTo(cx + 28, cy + 18, cx, cy + 24);
+  ctx.quadraticCurveTo(cx - 28, cy + 18, cx - 28, cy);
+  ctx.quadraticCurveTo(cx - 28, cy - 22, cx, cy - 22);
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  // Gold duck silhouette
+  ctx.fillStyle = '#FFD700';
+  ctx.beginPath();
+  ctx.ellipse(cx - 2, cy + 4, 9, 6, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx - 4, cy - 4, 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#FF8C00';
+  ctx.beginPath();
+  ctx.moveTo(cx + 2, cy - 5);
+  ctx.lineTo(cx + 9, cy - 3);
+  ctx.lineTo(cx + 2, cy - 1);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function logoBillyMallards(cx, cy) {
+  ctx.save();
+  ctx.fillStyle = '#FFD700';
+  ctx.strokeStyle = '#c0392b';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < 20; i++) {
+    const a = (i / 20) * Math.PI * 2;
+    const r = (i % 2 === 0) ? 28 : 19;
+    const x = cx + Math.cos(a) * r;
+    const y = cy + Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#c0392b';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('$$$', cx, cy);
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
+
+function logoProgresspond(cx, cy) {
+  ctx.save();
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(cx - 36, cy - 22, 72, 44);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx - 36, cy - 22, 72, 44);
+  ctx.fillStyle = '#0066cc';
+  ctx.fillRect(cx - 36, cy - 22, 72, 10);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 8px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('PROGRESSPOND', cx, cy - 17);
+  ctx.fillStyle = '#0066cc';
+  ctx.font = 'bold 26px sans-serif';
+  ctx.fillText('P', cx, cy + 6);
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
+
+function logoMostInteresting(cx, cy) {
+  ctx.save();
+  // Beer mug
+  ctx.fillStyle = '#F4A460';
+  ctx.fillRect(cx - 16, cy - 16, 26, 32);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx - 16, cy - 16, 26, 32);
+  // handle
+  ctx.beginPath();
+  ctx.moveTo(cx + 10, cy - 8);
+  ctx.quadraticCurveTo(cx + 22, cy, cx + 10, cy + 8);
+  ctx.stroke();
+  // foam
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(cx - 12, cy - 16, 5, 0, Math.PI * 2);
+  ctx.arc(cx - 4, cy - 20, 6, 0, Math.PI * 2);
+  ctx.arc(cx + 4, cy - 16, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function logoCryptoPond(cx, cy) {
+  ctx.save();
+  ctx.fillStyle = '#FFD700';
+  ctx.beginPath();
+  ctx.arc(cx, cy, 26, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#B8860B';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy, 21, 0, Math.PI * 2);
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.fillStyle = '#1a1a4e';
+  ctx.font = 'bold 28px serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Đ', cx, cy + 2);
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
+
+function logoYourAdHere(cx, cy) {
+  ctx.save();
+  ctx.strokeStyle = '#FFD700';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 4]);
+  ctx.strokeRect(cx - 36, cy - 22, 72, 44);
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#FFD700';
+  ctx.font = 'bold 30px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('+', cx, cy + 2);
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
 
 const ADS = [
   {
     character: 'Jake from Stateduck',
+    logo: logoStateduck,
     lines: [
       "Hi, I'm Jake from Stateduck.",
       "Did you know your duck collection",
@@ -1696,6 +1839,7 @@ const ADS = [
   },
   {
     character: 'Billy Mallards',
+    logo: logoBillyMallards,
     lines: [
       "BILLY MALLARDS HERE!",
       "Tired of pond scum on your feathers?",
@@ -1705,6 +1849,7 @@ const ADS = [
   },
   {
     character: 'Flo from Progresspond',
+    logo: logoProgresspond,
     lines: [
       "Hi there, I'm Flo!",
       "Bundle your duck AND goose policies",
@@ -1713,6 +1858,7 @@ const ADS = [
   },
   {
     character: 'The Most Interesting Duck in the World',
+    logo: logoMostInteresting,
     lines: [
       "I don't always collect ducks...",
       "but when I do, I prefer DUCKVECCHIO.",
@@ -1721,6 +1867,7 @@ const ADS = [
   },
   {
     character: 'CryptoPond Industries',
+    logo: logoCryptoPond,
     lines: [
       "ATTENTION DUCK COLLECTORS:",
       "Now is the time to invest in DUCKCOIN.",
@@ -1730,6 +1877,7 @@ const ADS = [
   },
   {
     character: 'YOUR AD HERE',
+    logo: logoYourAdHere,
     lines: [
       "Could YOUR product be advertised",
       "right here, in this very rock?",
@@ -1801,14 +1949,13 @@ function drawLevelEnd() {
 }
 
 function drawAdvert() {
-  // dim full background
   ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
   ctx.fillRect(0, 0, W, H);
 
   if (!currentAd) return;
 
-  // modal background
-  const mx = W/2 - 280, my = 100, mw = 560, mh = 380;
+  // taller modal (was 380) to fit logo + sales pitch
+  const mx = W/2 - 280, my = 90, mw = 560, mh = 420;
   ctx.fillStyle = '#1a1a4e';
   ctx.fillRect(mx, my, mw, mh);
   ctx.strokeStyle = '#FFD700';
@@ -1817,25 +1964,34 @@ function drawAdvert() {
 
   // blinking ADVERTISEMENT header
   const blink = (Math.floor(performance.now() / 400) % 2) === 0;
-  drawText('ADVERTISEMENT', W/2, my + 50, 28, blink ? '#FF1493' : '#FF69B4');
+  drawText('ADVERTISEMENT', W/2, my + 40, 26, blink ? '#FF1493' : '#FF69B4');
 
-  // character name
-  drawText(currentAd.character, W/2, my + 100, 26, '#FFD700');
-
-  // spiel
-  let y = my + 150;
-  for (const line of currentAd.lines) {
-    drawText(line, W/2, y, 18, '#fff');
-    y += 28;
+  // company logo
+  if (currentAd.logo) {
+    currentAd.logo(W/2, my + 85);
   }
 
+  // character name
+  drawText(currentAd.character, W/2, my + 140, 22, '#FFD700');
+
+  // spiel
+  let y = my + 175;
+  for (const line of currentAd.lines) {
+    drawText(line, W/2, y, 17, '#fff');
+    y += 24;
+  }
+
+  // sales pitch
+  drawText('Could this be YOUR ad?', W/2, my + 320, 14, '#FFE94A');
+  drawText('goduckyourself.com/advertise', W/2, my + 342, 16, '#FFD700');
+
   // dismiss button
-  if (drawButton(W/2, my + mh - 50, 200, 50, 'DISMISS')) {
+  if (drawButton(W/2, my + mh - 35, 200, 50, 'DISMISS')) {
     currentAd = null;
     state = STATES.DUCKTOPIA;
   }
 
-  // tiny footer joke
+  // tiny footer joke (outside modal)
   drawText('(an ad you saw is one a rival could have eaten)', W/2, H - 30, 13, '#bbb');
 }
 
