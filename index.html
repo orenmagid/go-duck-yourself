@@ -58,6 +58,7 @@ const STATES = {
   LEVEL_END: 'LEVEL_END',
   DUCK_OFF_INTRO: 'DUCK_OFF_INTRO',
   DUCK_OFF_ROLL: 'DUCK_OFF_ROLL',
+  DUCK_OFF_BATTLE: 'DUCK_OFF_BATTLE',
   WIN: 'WIN',
   LOSE: 'LOSE',
   HELP: 'HELP',
@@ -1913,6 +1914,65 @@ function fireBigFlash(opts) {
 let rollStart = 0;
 let rollResult = null;
 
+// --- Duck Off Battle state ---
+let playerHP = 0;
+let gooseHP = 0;
+let battlePlayer = { x: 200, y: 350 };
+let battleGoose = { x: 600, y: 320 };
+let battleProjectiles = [];   // { x, y, vx, vy, fromPlayer }
+let lastPlayerThrow = 0;
+let nextGooseThrowAt = 0;
+let playerInvulnUntil = 0;
+let gooseInvulnUntil = 0;
+let battleEnding = null;      // 'win', 'lose', or null
+let battleEndAt = 0;
+let battleMaxPlayerHP = 0;
+let battleMaxGooseHP = 0;
+
+function initBattle() {
+  battleMaxPlayerHP = collected;
+  battleMaxGooseHP = BOSS_PER_LEVEL * level + bossStolen;
+  playerHP = battleMaxPlayerHP;
+  gooseHP = battleMaxGooseHP;
+  battlePlayer = { x: 200, y: 350 };
+  battleGoose = { x: 600, y: 320 };
+  battleProjectiles = [];
+  lastPlayerThrow = 0;
+  nextGooseThrowAt = performance.now() + 1000;  // first goose throw a beat after entry
+  playerInvulnUntil = 0;
+  gooseInvulnUntil = 0;
+  battleEnding = null;
+  battleEndAt = 0;
+}
+
+function throwBattleProjectile(fromPlayer, fromX, fromY, toX, toY) {
+  const dx = toX - fromX, dy = toY - fromY;
+  const len = Math.hypot(dx, dy) || 1;
+  const SPEED = 7;
+  battleProjectiles.push({
+    x: fromX,
+    y: fromY,
+    vx: (dx / len) * SPEED,
+    vy: (dy / len) * SPEED,
+    fromPlayer,
+  });
+}
+
+function drawHPBar(x, y, w, h, hp, maxHp, label) {
+  const ratio = Math.max(0, Math.min(1, hp / Math.max(1, maxHp)));
+  ctx.fillStyle = '#222';
+  ctx.fillRect(x, y, w, h);
+  let fillColor = '#27ae60';
+  if (ratio < 0.5) fillColor = '#f39c12';
+  if (ratio < 0.25) fillColor = '#c0392b';
+  ctx.fillStyle = fillColor;
+  ctx.fillRect(x, y, w * ratio, h);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, w, h);
+  drawText(`${label}: ${Math.max(0, hp)}`, x + w/2, y + h/2 + 5, 14, '#fff');
+}
+
 function oddsVibe(collected, boss) {
   const ratio = collected / Math.max(1, boss);
   if (ratio >= 1.2) return 'Legendary collection.';
@@ -2034,8 +2094,6 @@ function drawDuckOffIntro() {
   if (drawButton(W/2, 555, 240, 60, 'DUCK OFF!')) {
     state = STATES.DUCK_OFF_ROLL;
     rollStart = performance.now();
-    const winPct = collected / (collected + bossEffective);
-    rollResult = Math.random() < winPct;
   }
 }
 
@@ -2067,7 +2125,195 @@ function drawDuckOffRoll() {
   }
 
   if (t >= 1) {
-    state = rollResult ? STATES.WIN : STATES.LOSE;
+    state = STATES.DUCK_OFF_BATTLE;
+    initBattle();
+  }
+}
+
+function drawDuckOffBattle() {
+  maybeChaosQuack();
+
+  // arena background
+  const g = ctx.createRadialGradient(W/2, H/2, 50, W/2, H/2, 500);
+  g.addColorStop(0, '#3a1a3a');
+  g.addColorStop(1, '#0a0a1e');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // title
+  drawText('THE DUCK OFF', W/2, 30, 26, '#FF1493');
+
+  // HP bars
+  drawHPBar(60, 50, 320, 22, playerHP, battleMaxPlayerHP, 'YOU');
+  drawHPBar(420, 50, 320, 22, gooseHP, battleMaxGooseHP, 'GOOSE');
+
+  // center divider (subtle)
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(W/2, 100);
+  ctx.lineTo(W/2, H - 30);
+  ctx.stroke();
+
+  const now = performance.now();
+
+  // Gameplay (only when battle isn't ending)
+  if (!battleEnding) {
+    // ---- player movement ----
+    let dx = 0, dy = 0;
+    if (keys['arrowleft']  || keys['a']) dx -= 1;
+    if (keys['arrowright'] || keys['d']) dx += 1;
+    if (keys['arrowup']    || keys['w']) dy -= 1;
+    if (keys['arrowdown']  || keys['s']) dy += 1;
+    if (touchState.active) {
+      const tdx = touchState.currentX - touchState.startX;
+      const tdy = touchState.currentY - touchState.startY;
+      const tdist = Math.hypot(tdx, tdy);
+      if (tdist > 12) { dx = tdx / tdist; dy = tdy / tdist; }
+    }
+    if (dx || dy) {
+      const len = Math.hypot(dx, dy);
+      battlePlayer.x += (dx / len) * 4;
+      battlePlayer.y += (dy / len) * 4;
+    }
+    // constrain to left arena
+    battlePlayer.x = Math.max(60, Math.min(380, battlePlayer.x));
+    battlePlayer.y = Math.max(110, Math.min(H - 50, battlePlayer.y));
+
+    // ---- player throw ----
+    if (now - lastPlayerThrow > 350) {
+      let shouldThrow = false;
+      if (keys[' ']) {
+        shouldThrow = true;
+        keys[' '] = false;  // consume
+      }
+      if (mouse.clicked && !mouse.clickConsumed) {
+        shouldThrow = true;
+      }
+      if (shouldThrow) {
+        throwBattleProjectile(true, battlePlayer.x, battlePlayer.y, battleGoose.x, battleGoose.y);
+        lastPlayerThrow = now;
+        playWhoosh();
+      }
+    }
+
+    // ---- goose throw ----
+    if (now >= nextGooseThrowAt) {
+      throwBattleProjectile(false, battleGoose.x, battleGoose.y, battlePlayer.x, battlePlayer.y);
+      nextGooseThrowAt = now + 700 + Math.random() * 700;
+      playWhoosh();
+    }
+
+    // ---- update projectiles + collisions ----
+    for (let i = battleProjectiles.length - 1; i >= 0; i--) {
+      const p = battleProjectiles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      // off-screen?
+      if (p.x < -60 || p.x > W + 60 || p.y < -60 || p.y > H + 60) {
+        battleProjectiles.splice(i, 1);
+        continue;
+      }
+      // hit goose
+      if (p.fromPlayer && now > gooseInvulnUntil) {
+        const d = Math.hypot(p.x - battleGoose.x, p.y - battleGoose.y);
+        if (d < 42) {
+          gooseHP--;
+          gooseInvulnUntil = now + 500;
+          battleProjectiles.splice(i, 1);
+          playSplat();
+          playQuack(0.55);
+          fireBigFlash({
+            durationMs: 450,
+            shake: 6,
+            flashColor: '#FFD700',
+            flashAlphaMax: 0.3,
+            msg: '-1',
+            msgColor: '#FFD700',
+            msgSize: 56,
+          });
+          continue;
+        }
+      }
+      // hit player
+      if (!p.fromPlayer && now > playerInvulnUntil) {
+        const d = Math.hypot(p.x - battlePlayer.x, p.y - battlePlayer.y);
+        if (d < 32) {
+          playerHP--;
+          playerInvulnUntil = now + 500;
+          battleProjectiles.splice(i, 1);
+          playSplat();
+          playQuack(1.3);
+          fireBigFlash({
+            durationMs: 450,
+            shake: 8,
+            flashColor: '#c0392b',
+            flashAlphaMax: 0.35,
+            msg: 'HIT',
+            msgColor: '#fff',
+            msgSize: 56,
+          });
+          continue;
+        }
+      }
+    }
+
+    // ---- end condition ----
+    if (playerHP <= 0 || gooseHP <= 0) {
+      battleEnding = playerHP <= 0 ? 'lose' : 'win';
+      battleEndAt = now + 1500;
+    }
+  } else {
+    // still update projectiles so they fly off-screen
+    for (let i = battleProjectiles.length - 1; i >= 0; i--) {
+      const p = battleProjectiles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      if (p.x < -60 || p.x > W + 60 || p.y < -60 || p.y > H + 60) {
+        battleProjectiles.splice(i, 1);
+      }
+    }
+    // transition once delay elapsed
+    if (now >= battleEndAt) {
+      state = battleEnding === 'win' ? STATES.WIN : STATES.LOSE;
+    }
+  }
+
+  // ---- draw projectiles ----
+  for (const p of battleProjectiles) {
+    if (p.fromPlayer) {
+      drawDuck(p.x, p.y, 0.45, p.x / 30, player.faceImg);
+    } else {
+      drawGoose(p.x, p.y, 0.55, p.x / 30, {});
+    }
+  }
+
+  // ---- draw goose (with flicker during invuln) ----
+  const gooseVisible = now > gooseInvulnUntil || (Math.floor(now / 60) % 2 === 0);
+  if (gooseVisible) {
+    drawGoose(battleGoose.x, battleGoose.y + Math.sin(now / 250) * 4, 1.5, 0, { diva: true });
+  }
+
+  // ---- draw player (with flicker during invuln) ----
+  const playerVisible = now > playerInvulnUntil || (Math.floor(now / 60) % 2 === 0);
+  if (playerVisible) {
+    drawDuck(battlePlayer.x, battlePlayer.y, 1.3, now / 200, player.faceImg);
+  }
+
+  // ---- end-of-battle banner ----
+  if (battleEnding) {
+    drawText(
+      battleEnding === 'win' ? 'YOU WIN' : 'YOU LOSE',
+      W/2,
+      H/2 + 20,
+      88,
+      battleEnding === 'win' ? '#FFD700' : '#FF6B6B'
+    );
+  }
+
+  // ---- hint ----
+  if (!battleEnding) {
+    drawText('SPACE or TAP to throw • Arrow keys / drag to move', W/2, H - 14, 14, '#bbb');
   }
 }
 
@@ -2140,6 +2386,7 @@ function frame() {
     case STATES.LEVEL_END:       drawLevelEnd(); break;
     case STATES.DUCK_OFF_INTRO:  drawDuckOffIntro(); break;
     case STATES.DUCK_OFF_ROLL:   drawDuckOffRoll(); break;
+    case STATES.DUCK_OFF_BATTLE: drawDuckOffBattle(); break;
     case STATES.WIN:             drawEnd(true); break;
     case STATES.LOSE:            drawEnd(false); break;
     case STATES.HELP:            drawHelp(); break;
