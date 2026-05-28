@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["findings", "meta"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "cabinet-member", "severity", "title", "description", "autoFixable"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique finding ID: {cabinet-member}-{NNNN}",
+            "pattern": "^[a-z-]+-\\d{4}$"
+          },
+          "cabinet-member": {
+            "type": "string",
+            "description": "Cabinet member name matching the directory name in skills/cabinet-*/",
+            "pattern": "^[a-z][a-z0-9-]+$"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "warn", "info", "idea"],
+            "description": "critical = data loss/breakage, warn = degradation/drift, info = improvement opportunity, idea = suggestion"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "Short description of the finding"
+          },
+          "description": {
+            "type": "string",
+            "description": "Full explanation of the finding"
+          },
+          "assumption": {
+            "type": "string",
+            "description": "What the auditor assumes the intent was"
+          },
+          "evidence": {
+            "type": "string",
+            "description": "What was observed that led to this finding"
+          },
+          "question": {
+            "type": "string",
+            "description": "What the auditor is uncertain about — invites human judgment"
+          },
+          "file": {
+            "type": "string",
+            "description": "Primary file path relative to repo root, if applicable"
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number in the file, if applicable"
+          },
+          "suggestedFix": {
+            "type": "string",
+            "description": "Proposed fix or approach"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["finding", "positive"],
+            "default": "finding",
+            "description": "finding = issue to triage, positive = health confirmation (not triageable)"
+          },
+          "autoFixable": {
+            "type": "boolean",
+            "description": "Whether a fix agent could resolve this without human judgment"
+          },
+          "reference": {
+            "type": "string",
+            "description": "URL or source reference"
+          },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Categorization tags for filtering"
+          }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": ["cabinet-member", "timestamp"],
+      "properties": {
+        "cabinet-member": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "commitHash": { "type": "string" },
+        "durationSeconds": { "type": "number" },
+        "model": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Audit Triage</title>
+  <meta name="color-scheme" content="light dark">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      padding: 20px 24px;
+      color: #c1c2c5;
+      background: #1a1b1e;
+      font-size: 13px;
+      line-height: 1.5;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #373a40;
+    }
+    h1 { font-size: 18px; color: #fff; font-weight: 600; }
+    .run-info { color: #909296; font-size: 12px; }
+
+    /* Perspective groups */
+    .member-group {
+      margin-bottom: 16px;
+      border: 1px solid #373a40;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .member-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      background: #25262b;
+      cursor: pointer;
+      user-select: none;
+    }
+    .member-header:hover { background: #2c2e33; }
+    .member-name {
+      font-weight: 600;
+      color: #e9ecef;
+      font-size: 14px;
+    }
+    .member-stats {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+      color: #909296;
+    }
+    .member-body { padding: 0; }
+    .member-body.collapsed { display: none; }
+
+    /* Finding rows */
+    .finding {
+      padding: 10px 14px;
+      border-top: 1px solid #2c2e33;
+      transition: background 0.1s;
+    }
+    .finding:hover { background: #25262b; }
+    .finding-top {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .badge-critical { background: #e03131; color: #fff; }
+    .badge-warn { background: #f08c00; color: #fff; }
+    .badge-info { background: #1c7ed6; color: #fff; }
+    .badge-idea { background: #7048e8; color: #fff; }
+    .finding-title { color: #e9ecef; font-weight: 500; flex: 1; }
+    .finding-id { color: #5c5f66; font-size: 11px; font-family: monospace; flex-shrink: 0; }
+
+    .commentary {
+      color: #909296;
+      font-size: 12px;
+      margin: 4px 0 8px 0;
+      padding-left: 2px;
+      line-height: 1.6;
+    }
+
+    .controls {
+      display: flex;
+      gap: 5px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .verdict-btn {
+      padding: 3px 10px;
+      border: 1px solid #373a40;
+      border-radius: 4px;
+      background: #2c2e33;
+      color: #909296;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 500;
+      transition: all 0.12s;
+    }
+    .verdict-btn:hover { background: #373a40; color: #c1c2c5; }
+    .verdict-btn.sel-fix { background: #2b8a3e; color: #fff; border-color: #2b8a3e; }
+    .verdict-btn.sel-defer { background: #5c5f66; color: #fff; border-color: #5c5f66; }
+    .verdict-btn.sel-reject { background: #e03131; color: #fff; border-color: #e03131; }
+    .verdict-btn.sel-question { background: #1c7ed6; color: #fff; border-color: #1c7ed6; }
+
+    .feedback-input {
+      flex: 1;
+      min-width: 140px;
+      padding: 3px 8px;
+      border: 1px solid #373a40;
+      border-radius: 4px;
+      background: #1a1b1e;
+      color: #c1c2c5;
+      font-size: 11px;
+    }
+    .feedback-input::placeholder { color: #5c5f66; }
+
+    /* Perspective-level controls */
+    .member-controls {
+      padding: 8px 14px;
+      background: #2c2e33;
+      border-top: 1px solid #373a40;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .member-controls-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+    }
+    .member-controls-row label { color: #909296; flex-shrink: 0; }
+    .member-input {
+      flex: 1;
+      padding: 4px 8px;
+      border: 1px solid #373a40;
+      border-radius: 4px;
+      background: #1a1b1e;
+      color: #c1c2c5;
+      font-size: 12px;
+    }
+    .member-input::placeholder { color: #5c5f66; }
+    .member-q-btn {
+      padding: 3px 10px;
+      border: 1px solid #1c7ed6;
+      border-radius: 4px;
+      background: #25262b;
+      color: #1c7ed6;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 500;
+      flex-shrink: 0;
+    }
+    .member-q-btn:hover { background: #1c7ed622; }
+    .member-q-btn.active { background: #1c7ed6; color: #fff; }
+
+    /* Bulk actions */
+    .bulk-bar {
+      display: flex;
+      gap: 8px;
+      padding: 8px 14px;
+      background: #2c2e33;
+      border-top: 1px solid #373a40;
+      align-items: center;
+      font-size: 12px;
+    }
+    .bulk-bar label { color: #909296; }
+    .bulk-btn {
+      padding: 3px 10px;
+      border: 1px solid #373a40;
+      border-radius: 4px;
+      background: #25262b;
+      color: #c1c2c5;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .bulk-btn:hover { background: #373a40; }
+
+    /* Bottom bar */
+    .bottom-bar {
+      position: sticky;
+      bottom: 0;
+      background: #1a1b1e;
+      border-top: 1px solid #373a40;
+      padding: 14px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 16px;
+    }
+    .progress { color: #909296; font-size: 13px; }
+    .progress strong { color: #e9ecef; }
+    .submit-btn {
+      padding: 8px 28px;
+      background: #7048e8;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .submit-btn:hover { background: #6741d9; }
+    .submit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #status {
+      margin-top: 10px;
+      padding: 10px 14px;
+      background: #2b8a3e22;
+      border: 1px solid #2b8a3e;
+      border-radius: 6px;
+      color: #51cf66;
+      font-weight: 600;
+      display: none;
+    }
+
+    #loading {
+      text-align: center;
+      padding: 60px 20px;
+      color: #909296;
+    }
+    #loading .spinner {
+      display: inline-block;
+      width: 24px;
+      height: 24px;
+      border: 2px solid #373a40;
+      border-top-color: #7048e8;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #5c5f66;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Audit Triage</h1>
+    <span class="run-info" id="run-info"></span>
+  </header>
+
+  <div id="loading">
+    <div class="spinner"></div>
+    <div>Loading findings...</div>
+  </div>
+
+  <div id="findings-root"></div>
+
+  <div class="bottom-bar" id="bottom-bar" style="display:none">
+    <span class="progress" id="progress"></span>
+    <button class="submit-btn" id="submit-btn" disabled>Submit Verdicts</button>
+  </div>
+
+  <div id="status"></div>
+
+  <script>
+    // ── State ──
+    let findings = [];
+    const verdicts = {};  // { findingId: { verdict, feedback } }
+    const memberNotes = {};  // { member: { comment, question } }
+    const feedbackDebounce = {}; // { findingId: timeoutId }
+
+    function dedupById(items) {
+      const seen = new Set();
+      const out = [];
+      for (const f of items) {
+        if (!f || !f.id || seen.has(f.id)) continue;
+        seen.add(f.id);
+        out.push(f);
+      }
+      return out;
+    }
+
+    // POST a verdict write-through to the server (silent on failure
+    // — write-through is best-effort; submit remains the source of truth)
+    function persistVerdict(id) {
+      const v = verdicts[id] || { verdict: '', feedback: '' };
+      fetch('/api/verdict', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, verdict: v.verdict, feedback: v.feedback }),
+      }).catch(() => {});
+    }
+
+    // ── Public API for Claude (javascript_tool) ──
+    window.loadFindings = function(data) {
+      findings = dedupById(Array.isArray(data) ? data : []);
+      // Hydrate from server-persisted drafts first; recommendations only
+      // fill in when there's no prior draft.
+      findings.forEach(f => {
+        if (f.draft && f.draft.verdict !== undefined) {
+          verdicts[f.id] = {
+            verdict: f.draft.verdict || '',
+            feedback: f.draft.feedback || '',
+          };
+        } else if (f.recommendation && !verdicts[f.id]) {
+          verdicts[f.id] = { verdict: f.recommendation, feedback: '' };
+        }
+      });
+      render();
+      return `Loaded ${findings.length} findings`;
+    };
+
+    window.getVerdicts = function() {
+      return JSON.stringify({
+        total: findings.length,
+        triaged: Object.keys(verdicts).length,
+        submitted: !!window._submitted,
+        memberNotes: Object.fromEntries(
+          Object.entries(memberNotes).filter(([_, v]) => v.comment || v.question)
+        ),
+        verdicts: findings.map(f => ({
+          id: f.id,
+          'cabinet-member': f['cabinet-member'],
+          severity: f.severity,
+          title: f.title,
+          verdict: verdicts[f.id]?.verdict || null,
+          feedback: verdicts[f.id]?.feedback || '',
+        }))
+      });
+    };
+
+    window.getVerdictSummary = function() {
+      const counts = { fix: 0, defer: 0, reject: 0, question: 0, untriaged: 0 };
+      findings.forEach(f => {
+        const v = verdicts[f.id]?.verdict;
+        if (v) counts[v]++;
+        else counts.untriaged++;
+      });
+      return JSON.stringify(counts);
+    };
+
+    // ── Try fetching from server ──
+    fetch('/api/findings')
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(data => {
+        if (data.findings?.length) window.loadFindings(data.findings);
+        else showEmpty();
+      })
+      .catch(() => showEmpty());
+
+    function showEmpty() {
+      document.getElementById('loading').innerHTML =
+        '<div class="empty-state">No findings loaded.<br>Claude will inject findings via javascript_tool.</div>';
+    }
+
+    // ── Render ──
+    function render() {
+      document.getElementById('loading').style.display = 'none';
+      document.getElementById('bottom-bar').style.display = 'flex';
+
+      // Group by cabinet member
+      const groups = {};
+      findings.forEach(f => {
+        const m = f['cabinet-member'];
+        if (!groups[m]) groups[m] = [];
+        groups[m].push(f);
+      });
+
+      const root = document.getElementById('findings-root');
+      root.innerHTML = '';
+
+      // Sort members alphabetically
+      const members = Object.keys(groups).sort();
+
+      members.forEach(member => {
+        const items = groups[member];
+        const triaged = items.filter(f => verdicts[f.id]?.verdict).length;
+
+        const group = document.createElement('div');
+        group.className = 'member-group';
+
+        // Header
+        const header = document.createElement('div');
+        header.className = 'member-header';
+        header.innerHTML = `
+          <span class="member-name">${member} (${items.length})</span>
+          <span class="member-stats">
+            ${triaged}/${items.length} triaged
+          </span>
+        `;
+        header.addEventListener('click', () => {
+          body.classList.toggle('collapsed');
+        });
+        group.appendChild(header);
+
+        // Body
+        const body = document.createElement('div');
+        body.className = 'member-body';
+
+        items.forEach(f => {
+          const row = document.createElement('div');
+          row.className = 'finding';
+          const v = verdicts[f.id]?.verdict || '';
+
+          row.innerHTML = `
+            <div class="finding-top">
+              <span class="badge badge-${f.severity}">${f.severity}</span>
+              <span class="finding-title">${esc(f.title)}</span>
+              <span class="finding-id">${esc(f.id)}</span>
+            </div>
+            ${f.commentary ? `<div class="commentary">${esc(f.commentary)}</div>` : ''}
+            <div class="controls">
+              <button class="verdict-btn ${v === 'fix' ? 'sel-fix' : ''}" data-id="${f.id}" data-v="fix">Fix</button>
+              <button class="verdict-btn ${v === 'defer' ? 'sel-defer' : ''}" data-id="${f.id}" data-v="defer">Defer</button>
+              <button class="verdict-btn ${v === 'reject' ? 'sel-reject' : ''}" data-id="${f.id}" data-v="reject">Reject</button>
+              <button class="verdict-btn ${v === 'question' ? 'sel-question' : ''}" data-id="${f.id}" data-v="question">?</button>
+              <input class="feedback-input" data-id="${f.id}" placeholder="notes..." value="${esc(verdicts[f.id]?.feedback || '')}">
+            </div>
+          `;
+          body.appendChild(row);
+        });
+
+        // Bulk action bar
+        const bulk = document.createElement('div');
+        bulk.className = 'bulk-bar';
+        bulk.innerHTML = `
+          <label>Bulk:</label>
+          <button class="bulk-btn" data-p="${member}" data-v="fix">All Fix</button>
+          <button class="bulk-btn" data-p="${member}" data-v="defer">All Defer</button>
+          <button class="bulk-btn" data-p="${member}" data-v="reject">All Reject</button>
+        `;
+        body.appendChild(bulk);
+
+        // Member-level controls
+        const pn = memberNotes[member] || { comment: '', question: false };
+        const pControls = document.createElement('div');
+        pControls.className = 'member-controls';
+        pControls.innerHTML = `
+          <div class="member-controls-row">
+            <button class="member-q-btn ${pn.question ? 'active' : ''}" data-member="${member}">?</button>
+            <input class="member-input" data-member="${member}"
+              placeholder="${pn.question ? 'your question about this member...' : 'comment on this member...'}"
+              value="${esc(pn.comment || '')}">
+          </div>
+        `;
+        body.appendChild(pControls);
+
+        group.appendChild(body);
+        root.appendChild(group);
+      });
+
+      updateProgress();
+      if (document.getElementById('run-info'))
+        document.getElementById('run-info').textContent = `${findings.length} findings`;
+    }
+
+    function updateProgress() {
+      const triaged = Object.values(verdicts).filter(v => v.verdict).length;
+      const el = document.getElementById('progress');
+      el.innerHTML = `<strong>${triaged}</strong> / ${findings.length} triaged`;
+      document.getElementById('submit-btn').disabled = triaged < findings.length;
+      // Highlight feedback inputs for question verdicts
+      document.querySelectorAll('.feedback-input').forEach(input => {
+        const id = input.dataset.id;
+        if (verdicts[id]?.verdict === 'question') {
+          input.placeholder = 'your question...';
+          input.style.borderColor = '#1c7ed6';
+        } else {
+          input.placeholder = 'notes...';
+          input.style.borderColor = '#373a40';
+        }
+      });
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    // ── Event delegation ──
+    document.addEventListener('click', e => {
+      // Verdict buttons
+      if (e.target.classList.contains('verdict-btn')) {
+        const id = e.target.dataset.id;
+        const v = e.target.dataset.v;
+        if (!verdicts[id]) verdicts[id] = { verdict: '', feedback: '' };
+        verdicts[id].verdict = v;
+        persistVerdict(id);
+        render();
+      }
+      // Bulk buttons
+      if (e.target.classList.contains('bulk-btn')) {
+        const member = e.target.dataset.p;
+        const v = e.target.dataset.v;
+        findings.filter(f => f['cabinet-member'] === member).forEach(f => {
+          if (!verdicts[f.id]) verdicts[f.id] = { verdict: '', feedback: '' };
+          verdicts[f.id].verdict = v;
+          persistVerdict(f.id);
+        });
+        render();
+      }
+    });
+
+    document.addEventListener('click', e => {
+      if (e.target.classList.contains('member-q-btn')) {
+        const p = e.target.dataset.member;
+        if (!memberNotes[p]) memberNotes[p] = { comment: '', question: false };
+        memberNotes[p].question = !memberNotes[p].question;
+        render();
+      }
+    });
+
+    document.addEventListener('input', e => {
+      if (e.target.classList.contains('feedback-input')) {
+        const id = e.target.dataset.id;
+        if (!verdicts[id]) verdicts[id] = { verdict: '', feedback: '' };
+        verdicts[id].feedback = e.target.value;
+        // Debounce write-through so we don't POST on every keystroke
+        clearTimeout(feedbackDebounce[id]);
+        feedbackDebounce[id] = setTimeout(() => persistVerdict(id), 400);
+      }
+      if (e.target.classList.contains('member-input')) {
+        const p = e.target.dataset.member;
+        if (!memberNotes[p]) memberNotes[p] = { comment: '', question: false };
+        memberNotes[p].comment = e.target.value;
+      }
+    });
+
+    // Submit
+    document.getElementById('submit-btn').addEventListener('click', async () => {
+      window._submitted = true;
+      const results = window.getVerdicts();
+
+      // Try posting to server
+      try {
+        await fetch('/api/verdicts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: results,
+        });
+      } catch {}
+
+      document.getElementById('status').style.display = 'block';
+      document.getElementById('status').textContent =
+        'Verdicts submitted. Tell Claude to read results.';
+      document.getElementById('submit-btn').disabled = true;
+      document.getElementById('submit-btn').textContent = 'Submitted';
+    });
+  </script>
+</body>
+</html>
