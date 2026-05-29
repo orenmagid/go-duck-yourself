@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Go Duck Yourself</title>
 <style>
   html, body {
@@ -124,7 +125,7 @@ const HELP_PAGES = [
     title: 'DUCKLINGS',
     lines: [
       "Sometimes a bush or rock hides a DUCKLING.",
-      "When you have one, press SPACE (or tap) to throw.",
+      "When you have one, press SPACE or use 2nd finger to throw.",
       "Lands as a worker — finds ducks for you.",
       "Throw it at a rival to defeat them.",
     ],
@@ -448,8 +449,8 @@ canvas.addEventListener('mousemove', e => {
 canvas.addEventListener('mousedown', () => { ensureAudio(); mouse.down = true; mouse.clicked = true; });
 canvas.addEventListener('mouseup',   () => { mouse.down = false; });
 
-// Touch (iPad / mobile) — translates the first touch into the mouse model
-let touchState = { active: false, startX: 0, startY: 0, currentX: 0, currentY: 0 };
+// Touch (iPad / mobile) — first finger = joystick, second finger = tap-to-throw
+let touchState = { active: false, id: null, startX: 0, startY: 0, currentX: 0, currentY: 0 };
 
 function touchPos(t) {
   const rect = canvas.getBoundingClientRect();
@@ -462,41 +463,66 @@ function touchPos(t) {
 canvas.addEventListener('touchstart', e => {
   ensureAudio();
   e.preventDefault();
-  if (e.touches.length > 1) return;
-  const pos = touchPos(e.touches[0]);
-  touchState.active = true;
-  touchState.startX = pos.x;
-  touchState.startY = pos.y;
-  touchState.currentX = pos.x;
-  touchState.currentY = pos.y;
-  mouse.x = pos.x;
-  mouse.y = pos.y;
+  for (const touch of e.changedTouches) {
+    if (!touchState.active) {
+      // First finger: start joystick
+      const pos = touchPos(touch);
+      touchState.active = true;
+      touchState.id = touch.identifier;
+      touchState.startX = pos.x;
+      touchState.startY = pos.y;
+      touchState.currentX = pos.x;
+      touchState.currentY = pos.y;
+      mouse.x = pos.x;
+      mouse.y = pos.y;
+    } else {
+      // Second finger: tap-to-act at this location (throw duckling / shoot)
+      const pos = touchPos(touch);
+      mouse.x = pos.x;
+      mouse.y = pos.y;
+      mouse.clicked = true;
+    }
+  }
 }, { passive: false });
 
 canvas.addEventListener('touchmove', e => {
   e.preventDefault();
-  if (e.touches.length > 1) return;
-  const pos = touchPos(e.touches[0]);
-  touchState.currentX = pos.x;
-  touchState.currentY = pos.y;
-  mouse.x = pos.x;
-  mouse.y = pos.y;
+  for (const touch of e.changedTouches) {
+    if (touch.identifier === touchState.id) {
+      const pos = touchPos(touch);
+      touchState.currentX = pos.x;
+      touchState.currentY = pos.y;
+      mouse.x = pos.x;
+      mouse.y = pos.y;
+    }
+  }
 }, { passive: false });
 
 canvas.addEventListener('touchend', e => {
   e.preventDefault();
-  const dx = touchState.currentX - touchState.startX;
-  const dy = touchState.currentY - touchState.startY;
-  const moved = Math.hypot(dx, dy);
-  if (touchState.active && moved < 12) {
-    // It's a tap — synthesize a click. mouse.x/y is already at the tap location.
-    mouse.clicked = true;
+  for (const touch of e.changedTouches) {
+    if (touch.identifier === touchState.id) {
+      const dx = touchState.currentX - touchState.startX;
+      const dy = touchState.currentY - touchState.startY;
+      const moved = Math.hypot(dx, dy);
+      if (moved < 12) {
+        mouse.x = touchState.currentX;
+        mouse.y = touchState.currentY;
+        mouse.clicked = true;
+      }
+      touchState.active = false;
+      touchState.id = null;
+    }
   }
-  touchState.active = false;
 }, { passive: false });
 
 canvas.addEventListener('touchcancel', e => {
-  touchState.active = false;
+  for (const touch of e.changedTouches) {
+    if (touch.identifier === touchState.id) {
+      touchState.active = false;
+      touchState.id = null;
+    }
+  }
 }, { passive: false });
 
 // --- Ducklings (player-thrown helpers) ---
@@ -1668,13 +1694,13 @@ function drawDucktopia() {
       state = STATES.LEVEL_END;
     }
     if (ducklings > 0) {
-      drawText('SPACE to throw a duckling at your mouse', W/2, H - 90, 16, '#1a1a2e');
+      drawText('SPACE / 2nd finger to throw a duckling', W/2, H - 90, 16, '#1a1a2e');
     }
   } else {
     drawText('Walk around. Search bushes and rocks.', W/2, H - 32, 18, '#1a1a2e');
     drawText('Arrow keys or WASD.', W/2, H - 12, 16, '#1a1a2e');
     if (ducklings > 0) {
-      drawText('SPACE to throw a duckling at your mouse', W/2, H - 52, 16, '#1a1a2e');
+      drawText('SPACE / 2nd finger to throw a duckling', W/2, H - 52, 16, '#1a1a2e');
     }
   }
 
@@ -2190,6 +2216,12 @@ function drawDuckOffBattle() {
       if (mouse.clicked && !mouse.clickConsumed) {
         shouldThrow = true;
       }
+      // Auto-fire while moving via touch (iPad single-finger fix)
+      if (touchState.active) {
+        const tdx = touchState.currentX - touchState.startX;
+        const tdy = touchState.currentY - touchState.startY;
+        if (Math.hypot(tdx, tdy) > 12) shouldThrow = true;
+      }
       if (shouldThrow) {
         throwBattleProjectile(true, battlePlayer.x, battlePlayer.y, battleGoose.x, battleGoose.y);
         lastPlayerThrow = now;
@@ -2313,7 +2345,7 @@ function drawDuckOffBattle() {
 
   // ---- hint ----
   if (!battleEnding) {
-    drawText('SPACE or TAP to throw • Arrow keys / drag to move', W/2, H - 14, 14, '#bbb');
+    drawText('SPACE or TAP to throw • Arrow keys / drag to move (auto-fires!)', W/2, H - 14, 14, '#bbb');
   }
 }
 
