@@ -94,8 +94,24 @@ const TOOLS = [
         area: { type: 'string', description: 'Area (e.g., dev, ops, docs)' },
         notes: { type: 'string', description: 'Project notes' },
         due: { type: 'string', description: 'Due date (YYYY-MM-DD)' },
+        tags: { type: 'string', description: 'Comma-separated tags (e.g., client-visible)' },
       },
       required: ['name'],
+    },
+  },
+  {
+    name: 'pib_update_project',
+    description: 'Update fields on an existing project.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fid: { type: 'string', description: 'Project fid (e.g., prj:abc12345)' },
+        tags: { type: 'string', description: 'Comma-separated tags' },
+        name: { type: 'string', description: 'New project name' },
+        status: { type: 'string', description: 'New status', enum: ['active', 'paused', 'done', 'dropped', 'someday'] },
+        notes: { type: 'string', description: 'Updated notes' },
+      },
+      required: ['fid'],
     },
   },
   {
@@ -301,6 +317,8 @@ function handleToolCall(name, args) {
   switch (name) {
     case 'pib_create_project':
       return lib.createProject(d, args);
+    case 'pib_update_project':
+      return lib.updateProject(d, args);
     case 'pib_list_projects':
       return lib.listProjects(d);
     case 'pib_create_action':

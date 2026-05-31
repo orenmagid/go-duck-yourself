@@ -31,7 +31,8 @@ function today() {
 //   3 — added trigger_condition on actions/projects + trigger_checks history
 //   4 — composite index on trigger_checks(target_fid, checked_at DESC) for listTriggered
 //   5 — added engagement_events append-only log + 3 indexes (engagement mgmt)
-export const SCHEMA_VERSION = 5;
+//   6 — added projects.tags (symmetric with actions.tags at v2)
+export const SCHEMA_VERSION = 6;
 
 // Each entry: { version, sql }. A single version may have multiple SQL
 // statements (e.g. column add + index). Statements run in array order;
@@ -71,6 +72,7 @@ const MIGRATIONS = [
   { version: 5, sql: "CREATE INDEX IF NOT EXISTS idx_engagement_events_eng ON engagement_events(engagement, created_at DESC)" },
   { version: 5, sql: "CREATE INDEX IF NOT EXISTS idx_engagement_events_tgt ON engagement_events(target_fid, created_at DESC)" },
   { version: 5, sql: "CREATE INDEX IF NOT EXISTS idx_engagement_events_dedup ON engagement_events(packet_id, target_fid, verdict)" },
+  { version: 6, sql: "ALTER TABLE projects ADD COLUMN tags TEXT NOT NULL DEFAULT ''" },
 ];
 
 export function migrate(db) {
@@ -279,18 +281,36 @@ export function getAction(db, { fid }) {
 // ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
-export function createProject(db, { name, area, notes, due }) {
+export function createProject(db, { name, area, notes, due, tags }) {
   const fid = generateFid('prj');
   db.prepare(`
-    INSERT INTO projects (fid, name, area, notes, due, created)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(fid, name, area || null, notes || '', due || null, today());
+    INSERT INTO projects (fid, name, area, notes, due, tags, created)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(fid, name, area || null, notes || '', due || null, tags || '', today());
   return { fid, name, message: `Created project ${fid}: ${name}` };
+}
+
+export function updateProject(db, { fid, tags, name, status, notes }) {
+  const sets = [];
+  const params = [];
+  if (tags !== undefined) { sets.push('tags = ?'); params.push(tags); }
+  if (name !== undefined) { sets.push('name = ?'); params.push(name); }
+  if (status !== undefined) { sets.push('status = ?'); params.push(status); }
+  if (notes !== undefined) { sets.push('notes = ?'); params.push(notes); }
+  if (sets.length === 0) {
+    return { error: { message: 'No fields to update. Use tags, name, status, or notes.' } };
+  }
+  params.push(fid);
+  const result = db.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE fid = ?`).run(...params);
+  if (result.changes === 0) {
+    return { error: { message: `Project ${fid} not found` } };
+  }
+  return { fid, message: `Updated ${fid}` };
 }
 
 export function listProjects(db) {
   const rows = db.prepare(`
-    SELECT p.fid, p.name, p.area, p.status, p.due,
+    SELECT p.fid, p.name, p.area, p.status, p.due, p.notes, p.tags, p.deleted_at,
       (SELECT COUNT(*) FROM actions a WHERE a.project_fid = p.fid AND a.completed = 0 AND a.deleted_at IS NULL) as open_actions
     FROM projects p
     WHERE p.status = 'active' AND p.deleted_at IS NULL

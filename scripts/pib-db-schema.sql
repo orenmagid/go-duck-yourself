@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS projects (
   completed_at       TEXT,
   due                TEXT,
   deleted_at         TEXT,
-  trigger_condition  TEXT
+  trigger_condition  TEXT,
+  tags               TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS actions (

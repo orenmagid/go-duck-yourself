@@ -194,6 +194,12 @@ switch (command) {
     printResult(lib.createProject(getDb(), { name: positional[0], ...flags }));
     break;
   }
+  case 'update-project': {
+    const fid = args[0];
+    const { flags } = parseFlags(args.slice(1));
+    printResult(lib.updateProject(getDb(), { fid, ...flags }));
+    break;
+  }
   case 'list-projects':
     printResult(lib.listProjects(getDb()));
     break;
@@ -227,7 +233,8 @@ Commands:
   list-events [--engagement prj:X] [--target act:Y] [--unaddressed-only] [--exclude-soft-deleted]
                                     List engagement events (newest first)
   mark-event-addressed <id>         Mark an engagement event addressed
-  create-project "name" [--area X]  Create a project
+  create-project "name" [--area X] [--tags X]  Create a project
+  update-project <fid> [--tags X] [--name X] [--status X] [--notes X]
   list-projects                     List active projects
   ingest-findings <run-dir>         Ingest audit findings from a run directory
   triage <finding-id> <status>      Triage a finding (approved/rejected/deferred/fixed)
