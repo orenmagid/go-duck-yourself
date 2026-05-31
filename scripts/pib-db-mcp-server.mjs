@@ -238,6 +238,48 @@ const TOOLS = [
     },
   },
   {
+    name: 'pib_add_engagement_event',
+    description: 'Append an event to a consulting engagement\'s append-only log (client feedback, approvals, status pushes, delegations, notes, packet-sent markers). All writes route through here — no raw INSERT. The caller must pass allowedAuthors (the engagement\'s recipient ids + "consultant", derived from engagement.yaml); the author allowlist is enforced fail-closed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        engagement: { type: 'string', description: 'Engagement project fid (prj:*). Must exist.' },
+        target_fid: { type: 'string', description: 'Action fid this event is about (act:*), or omit for engagement-level events.' },
+        packet_id: { type: 'string', description: 'Packet identifier this event relates to.' },
+        kind: { type: 'string', enum: ['client_feedback', 'status_push', 'delegation', 'approval', 'note', 'packet_sent'], description: 'Event kind. client_feedback and approval require a meaningful verdict.' },
+        author: { type: 'string', description: 'Who authored the event. Must be in allowedAuthors.' },
+        verdict: { type: 'string', enum: ['approve', 'object', 'comment', 'none'], description: 'Required (approve|object|comment) for client_feedback and approval kinds.' },
+        body: { type: 'string', description: 'Free-text body (≤10000 chars).' },
+        allowedAuthors: { type: 'array', items: { type: 'string' }, description: 'Non-empty allowlist of valid authors (recipient ids + "consultant"). Empty/omitted rejects all (fail-closed).' },
+      },
+      required: ['engagement', 'kind', 'author', 'allowedAuthors'],
+    },
+  },
+  {
+    name: 'pib_list_engagement_events',
+    description: 'List engagement events (newest first). Filter by engagement, target action, unaddressed-only, and exclude events whose target action was soft-deleted (engagement-level events with no target are always kept).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        engagement: { type: 'string', description: 'Scope to one engagement (prj:*).' },
+        target_fid: { type: 'string', description: 'Scope to one action\'s events (act:*).' },
+        unaddressedOnly: { type: 'boolean', description: 'Only events not yet marked addressed.' },
+        excludeSoftDeleted: { type: 'boolean', description: 'Drop events whose target action is soft-deleted.' },
+      },
+    },
+  },
+  {
+    name: 'pib_mark_event_addressed',
+    description: 'Mark an engagement event as addressed (the consultant has triaged it).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer', description: 'Engagement event id.' },
+      },
+      required: ['id'],
+    },
+  },
+  {
     name: 'pib_query',
     description: 'Run an arbitrary SQL query against the pib database.',
     inputSchema: {
@@ -283,6 +325,15 @@ function handleToolCall(name, args) {
       return lib.listTriggered(d, args);
     case 'pib_mark_trigger_checked':
       return lib.markTriggerChecked(d, args);
+    case 'pib_add_engagement_event':
+      // args carries the event payload plus allowedAuthors; the lib
+      // destructures the payload fields it needs and takes allowedAuthors
+      // as a separate argument (ignoring the extra key on the payload).
+      return lib.addEngagementEvent(d, args, args.allowedAuthors);
+    case 'pib_list_engagement_events':
+      return lib.listEngagementEvents(d, args);
+    case 'pib_mark_event_addressed':
+      return lib.markEventAddressed(d, args);
     case 'pib_query':
       return lib.query(d, args);
     default:

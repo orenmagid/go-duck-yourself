@@ -16,6 +16,9 @@
 //   node scripts/pib-db.mjs defer-with-trigger act:abc --trigger "<text>" [--cascade]
 //   node scripts/pib-db.mjs list-triggered [--include-done]
 //   node scripts/pib-db.mjs mark-trigger-checked act:abc --result <value> [--notes "<text>"]
+//   node scripts/pib-db.mjs add-event --engagement prj:abc --kind note --author consultant --allowed-authors "consultant,ed"
+//   node scripts/pib-db.mjs list-events [--engagement prj:abc] [--target act:xyz] [--unaddressed-only] [--exclude-soft-deleted]
+//   node scripts/pib-db.mjs mark-event-addressed <id>
 //   node scripts/pib-db.mjs ingest-findings <run-dir>   # Ingest audit findings
 //   node scripts/pib-db.mjs triage <finding-id> <status> [notes]
 //   node scripts/pib-db.mjs triage-history              # Suppression list JSON
@@ -152,6 +155,40 @@ switch (command) {
     }));
     break;
   }
+  case 'add-event': {
+    const { flags } = parseFlags(args);
+    // allowedAuthors comes from the caller (the engagement-sync skill reads
+    // engagement.yaml and passes the recipient ids + 'consultant' here). The
+    // CLI itself stays config-agnostic. Absent flag → undefined → fail-closed.
+    const allowedAuthors = typeof flags['allowed-authors'] === 'string'
+      ? flags['allowed-authors'].split(',').map(s => s.trim()).filter(Boolean)
+      : undefined;
+    printResult(lib.addEngagementEvent(getDb(), {
+      engagement: flags.engagement,
+      target_fid: typeof flags.target === 'string' ? flags.target : undefined,
+      packet_id: typeof flags['packet-id'] === 'string' ? flags['packet-id'] : undefined,
+      kind: flags.kind,
+      author: flags.author,
+      verdict: typeof flags.verdict === 'string' ? flags.verdict : undefined,
+      body: typeof flags.body === 'string' ? flags.body : undefined,
+    }, allowedAuthors));
+    break;
+  }
+  case 'list-events': {
+    const { flags } = parseFlags(args);
+    printResult(lib.listEngagementEvents(getDb(), {
+      engagement: typeof flags.engagement === 'string' ? flags.engagement : undefined,
+      target_fid: typeof flags.target === 'string' ? flags.target : undefined,
+      unaddressedOnly: flags['unaddressed-only'] === true,
+      excludeSoftDeleted: flags['exclude-soft-deleted'] === true,
+    }));
+    break;
+  }
+  case 'mark-event-addressed': {
+    const { positional } = parseFlags(args);
+    printResult(lib.markEventAddressed(getDb(), { id: positional[0] }));
+    break;
+  }
   case 'create-project': {
     const { flags, positional } = parseFlags(args);
     printResult(lib.createProject(getDb(), { name: positional[0], ...flags }));
@@ -184,6 +221,12 @@ Commands:
   list-triggered [--include-done]   List items waiting on triggers
   mark-trigger-checked <fid> --result <value> [--notes "<text>"]
                                     Record trigger evaluation (triggered|still-waiting|needs-info|condition-obsolete)
+  add-event --engagement prj:X --kind <kind> --author <a> --allowed-authors "a,b,c"
+            [--target act:Y] [--packet-id P] [--verdict approve|object|comment|none] [--body "text"]
+                                    Append an engagement event (kinds: client_feedback,status_push,delegation,approval,note,packet_sent)
+  list-events [--engagement prj:X] [--target act:Y] [--unaddressed-only] [--exclude-soft-deleted]
+                                    List engagement events (newest first)
+  mark-event-addressed <id>         Mark an engagement event addressed
   create-project "name" [--area X]  Create a project
   list-projects                     List active projects
   ingest-findings <run-dir>         Ingest audit findings from a run directory

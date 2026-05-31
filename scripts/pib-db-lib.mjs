@@ -30,7 +30,8 @@ function today() {
 //   2 — added actions.tags
 //   3 — added trigger_condition on actions/projects + trigger_checks history
 //   4 — composite index on trigger_checks(target_fid, checked_at DESC) for listTriggered
-export const SCHEMA_VERSION = 4;
+//   5 — added engagement_events append-only log + 3 indexes (engagement mgmt)
+export const SCHEMA_VERSION = 5;
 
 // Each entry: { version, sql }. A single version may have multiple SQL
 // statements (e.g. column add + index). Statements run in array order;
@@ -52,6 +53,24 @@ const MIGRATIONS = [
   )` },
   { version: 3, sql: "CREATE INDEX IF NOT EXISTS idx_trigger_checks_fid ON trigger_checks(target_fid)" },
   { version: 4, sql: "CREATE INDEX IF NOT EXISTS idx_trigger_checks_target_time ON trigger_checks(target_fid, checked_at DESC)" },
+  { version: 5, sql: `CREATE TABLE IF NOT EXISTS engagement_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    engagement    TEXT NOT NULL REFERENCES projects(fid),
+    target_fid    TEXT,
+    packet_id     TEXT,
+    kind          TEXT NOT NULL
+                    CHECK(kind IN ('client_feedback','status_push','delegation','approval','note','packet_sent')),
+    author        TEXT NOT NULL,
+    verdict       TEXT CHECK(verdict IS NULL OR verdict IN ('approve','object','comment','none')),
+    body          TEXT CHECK(body IS NULL OR length(body) <= 10000),
+    addressed     INTEGER NOT NULL DEFAULT 0 CHECK(addressed IN (0,1)),
+    created_at    TEXT NOT NULL CHECK(created_at GLOB '????-??-??T*'),
+    CHECK(kind NOT IN ('client_feedback','approval')
+          OR (verdict IS NOT NULL AND verdict IN ('approve','object','comment')))
+  )` },
+  { version: 5, sql: "CREATE INDEX IF NOT EXISTS idx_engagement_events_eng ON engagement_events(engagement, created_at DESC)" },
+  { version: 5, sql: "CREATE INDEX IF NOT EXISTS idx_engagement_events_tgt ON engagement_events(target_fid, created_at DESC)" },
+  { version: 5, sql: "CREATE INDEX IF NOT EXISTS idx_engagement_events_dedup ON engagement_events(packet_id, target_fid, verdict)" },
 ];
 
 export function migrate(db) {
@@ -499,4 +518,168 @@ export function markTriggerChecked(db, { fid, result, notes } = {}) {
   `).run(table, fid, checkedAt, result, notes || null);
 
   return { fid, checkedAt, result, message: `Recorded trigger check for ${fid}: ${result}` };
+}
+
+// ---------------------------------------------------------------------------
+// Engagement events (schema v5) — append-only log for consulting engagements
+// ---------------------------------------------------------------------------
+// All writes route through addEngagementEvent (CLI and MCP both call it; no
+// raw INSERT). The library stays config-agnostic: it never reads engagement
+// yaml — the caller passes allowedAuthors (recipient ids + 'consultant')
+// derived from config, and the author allowlist is enforced fail-closed.
+export const ENGAGEMENT_EVENT_KINDS = ['client_feedback', 'status_push', 'delegation', 'approval', 'note', 'packet_sent'];
+// STORAGE verdicts. Duplicated (no single SoT across JS/SQL) in: the
+// engagement_events CHECK in pib-db-schema.sql AND the v5 MIGRATIONS entry
+// above. The client-side superset is FEEDBACK_VERDICTS in engagement.mjs.
+// Keep all four in sync if you add/rename a verdict.
+export const ENGAGEMENT_VERDICTS = ['approve', 'object', 'comment', 'none'];
+// Kinds that must carry a meaningful verdict (not NULL, not 'none').
+const ENGAGEMENT_VERDICT_REQUIRED_KINDS = ['client_feedback', 'approval'];
+const ENGAGEMENT_MEANINGFUL_VERDICTS = ['approve', 'object', 'comment'];
+const ENGAGEMENT_BODY_MAX_LENGTH = 10000;
+
+/**
+ * Append an engagement event. Returns the inserted row's id (or the existing
+ * id when a dedup match is found). Validates the engagement exists, the
+ * author is in the allowlist (fail-closed), the kind/verdict enums, and the
+ * body length before touching the DB.
+ *
+ * Dedup is advisory, not a hard constraint: when packet_id, target_fid, and
+ * verdict are all non-null (a real feedback/approval response), an identical
+ * (packet_id, target_fid, verdict) triple is treated as a duplicate and not
+ * re-inserted. Distinct verdicts for the same (packet_id, target_fid) are
+ * preserved as separate rows. packet_sent rows (target_fid/verdict NULL) are
+ * never deduped — duplicates there are harmless (file rename is primary state).
+ */
+export function addEngagementEvent(db, { engagement, target_fid, packet_id, kind, author, verdict, body } = {}, allowedAuthors) {
+  // engagement must be a project fid that exists and is not soft-deleted.
+  const engError = validateFid(engagement);
+  if (engError) return { error: { error: 'invalid_engagement', message: `engagement must be a valid fid: ${engError.message}` } };
+  if (!engagement.startsWith('prj:')) {
+    return { error: { error: 'invalid_engagement', message: `engagement must be a project fid (prj:*), got "${engagement}"` } };
+  }
+  const engRow = db.prepare(`SELECT fid FROM projects WHERE fid = ? AND deleted_at IS NULL`).get(engagement);
+  if (!engRow) return { error: { error: 'engagement_not_found', message: `No engagement (project) with fid ${engagement}` } };
+
+  // target_fid is optional; when present it must be an action fid (no
+  // existence check — append-only audit, action may be deleted later).
+  if (target_fid !== undefined && target_fid !== null) {
+    const tgtError = validateFid(target_fid);
+    if (tgtError) return { error: { error: 'invalid_target_fid', message: `target_fid must be a valid fid or null: ${tgtError.message}` } };
+    if (!target_fid.startsWith('act:')) {
+      return { error: { error: 'invalid_target_fid', message: `target_fid must be an action fid (act:*) or null, got "${target_fid}"` } };
+    }
+  }
+
+  if (!ENGAGEMENT_EVENT_KINDS.includes(kind)) {
+    return { error: { error: 'invalid_kind', message: `kind must be one of: ${ENGAGEMENT_EVENT_KINDS.join(', ')}`, got: kind } };
+  }
+
+  if (verdict !== undefined && verdict !== null && !ENGAGEMENT_VERDICTS.includes(verdict)) {
+    return { error: { error: 'invalid_verdict', message: `verdict must be one of: ${ENGAGEMENT_VERDICTS.join(', ')} (or null)`, got: verdict } };
+  }
+  if (ENGAGEMENT_VERDICT_REQUIRED_KINDS.includes(kind) && !ENGAGEMENT_MEANINGFUL_VERDICTS.includes(verdict)) {
+    return { error: { error: 'verdict_required', message: `kind "${kind}" requires a meaningful verdict (${ENGAGEMENT_MEANINGFUL_VERDICTS.join(', ')}), got "${verdict ?? 'null'}"` } };
+  }
+
+  // Author allowlist — fail closed. Missing/empty/non-array allowedAuthors
+  // rejects every author rather than silently accepting any.
+  if (!Array.isArray(allowedAuthors) || allowedAuthors.length === 0) {
+    return { error: { error: 'no_allowed_authors', message: 'allowedAuthors must be a non-empty array (fail-closed)' } };
+  }
+  if (typeof author !== 'string' || !allowedAuthors.includes(author)) {
+    return { error: { error: 'author_not_allowed', message: `author "${author}" is not in allowedAuthors`, allowedAuthors } };
+  }
+
+  if (body !== undefined && body !== null) {
+    if (typeof body !== 'string') {
+      return { error: { error: 'invalid_body', message: 'body must be a string or null' } };
+    }
+    if (body.length > ENGAGEMENT_BODY_MAX_LENGTH) {
+      return { error: { error: 'body_too_long', message: `body must be ≤${ENGAGEMENT_BODY_MAX_LENGTH} chars, got ${body.length}` } };
+    }
+  }
+
+  // Advisory dedup: only when all three core key parts are present. Body is
+  // part of the key so that two responses mapping to the same verdict but
+  // carrying distinct content (e.g. a 'provided' value and a 'credential_sent'
+  // envelope_id, both stored as verdict='comment') don't collapse — and so a
+  // client can correct a value by re-sending with new content. Identical
+  // re-feeds (same body) still dedup, preserving idempotence.
+  if (packet_id != null && target_fid != null && verdict != null) {
+    const existing = db.prepare(
+      `SELECT id FROM engagement_events
+       WHERE packet_id = ? AND target_fid = ? AND verdict = ? AND IFNULL(body,'') = IFNULL(?,'') LIMIT 1`
+    ).get(packet_id, target_fid, verdict, body ?? null);
+    if (existing) {
+      return { id: existing.id, deduped: true, message: `Duplicate event skipped (id ${existing.id})` };
+    }
+  }
+
+  const createdAt = new Date().toISOString();
+  const result = db.prepare(`
+    INSERT INTO engagement_events (engagement, target_fid, packet_id, kind, author, verdict, body, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(engagement, target_fid ?? null, packet_id ?? null, kind, author, verdict ?? null, body ?? null, createdAt);
+
+  return {
+    id: Number(result.lastInsertRowid),
+    engagement,
+    kind,
+    created_at: createdAt,
+    message: `Recorded engagement event ${result.lastInsertRowid} (${kind}) for ${engagement}`,
+  };
+}
+
+/**
+ * List engagement events, newest first. Filters:
+ * - engagement: scope to one engagement (project fid)
+ * - target_fid: scope to one action's events
+ * - unaddressedOnly: only events with addressed = 0
+ * - excludeSoftDeleted: drop events whose target action is soft-deleted.
+ *   Engagement-level events (target_fid IS NULL) are ALWAYS kept — the
+ *   LEFT JOIN produces a NULL deleted_at for them, and the WHERE clause
+ *   explicitly retains them.
+ */
+export function listEngagementEvents(db, { engagement, target_fid, unaddressedOnly = false, excludeSoftDeleted = false } = {}) {
+  const conditions = [];
+  const params = [];
+
+  if (engagement) { conditions.push('e.engagement = ?'); params.push(engagement); }
+  if (target_fid) { conditions.push('e.target_fid = ?'); params.push(target_fid); }
+  if (unaddressedOnly) { conditions.push('e.addressed = 0'); }
+  if (excludeSoftDeleted) {
+    // Keep engagement-level events (no target) and events whose target
+    // action is not soft-deleted. a.deleted_at is NULL both when the action
+    // is live AND when there is no joined action row (target_fid NULL) —
+    // the explicit "e.target_fid IS NULL" guards the engagement-level case.
+    conditions.push('(e.target_fid IS NULL OR a.deleted_at IS NULL)');
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const join = excludeSoftDeleted ? 'LEFT JOIN actions a ON e.target_fid = a.fid' : '';
+
+  const rows = db.prepare(`
+    SELECT e.id, e.engagement, e.target_fid, e.packet_id, e.kind, e.author,
+           e.verdict, e.body, e.addressed, e.created_at
+    FROM engagement_events e
+    ${join}
+    ${where}
+    ORDER BY e.created_at DESC, e.id DESC
+  `).all(...params);
+
+  return { rows };
+}
+
+/** Mark an engagement event addressed (consultant has triaged it). */
+export function markEventAddressed(db, { id } = {}) {
+  const numId = Number(id);
+  if (!Number.isInteger(numId) || numId <= 0) {
+    return { error: { error: 'invalid_id', message: `id must be a positive integer, got "${id}"` } };
+  }
+  const result = db.prepare(`UPDATE engagement_events SET addressed = 1 WHERE id = ?`).run(numId);
+  if (result.changes === 0) {
+    return { error: { error: 'not_found', message: `No engagement event with id ${numId}` } };
+  }
+  return { id: numId, addressed: 1, message: `Marked engagement event ${numId} addressed` };
 }

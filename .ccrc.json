@@ -18,8 +18,8 @@
     ],
     "date": "2026-05-28T14:40:48.357Z"
   },
-  "version": "0.33.0",
-  "installedAt": "2026-05-31T14:24:00.417Z",
+  "version": "0.33.1",
+  "installedAt": "2026-05-31T14:52:15.706Z",
   "upstreamPackage": "create-claude-cabinet",
   "modules": {
     "session-loop": true,
@@ -253,6 +253,10 @@
     ".claude/engagement/engagement.mjs": "33f9113fd0ae49d2",
     ".claude/engagement/example-checklist.yaml": "3bd39c28bdbbbdd3",
     ".claude/engagement/generate-keys.mjs": "826851cafd08fe5d",
+    ".claude/engagement/pib-db-patches/pib-db-lib.mjs": "afc956bc02475dda",
+    ".claude/engagement/pib-db-patches/pib-db-mcp-server.mjs": "e3eb5ea7c42c51cc",
+    ".claude/engagement/pib-db-patches/pib-db-schema.sql": "2707043b6c63a215",
+    ".claude/engagement/pib-db-patches/pib-db.mjs": "71bed9b9b671e149",
     ".claude/engagement/pibdb-adapter.mjs": "4433b7d9d6e32419",
     ".claude/engagement/schema.md": "7b431c9232d25bfc",
     ".claude/engagement/secure-input.mjs": "4c9ea5a348daf099"

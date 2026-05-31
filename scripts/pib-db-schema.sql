@@ -85,3 +85,45 @@ CREATE TABLE IF NOT EXISTS trigger_checks (
   notes         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trigger_checks_fid ON trigger_checks(target_fid);
+CREATE INDEX IF NOT EXISTS idx_trigger_checks_target_time ON trigger_checks(target_fid, checked_at DESC);
+
+-- Append-only engagement event log (schema v5). Records the multi-party
+-- workflow state of a consulting engagement: client feedback, approvals,
+-- status pushes, delegations, notes, and packet-sent markers.
+--
+-- engagement   -> projects(fid). FK enforced (foreign_keys = ON), so an
+--                 event can never reference a non-existent engagement.
+-- target_fid   -> an action fid, or NULL for engagement-level events. NO FK
+--                 by design: like trigger_checks, this is append-only audit
+--                 and a later soft/hard delete of the action must not erase
+--                 history. listEngagementEvents({excludeSoftDeleted}) filters
+--                 against actions.deleted_at at read time instead.
+-- verdict      -> nullable; required (and meaningful, not 'none') for
+--                 client_feedback and approval kinds via the table CHECK.
+-- dedup index  -> non-UNIQUE lookup aid. Dedup is an application-layer
+--                 SELECT-before-insert in addEngagementEvent (distinct
+--                 verdicts for the same (packet_id,target_fid) are preserved;
+--                 packet_sent rows with NULL target_fid/verdict may duplicate
+--                 harmlessly). It is intentionally not a hard UNIQUE constraint.
+CREATE TABLE IF NOT EXISTS engagement_events (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  engagement    TEXT NOT NULL REFERENCES projects(fid),
+  target_fid    TEXT,
+  packet_id     TEXT,
+  kind          TEXT NOT NULL
+                  CHECK(kind IN ('client_feedback','status_push','delegation','approval','note','packet_sent')),
+  author        TEXT NOT NULL,
+  verdict       TEXT CHECK(verdict IS NULL OR verdict IN ('approve','object','comment','none')),
+  body          TEXT CHECK(body IS NULL OR length(body) <= 10000),
+  addressed     INTEGER NOT NULL DEFAULT 0 CHECK(addressed IN (0,1)),
+  created_at    TEXT NOT NULL CHECK(created_at GLOB '????-??-??T*'),
+  -- client_feedback and approval must carry a meaningful verdict ('none'
+  -- and NULL are both rejected for those kinds). The explicit IS NOT NULL
+  -- is required: SQLite CHECK passes on NULL (3-valued logic), so without it
+  -- a NULL verdict would slip through for these kinds.
+  CHECK(kind NOT IN ('client_feedback','approval')
+        OR (verdict IS NOT NULL AND verdict IN ('approve','object','comment')))
+);
+CREATE INDEX IF NOT EXISTS idx_engagement_events_eng ON engagement_events(engagement, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_engagement_events_tgt ON engagement_events(target_fid, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_engagement_events_dedup ON engagement_events(packet_id, target_fid, verdict);
