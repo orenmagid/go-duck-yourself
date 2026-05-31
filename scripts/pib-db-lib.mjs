@@ -138,7 +138,7 @@ function validateSurfaceArea(notes) {
   }
 
   // Extract everything after ## Surface Area until the next ## or end
-  const sectionMatch = notes.match(/^## Surface Area\s*\n([\s\S]*?)(?=\n## |\n*$)/m);
+  const sectionMatch = notes.match(/^## Surface Area[^\n]*\n([\s\S]*?)(?=\n## |\n*$)/m);
   const sectionBody = sectionMatch ? sectionMatch[1] : '';
   const hasEntry = /^- (?:files|dirs):/m.test(sectionBody);
   if (!hasEntry) {
@@ -226,10 +226,23 @@ export function updateAction(db, { fid, status, text, tags, notes, due, flagged 
 }
 
 export function completeAction(db, { fid }) {
-  db.prepare(`
+  const fidError = validateFid(fid);
+  if (fidError) return fidError;
+
+  const row = db.prepare(
+    `SELECT fid, text, completed FROM actions WHERE fid = ? AND deleted_at IS NULL`
+  ).get(fid);
+  if (!row) return { error: 'not_found', message: `No action with fid ${fid}` };
+  if (row.completed === 1) return { error: 'already_done', message: `${fid} already completed` };
+
+  const result = db.prepare(`
     UPDATE actions SET completed = 1, completed_at = ?, status = 'done' WHERE fid = ?
   `).run(new Date().toISOString(), fid);
-  return { fid, message: `Completed ${fid}` };
+
+  if (result.changes === 0) {
+    return { error: 'update_failed', message: `UPDATE matched no rows for ${fid}` };
+  }
+  return { fid, text: row.text, message: `Completed ${fid}: ${row.text}` };
 }
 
 export function getAction(db, { fid }) {
