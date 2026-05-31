@@ -18,8 +18,8 @@
     ],
     "date": "2026-05-28T14:40:48.357Z"
   },
-  "version": "0.31.0",
-  "installedAt": "2026-05-30T22:53:01.566Z",
+  "version": "0.31.1",
+  "installedAt": "2026-05-31T00:46:03.045Z",
   "upstreamPackage": "create-claude-cabinet",
   "modules": {
     "session-loop": true,
@@ -69,9 +69,9 @@
     ".claude/skills/generate-plan-groups/SKILL.md": "30e9a52a0675e594",
     ".claude/skills/generate-plan-groups/scripts/build-conflict-graph.js": "3aaf6bbf54ffbcd7",
     ".claude/skills/execute-group/SKILL.md": "5eb30193a44f98f9",
-    ".claude/workflows/execute-group.js": "e9e2016214d40eb9",
+    ".claude/workflows/execute-group.js": "0c30bc8ad7a08e3f",
     ".claude/skills/investigate/SKILL.md": "5929425f74045902",
-    ".claude/cabinet/checkpoint-protocol.md": "39a01314a7668ff4",
+    ".claude/cabinet/checkpoint-protocol.md": "bb1bc9aace6f92ed",
     ".claude/rules/enforcement-pipeline.md": "6073f83f97259e5b",
     ".claude/memory/patterns/_pattern-template.md": "09d1e15d9ccc68b9",
     ".claude/memory/patterns/pattern-intelligence-first.md": "b08952c160f9c7f3",
