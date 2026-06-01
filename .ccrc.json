@@ -18,8 +18,8 @@
     ],
     "date": "2026-05-28T14:40:48.357Z"
   },
-  "version": "0.34.0",
-  "installedAt": "2026-05-31T18:09:05.781Z",
+  "version": "0.34.1",
+  "installedAt": "2026-06-01T00:54:04.642Z",
   "upstreamPackage": "create-claude-cabinet",
   "modules": {
     "session-loop": true,
@@ -259,6 +259,7 @@
     ".claude/engagement/pib-db-patches/pib-db.mjs": "0b59ed68986a0582",
     ".claude/engagement/pibdb-adapter.mjs": "b8be95f5e493dcbb",
     ".claude/engagement/schema.md": "7b431c9232d25bfc",
-    ".claude/engagement/secure-input.mjs": "4c9ea5a348daf099"
+    ".claude/engagement/secure-input-dialog.swift": "e765184671c49ced",
+    ".claude/engagement/secure-input.mjs": "48ebb9153f785ede"
   }
 }
