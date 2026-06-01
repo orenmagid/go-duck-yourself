@@ -106,6 +106,8 @@ CREATE INDEX IF NOT EXISTS idx_trigger_checks_target_time ON trigger_checks(targ
 --                 verdicts for the same (packet_id,target_fid) are preserved;
 --                 packet_sent rows with NULL target_fid/verdict may duplicate
 --                 harmlessly). It is intentionally not a hard UNIQUE constraint.
+-- SOURCE OF TRUTH: templates/engagement/sql-constants.mjs
+-- This copy must stay in sync. Drift-guard test verifies it.
 CREATE TABLE IF NOT EXISTS engagement_events (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   engagement    TEXT NOT NULL REFERENCES projects(fid),
@@ -116,6 +118,7 @@ CREATE TABLE IF NOT EXISTS engagement_events (
   author        TEXT NOT NULL,
   verdict       TEXT CHECK(verdict IS NULL OR verdict IN ('approve','object','comment','none')),
   body          TEXT CHECK(body IS NULL OR length(body) <= 10000),
+  visibility    TEXT NOT NULL DEFAULT 'internal' CHECK(visibility IN ('client','internal')),
   addressed     INTEGER NOT NULL DEFAULT 0 CHECK(addressed IN (0,1)),
   created_at    TEXT NOT NULL CHECK(created_at GLOB '????-??-??T*'),
   -- client_feedback and approval must carry a meaningful verdict ('none'

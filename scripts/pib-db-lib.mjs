@@ -8,6 +8,7 @@
 // None of them do console.log — callers decide how to present output.
 
 import { existsSync, readFileSync } from 'node:fs';
+import { ENGAGEMENT_EVENTS_CREATE, ENGAGEMENT_EVENTS_INDEXES } from '../.claude/engagement/sql-constants.mjs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -32,13 +33,23 @@ function today() {
 //   4 — composite index on trigger_checks(target_fid, checked_at DESC) for listTriggered
 //   5 — added engagement_events append-only log + 3 indexes (engagement mgmt)
 //   6 — added projects.tags (symmetric with actions.tags at v2)
-export const SCHEMA_VERSION = 6;
+//   7 — added client-facing copy columns on actions + projects (4 each)
+//   8 — added engagement_events.visibility (client|internal, default internal)
+export const SCHEMA_VERSION = 8;
 
 // Each entry: { version, sql }. A single version may have multiple SQL
 // statements (e.g. column add + index). Statements run in array order;
 // each is wrapped in try/catch so re-running on a DB that already has
 // the column/table is a no-op. The user_version pragma is the primary
 // gate — try/catch is a safety net for pre-pragma DBs.
+//
+// NOTE on version numbering (base vs patch):
+//   Base (work-tracking): v1-v6 (v6 = client columns)
+//   Patch (engagement):   v1-v7 (v5 = engagement_events, v6 = projects.tags, v7 = client columns)
+//   The same physical columns appear at different version numbers because
+//   base and patch have different migration histories. The try/catch on
+//   "duplicate column" makes the overlap safe — a DB that already has
+//   the columns from base v6 will silently skip patch v7's ALTERs.
 const MIGRATIONS = [
   { version: 1, sql: "ALTER TABLE actions ADD COLUMN status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','in-progress','blocked','deferred','done'))" },
   { version: 2, sql: "ALTER TABLE actions ADD COLUMN tags TEXT NOT NULL DEFAULT ''" },
@@ -54,25 +65,18 @@ const MIGRATIONS = [
   )` },
   { version: 3, sql: "CREATE INDEX IF NOT EXISTS idx_trigger_checks_fid ON trigger_checks(target_fid)" },
   { version: 4, sql: "CREATE INDEX IF NOT EXISTS idx_trigger_checks_target_time ON trigger_checks(target_fid, checked_at DESC)" },
-  { version: 5, sql: `CREATE TABLE IF NOT EXISTS engagement_events (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    engagement    TEXT NOT NULL REFERENCES projects(fid),
-    target_fid    TEXT,
-    packet_id     TEXT,
-    kind          TEXT NOT NULL
-                    CHECK(kind IN ('client_feedback','status_push','delegation','approval','note','packet_sent')),
-    author        TEXT NOT NULL,
-    verdict       TEXT CHECK(verdict IS NULL OR verdict IN ('approve','object','comment','none')),
-    body          TEXT CHECK(body IS NULL OR length(body) <= 10000),
-    addressed     INTEGER NOT NULL DEFAULT 0 CHECK(addressed IN (0,1)),
-    created_at    TEXT NOT NULL CHECK(created_at GLOB '????-??-??T*'),
-    CHECK(kind NOT IN ('client_feedback','approval')
-          OR (verdict IS NOT NULL AND verdict IN ('approve','object','comment')))
-  )` },
-  { version: 5, sql: "CREATE INDEX IF NOT EXISTS idx_engagement_events_eng ON engagement_events(engagement, created_at DESC)" },
-  { version: 5, sql: "CREATE INDEX IF NOT EXISTS idx_engagement_events_tgt ON engagement_events(target_fid, created_at DESC)" },
-  { version: 5, sql: "CREATE INDEX IF NOT EXISTS idx_engagement_events_dedup ON engagement_events(packet_id, target_fid, verdict)" },
+  { version: 5, sql: ENGAGEMENT_EVENTS_CREATE },
+  ...ENGAGEMENT_EVENTS_INDEXES.map(sql => ({ version: 5, sql })),
   { version: 6, sql: "ALTER TABLE projects ADD COLUMN tags TEXT NOT NULL DEFAULT ''" },
+  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_title TEXT" },
+  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_body TEXT" },
+  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_generated_at TEXT" },
+  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_generated_status TEXT" },
+  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_title TEXT" },
+  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_body TEXT" },
+  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_generated_at TEXT" },
+  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_generated_status TEXT" },
+  { version: 8, sql: "ALTER TABLE engagement_events ADD COLUMN visibility TEXT NOT NULL DEFAULT 'internal' CHECK(visibility IN ('client','internal'))" },
 ];
 
 export function migrate(db) {
@@ -107,6 +111,53 @@ export function init(db, { schemaPath }) {
   db.exec(schema);
   migrate(db);
   return { message: `Database initialized` };
+}
+
+// ---------------------------------------------------------------------------
+// Data migration — extract client-facing copy from notes into columns
+// ---------------------------------------------------------------------------
+const CLIENT_COPY_RE = /<!--\s*client-facing\s*\n([\s\S]*?)-->/;
+const CC_GENERATED_RE = /<!--\s*cc-generated:(\S+)\s+status:(\S+)\s*-->/;
+
+export function migrateClientCopy(db) {
+  const rows = db.prepare(
+    "SELECT fid, notes FROM actions WHERE notes LIKE '%client-facing%' AND client_title IS NULL AND client_body IS NULL AND client_generated_at IS NULL"
+  ).all();
+  const projRows = db.prepare(
+    "SELECT fid, notes FROM projects WHERE notes LIKE '%client-facing%' AND client_title IS NULL AND client_body IS NULL AND client_generated_at IS NULL"
+  ).all();
+
+  let migrated = 0;
+  const update = db.prepare(
+    "UPDATE actions SET client_title = ?, client_body = ?, client_generated_at = ?, client_generated_status = ? WHERE fid = ?"
+  );
+  const updateProj = db.prepare(
+    "UPDATE projects SET client_title = ?, client_body = ?, client_generated_at = ?, client_generated_status = ? WHERE fid = ?"
+  );
+
+  for (const { fid, notes } of [...rows, ...projRows]) {
+    if (!notes) continue;
+    const copyMatch = notes.match(CLIENT_COPY_RE);
+    const genMatch = notes.match(CC_GENERATED_RE);
+    if (!copyMatch && !genMatch) continue;
+
+    let title = null, body = null, genAt = null, genStatus = null;
+
+    if (copyMatch) {
+      const lines = copyMatch[1].split('\n').map(l => l.trim()).filter(Boolean);
+      title = lines[0] || null;
+      body = lines.slice(1).join('\n').trim() || null;
+    }
+    if (genMatch) {
+      genAt = genMatch[1] || null;
+      genStatus = genMatch[2] || null;
+    }
+
+    const stmt = rows.some(r => r.fid === fid) ? update : updateProj;
+    stmt.run(title, body, genAt, genStatus, fid);
+    migrated++;
+  }
+  return { migrated };
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +271,7 @@ export function listActions(db, { status, project } = {}) {
   return { rows };
 }
 
-export function updateAction(db, { fid, status, text, tags, notes, due, flagged }) {
+export function updateAction(db, { fid, status, text, tags, notes, due, flagged, client_title, client_body, client_generated_at, client_generated_status }) {
   const sets = [];
   const params = [];
 
@@ -230,6 +281,10 @@ export function updateAction(db, { fid, status, text, tags, notes, due, flagged 
   if (notes !== undefined) { sets.push('notes = ?'); params.push(notes); }
   if (due !== undefined) { sets.push('due = ?'); params.push(due); }
   if (flagged !== undefined) { sets.push('flagged = ?'); params.push(flagged === 'true' || flagged === '1' || flagged === true ? 1 : 0); }
+  if (client_title !== undefined) { sets.push('client_title = ?'); params.push(client_title || null); }
+  if (client_body !== undefined) { sets.push('client_body = ?'); params.push(client_body || null); }
+  if (client_generated_at !== undefined) { sets.push('client_generated_at = ?'); params.push(client_generated_at || null); }
+  if (client_generated_status !== undefined) { sets.push('client_generated_status = ?'); params.push(client_generated_status || null); }
 
   // If marking done, also set completed fields
   if (status === 'done') {
@@ -238,7 +293,7 @@ export function updateAction(db, { fid, status, text, tags, notes, due, flagged 
   }
 
   if (sets.length === 0) {
-    return { error: { message: 'No fields to update. Use status, text, tags, notes, due, or flagged.' } };
+    return { error: { message: 'No fields to update. Use status, text, tags, notes, due, flagged, client_title, client_body, client_generated_at, or client_generated_status.' } };
   }
 
   params.push(fid);
@@ -290,15 +345,19 @@ export function createProject(db, { name, area, notes, due, tags }) {
   return { fid, name, message: `Created project ${fid}: ${name}` };
 }
 
-export function updateProject(db, { fid, tags, name, status, notes }) {
+export function updateProject(db, { fid, tags, name, status, notes, client_title, client_body, client_generated_at, client_generated_status }) {
   const sets = [];
   const params = [];
   if (tags !== undefined) { sets.push('tags = ?'); params.push(tags); }
   if (name !== undefined) { sets.push('name = ?'); params.push(name); }
   if (status !== undefined) { sets.push('status = ?'); params.push(status); }
   if (notes !== undefined) { sets.push('notes = ?'); params.push(notes); }
+  if (client_title !== undefined) { sets.push('client_title = ?'); params.push(client_title || null); }
+  if (client_body !== undefined) { sets.push('client_body = ?'); params.push(client_body || null); }
+  if (client_generated_at !== undefined) { sets.push('client_generated_at = ?'); params.push(client_generated_at || null); }
+  if (client_generated_status !== undefined) { sets.push('client_generated_status = ?'); params.push(client_generated_status || null); }
   if (sets.length === 0) {
-    return { error: { message: 'No fields to update. Use tags, name, status, or notes.' } };
+    return { error: { message: 'No fields to update. Use tags, name, status, notes, client_title, client_body, client_generated_at, or client_generated_status.' } };
   }
   params.push(fid);
   const result = db.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE fid = ?`).run(...params);
@@ -571,7 +630,7 @@ const ENGAGEMENT_BODY_MAX_LENGTH = 10000;
  * preserved as separate rows. packet_sent rows (target_fid/verdict NULL) are
  * never deduped — duplicates there are harmless (file rename is primary state).
  */
-export function addEngagementEvent(db, { engagement, target_fid, packet_id, kind, author, verdict, body } = {}, allowedAuthors) {
+export function addEngagementEvent(db, { engagement, target_fid, packet_id, kind, author, verdict, body, visibility = 'internal' } = {}, allowedAuthors) {
   // engagement must be a project fid that exists and is not soft-deleted.
   const engError = validateFid(engagement);
   if (engError) return { error: { error: 'invalid_engagement', message: `engagement must be a valid fid: ${engError.message}` } };
@@ -600,6 +659,10 @@ export function addEngagementEvent(db, { engagement, target_fid, packet_id, kind
   }
   if (ENGAGEMENT_VERDICT_REQUIRED_KINDS.includes(kind) && !ENGAGEMENT_MEANINGFUL_VERDICTS.includes(verdict)) {
     return { error: { error: 'verdict_required', message: `kind "${kind}" requires a meaningful verdict (${ENGAGEMENT_MEANINGFUL_VERDICTS.join(', ')}), got "${verdict ?? 'null'}"` } };
+  }
+
+  if (visibility !== 'client' && visibility !== 'internal') {
+    return { error: { error: 'invalid_visibility', message: `visibility must be 'client' or 'internal', got "${visibility}"` } };
   }
 
   // Author allowlist — fail closed. Missing/empty/non-array allowedAuthors
@@ -638,9 +701,9 @@ export function addEngagementEvent(db, { engagement, target_fid, packet_id, kind
 
   const createdAt = new Date().toISOString();
   const result = db.prepare(`
-    INSERT INTO engagement_events (engagement, target_fid, packet_id, kind, author, verdict, body, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(engagement, target_fid ?? null, packet_id ?? null, kind, author, verdict ?? null, body ?? null, createdAt);
+    INSERT INTO engagement_events (engagement, target_fid, packet_id, kind, author, verdict, body, visibility, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(engagement, target_fid ?? null, packet_id ?? null, kind, author, verdict ?? null, body ?? null, visibility, createdAt);
 
   return {
     id: Number(result.lastInsertRowid),
@@ -681,7 +744,7 @@ export function listEngagementEvents(db, { engagement, target_fid, unaddressedOn
 
   const rows = db.prepare(`
     SELECT e.id, e.engagement, e.target_fid, e.packet_id, e.kind, e.author,
-           e.verdict, e.body, e.addressed, e.created_at
+           e.verdict, e.body, e.visibility, e.addressed, e.created_at
     FROM engagement_events e
     ${join}
     ${where}
