@@ -69,10 +69,12 @@ function fileAge(filePath) {
 
 function countQueueItems() {
   const queueDir = join(WATCHTOWER_DIR, 'queue', 'items');
-  if (!existsSync(queueDir)) return { total: 0, urgent: 0 };
+  if (!existsSync(queueDir)) return { total: 0, urgent: 0, byCategory: {}, draftsReady: 0 };
 
   let total = 0;
   let urgent = 0;
+  let draftsReady = 0;
+  const byCategory = {};
 
   try {
     const entries = readdirSync(queueDir, { withFileTypes: true });
@@ -82,12 +84,27 @@ function countQueueItems() {
       if (!item || item.status !== 'pending') continue;
       total++;
       if (item.urgency === 'urgent') urgent++;
+      const cat = item.category || 'uncategorized';
+      byCategory[cat] = (byCategory[cat] || 0) + 1;
+      if (cat === 'knowledge-extraction' && item.draft_artifact) draftsReady++;
     }
   } catch {
     // Queue unreadable — degrade gracefully
   }
 
-  return { total, urgent };
+  return { total, urgent, byCategory, draftsReady };
+}
+
+// A bare count is a scary number; a category breakdown is a work plan.
+// "33 knowledge-extraction (drafts ready), 9 worktree-unmerged, 6 routing-decision"
+function renderCategoryBreakdown(byCategory, draftsReady) {
+  const parts = Object.entries(byCategory)
+    .sort((a, b) => b[1] - a[1])
+    .map(([cat, n]) => {
+      const annotation = cat === 'knowledge-extraction' && draftsReady > 0 ? ' (drafts ready)' : '';
+      return `${n} ${cat}${annotation}`;
+    });
+  return parts.join(', ');
 }
 
 // --- Thread / focal zoom helpers ---
@@ -261,18 +278,16 @@ function main() {
     }
   }
 
-  // Step 6: Inbox summary
-  const { total, urgent } = countQueueItems();
-  if (urgent > 0) {
+  // Step 6: Inbox summary — one number, decomposed by category
+  const { total, urgent, byCategory, draftsReady } = countQueueItems();
+  if (total > 0) {
+    const breakdown = renderCategoryBreakdown(byCategory, draftsReady);
+    const headline = urgent > 0
+      ? `⚡ ${total} pending (${urgent} urgent) — run /inbox`
+      : `${total} pending — run /inbox when ready`;
     sections.push({
       key: 'queue',
-      content: `--- Inbox ---\n⚡ ${urgent} urgent item(s) waiting — run /inbox. ${total > urgent ? `${total - urgent} more at normal priority.` : ''}`,
-      priority: 1,
-    });
-  } else if (total > 0) {
-    sections.push({
-      key: 'queue',
-      content: `--- Inbox ---\n${total} item(s) waiting — run /inbox when ready.`,
+      content: `--- Inbox ---\n${headline}\n${breakdown}`,
       priority: 1,
     });
   }

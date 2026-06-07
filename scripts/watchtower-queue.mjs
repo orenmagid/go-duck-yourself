@@ -67,6 +67,7 @@ export function createItem({
   filed_by = 'manual',
   plan_fid = null,
   thread_ids = [],
+  confidence = null,
 }) {
   ensureDir(QUEUE_DIR);
   const id = generateId();
@@ -90,9 +91,11 @@ export function createItem({
     transcript_ref,
     plan_fid,
     thread_ids,
+    confidence,
     enrichment_dir: null,
     resolved_at: null,
     resolution: null,
+    resolution_type: null,
     resolution_notes: null,
   };
   atomicWrite(itemPath(id), item);
@@ -105,13 +108,14 @@ export function createItem({
  * @param {object} params
  * @returns {object} The updated item
  */
-export function resolveItem(id, { resolution, resolution_notes = null }) {
+export function resolveItem(id, { resolution, resolution_notes = null, resolution_type = null }) {
   const fp = itemPath(id);
   const item = readItem(fp);
   if (item.status !== 'pending') return null;
   item.status = 'resolved';
   item.resolved_at = new Date().toISOString();
   item.resolution = resolution;
+  item.resolution_type = resolution_type;
   item.resolution_notes = resolution_notes;
   atomicWrite(fp, item);
   return item;
@@ -123,11 +127,13 @@ export function resolveItem(id, { resolution, resolution_notes = null }) {
  * @param {object} params
  * @returns {object} The updated item
  */
-export function dismissItem(id, { notes = null } = {}) {
+export function dismissItem(id, { notes = null, resolution_type = null } = {}) {
   const fp = itemPath(id);
   const item = readItem(fp);
   if (item.status !== 'pending') return null;
   item.status = 'dismissed';
+  item.resolved_at = new Date().toISOString();
+  item.resolution_type = resolution_type;
   item.resolution_notes = notes;
   atomicWrite(fp, item);
   return item;

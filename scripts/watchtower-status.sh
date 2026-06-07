@@ -191,6 +191,12 @@ if [ -f "$config" ]; then
   echo "  Watching $proj_count projects"
 fi
 
+# Portfolio counts (live pib-db open/flagged data) refresh each Ring 1 scan —
+# surface the capability here since it's otherwise invisible outside /briefing
+if grep -q "## Portfolio Pulse" "$WATCHTOWER_DIR/state/summary.md" 2>/dev/null; then
+  echo "  Portfolio counts:   live (per-project pib data — see /briefing)"
+fi
+
 # ═══ Verbose mode ═══
 
 if [ "$VERBOSE" = "--verbose" ] || [ "$VERBOSE" = "-v" ]; then

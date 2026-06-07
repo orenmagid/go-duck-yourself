@@ -464,6 +464,8 @@ Rules:
     let threadData;
     if (existsSync(threadPath) && !t.is_new) {
       threadData = JSON.parse(readFileSync(threadPath, 'utf8'));
+      // Heal pre-versioning thread files (watchtower-contracts.md §Schema Versioning)
+      if (threadData.schema_version === undefined) threadData.schema_version = 1;
       threadData.cursor = t.cursor;
       threadData.last_updated = now;
       threadData.sessions.push({
@@ -475,6 +477,7 @@ Rules:
       });
     } else {
       threadData = {
+        schema_version: 1,
         thread: threadSlug,
         cursor: t.cursor,
         sessions: [{
@@ -501,7 +504,7 @@ Rules:
 // Phase 2c: Work item closure
 // ---------------------------------------------------------------------------
 
-async function workItemClosure(compressed, projectPath) {
+async function workItemClosure(compressed, projectPath, threadIds = []) {
   log('Phase 2c: Work item closure');
 
   const dbPath = join(projectPath, 'pib.db');
@@ -581,6 +584,11 @@ Output ONLY the JSON array, no other text.`;
         project_path: projectPath,
         category: 'completion-review',
         urgency: 'normal',
+        // Top-level typed field per design doc (act:6549289e); evidence.confidence
+        // kept for readers of pre-promotion items
+        confidence: evalItem.confidence,
+        plan_fid: evalItem.fid,
+        thread_ids: threadIds,
         title: `Review completion of: ${evalItem.fid}`,
         summary: `Action "${openActions.find(a => a.fid === evalItem.fid)?.text || evalItem.fid}" may be completed (${evalItem.confidence} confidence).`,
         context_anchor: `pib.db action ${evalItem.fid}`,
@@ -658,7 +666,7 @@ function isDuplicate(title, content, memoryLines, pendingTitles) {
 // Phase 2d: Knowledge extraction → inbox
 // ---------------------------------------------------------------------------
 
-async function decisionExtraction(compressed, projectPath, sessionId, transcriptPath) {
+async function decisionExtraction(compressed, projectPath, sessionId, transcriptPath, threadIds = []) {
   log('Phase 2d: Knowledge extraction');
 
   const systemPrompt = `You are extracting decisions, constraints, lessons, and user preferences from a Claude Code session transcript. For each item found, classify its home:
@@ -672,10 +680,12 @@ Only extract items that represent NEW durable knowledge — things learned or de
 
 Do NOT extract transient operational state: project completion status ("X has 0 open actions"), branch merge status ("branch Y was merged"), install success confirmations ("all rings working"), or other point-in-time observations that will be stale within days. These belong in state files, not the inbox.
 
-For each item, assess how time-sensitive routing is:
-- "urgent" = value decays quickly if not routed (e.g., a trigger condition that might fire soon, a constraint others need to know about NOW)
-- "normal" = worth routing but no rush (most lessons and preferences)
+For each item, assess how time-sensitive routing is. Urgency means HOW FAST THE VALUE DECAYS if not routed — it is NOT importance:
+- "urgent" = the value evaporates within days if not routed (a trigger condition about to fire, a constraint someone will trip over THIS WEEK, a decision another active session needs right now). Apply the time-decay test: "if this sits in the inbox for a week, is most of its value gone?" If no, it is not urgent.
+- "normal" = worth routing but the value keeps (most decisions and constraints)
 - "low" = interesting but can wait indefinitely
+
+Lessons and preferences are durable knowledge — their value does not decay. They are almost NEVER urgent, no matter how important they are. An important-but-durable item is "normal".
 
 Output JSON array: [{"type":"decision|constraint|lesson|preference","home":"memory|claude-md|pib-db-trigger|upstream-feedback","urgency":"urgent|normal|low","title":"short title","content":"detailed description"}]
 Output ONLY the JSON array, no other text. If nothing found, output [].`;
@@ -742,6 +752,7 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
         draft_artifact: isMemory ? `# ${item.title}\n\n${item.content}` : null,
         filed_by: 'ring3-close',
         transcript_ref: { path: transcriptPath, line_range: null },
+        thread_ids: threadIds,
       });
       queued++;
     } catch (e) {
@@ -804,14 +815,16 @@ async function qualityPatternCapture(compressed, projectPath) {
 // Phase 2f: Methodology capture
 // ---------------------------------------------------------------------------
 
-async function methodologyCapture(compressed, projectPath) {
+async function methodologyCapture(compressed, projectPath, threadIds = []) {
   log('Phase 2f: Methodology capture');
 
   try {
     const response = await claudeCall(
       `You are checking whether a Claude Code session established a NEW reusable methodology — a new skill, convention, workflow pattern, or rule that should be codified for future sessions. Routine work, bug fixes, and using existing patterns do NOT count. Only report genuinely new methodology that was created or established in this session.
 
-If a new methodology was established, output JSON: {"found": true, "title": "short description", "content": "what the methodology is and how to apply it"}
+VERIFICATION REQUIREMENT: a methodology only counts if the session produced a durable artifact for it — a file that was created or edited to encode the methodology (a SKILL.md, a rules file, a convention doc, a template). Merely discussing or following a pattern does not count. Name the artifact path relative to the project root.
+
+If a new methodology was established, output JSON: {"found": true, "title": "short description", "content": "what the methodology is and how to apply it", "artifact_path": "relative/path/to/the/file"}
 If nothing new was established, output JSON: {"found": false}
 Output ONLY the JSON object.`,
       compressed.slice(0, 30000),
@@ -829,6 +842,19 @@ Output ONLY the JSON object.`,
       return;
     }
 
+    // Verification gate (act:3f3f9a31, per decision_methodology_capture_claude_verification):
+    // the claimed artifact must actually exist on disk. 11/11 unverified captures
+    // were dismissed over 3 weeks — without an artifact this category is pure noise.
+    if (!result.artifact_path || typeof result.artifact_path !== 'string') {
+      log('Phase 2f: Methodology claimed but no artifact named — skipping (verification gate)');
+      return;
+    }
+    const artifactAbs = join(projectPath, result.artifact_path);
+    if (!existsSync(artifactAbs)) {
+      log(`Phase 2f: Methodology artifact not found on disk (${result.artifact_path}) — skipping (verification gate)`);
+      return;
+    }
+
     const projectName = basename(projectPath);
     createItem({
       project: projectName,
@@ -837,10 +863,12 @@ Output ONLY the JSON object.`,
       urgency: 'normal',
       title: `methodology: ${result.title}`,
       summary: result.content,
-      context_anchor: 'ring3-close methodology scan',
+      context_anchor: `ring3-close methodology scan — artifact: ${result.artifact_path}`,
+      evidence: { artifact_path: result.artifact_path },
       filed_by: 'ring3-close',
+      thread_ids: threadIds,
     });
-    log(`Phase 2f: Methodology captured: ${result.title}`);
+    log(`Phase 2f: Methodology captured: ${result.title} (artifact verified: ${result.artifact_path})`);
   } catch (e) {
     logError(`Phase 2f: Methodology capture failed: ${e.message}`);
   }
@@ -850,7 +878,7 @@ Output ONLY the JSON object.`,
 // Phase 2g: Upstream friction
 // ---------------------------------------------------------------------------
 
-async function upstreamFriction(compressed, projectPath) {
+async function upstreamFriction(compressed, projectPath, threadIds = []) {
   log('Phase 2g: Upstream friction');
 
   const systemPrompt = `You are analyzing a Claude Code session transcript for friction with Claude Code itself (bugs, limitations, confusing behavior, missing features, workarounds). Only report genuine CC friction, not user errors or project-specific issues.
@@ -887,6 +915,7 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
         context_anchor: 'ring3-close friction scan',
         evidence: { severity: item.severity },
         filed_by: 'ring3-close',
+        thread_ids: threadIds,
       });
     }
 
@@ -1192,7 +1221,7 @@ async function main() {
 
   // Phase 2c: Work item closure
   try {
-    const result = await workItemClosure(compressed, project.path);
+    const result = await workItemClosure(compressed, project.path, threadIds);
     stats.actionsClosed = result.closed;
     stats.actionsQueued += result.queued;
     stats.itemsFiled += result.queued;
@@ -1202,7 +1231,7 @@ async function main() {
 
   // Phase 2d: Decision/lesson extraction
   try {
-    const result = await decisionExtraction(compressed, project.path, args.sessionId, args.transcriptPath);
+    const result = await decisionExtraction(compressed, project.path, args.sessionId, args.transcriptPath, threadIds);
     stats.memoryWritten = result.autoWritten;
     stats.extractionsQueued = result.queued;
     stats.itemsFiled += result.queued;
@@ -1220,7 +1249,7 @@ async function main() {
   // Phase 2f: Methodology capture (feature-flagged)
   if (config.defaults?.methodology_capture !== false) {
     try {
-      await methodologyCapture(compressed, project.path);
+      await methodologyCapture(compressed, project.path, threadIds);
     } catch (e) {
       logError(`Phase 2f failed: ${e.message}`);
     }
@@ -1229,7 +1258,7 @@ async function main() {
   // Phase 2g: Upstream friction (feature-flagged)
   if (config.defaults?.upstream_friction_detection !== false) {
     try {
-      await upstreamFriction(compressed, project.path);
+      await upstreamFriction(compressed, project.path, threadIds);
     } catch (e) {
       logError(`Phase 2g failed: ${e.message}`);
     }

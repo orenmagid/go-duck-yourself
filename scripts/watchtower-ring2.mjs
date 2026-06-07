@@ -44,6 +44,10 @@ const FAST_ENRICHMENT_CAP = 2;
 const FAST_ENRICHMENT_MIN_AGE_MS = 10 * 60 * 1000; // 10 minutes
 const ESCALATION_WARN_DAYS = 14;
 const ESCALATION_EXPIRE_DAYS = 30;
+// Urgency = value decay, not importance (decision_ring3_urgency_value_based).
+// An urgent item whose decay window has passed is by definition no longer
+// urgent — de-escalate so the SessionStart urgent count stays trustworthy.
+const URGENT_DECAY_DAYS = 7;
 const SLOW_STALE_DAYS = 14;
 const SLOW_CROSS_PROJECT_CAP = 3;
 const HOOK_TIMEOUT_MS = 60_000;
@@ -469,6 +473,8 @@ async function escalateQueueItems() {
   let escalated = 0;
   let expired = 0;
 
+  let deescalated = 0;
+
   for (const item of items) {
     const ageMs = now - new Date(item.filed_at).getTime();
     const ageDays = ageMs / (24 * 60 * 60 * 1000);
@@ -478,7 +484,10 @@ async function escalateQueueItems() {
       expireItem(item.id);
       expired++;
       log(`Fast: expired queue item ${item.id} (${Math.floor(ageDays)}d old)`);
-    } else if (ageDays >= ESCALATION_WARN_DAYS) {
+      continue;
+    }
+
+    if (ageDays >= ESCALATION_WARN_DAYS) {
       // 14+ days: add [AGING] prefix if not already there
       if (!item.title.startsWith('[AGING]')) {
         const itemPath = join(WATCHTOWER_DIR, 'queue', 'items', `${item.id}.json`);
@@ -491,10 +500,24 @@ async function escalateQueueItems() {
         }
       }
     }
+
+    // De-escalation: an urgent item that sat past its decay window is no
+    // longer urgent — if the value really decayed, the urgency is spent;
+    // if it didn't decay, it was never urgent (act:3f3f9a31).
+    if (item.urgency === 'urgent' && ageDays >= URGENT_DECAY_DAYS) {
+      const itemPath = join(WATCHTOWER_DIR, 'queue', 'items', `${item.id}.json`);
+      if (existsSync(itemPath)) {
+        const updated = JSON.parse(readFileSync(itemPath, 'utf8'));
+        updated.urgency = 'normal';
+        atomicWrite(itemPath, updated);
+        deescalated++;
+        log(`Fast: de-escalated item ${item.id} urgent → normal (${Math.floor(ageDays)}d old, decay window passed)`);
+      }
+    }
   }
 
-  if (escalated > 0 || expired > 0) {
-    log(`Fast: escalation — ${escalated} aged, ${expired} expired`);
+  if (escalated > 0 || expired > 0 || deescalated > 0) {
+    log(`Fast: escalation — ${escalated} aged, ${expired} expired, ${deescalated} de-escalated`);
   }
 }
 
@@ -634,8 +657,74 @@ async function runMemoryHygiene(config) {
   mkdirSync(stateDir, { recursive: true });
   atomicWrite(join(stateDir, 'memory-health.md'), healthLines.join('\n'));
 
+  // Silent detection ≈ no detection (no-silent-failures rule, act:3f3f9a31):
+  // a project persistently over budget gets ONE inbox item, not a log line
+  // nobody reads. Streaks tracked across runs; re-file at most every 7 days.
+  try {
+    surfacePersistentViolations(violationProjects, projects, stateDir);
+  } catch (e) {
+    logError(`Slow: memory violation surfacing failed: ${e.message}`);
+  }
+
   log(`Slow: memory hygiene — ${passProjects.length} pass, ${violationProjects.length} violations, ${skippedProjects.length} skipped`);
   return results;
+}
+
+const MEMORY_VIOLATION_STREAK_THRESHOLD = 3; // consecutive slow runs
+const MEMORY_VIOLATION_REFILE_DAYS = 7;
+
+function surfacePersistentViolations(violationProjects, projects, stateDir) {
+  const streakPath = join(stateDir, 'memory-violation-streaks.json');
+  let streaks = {};
+  if (existsSync(streakPath)) {
+    try { streaks = JSON.parse(readFileSync(streakPath, 'utf8')); } catch { streaks = {}; }
+  }
+
+  const violatingNames = new Set(violationProjects.map(p => p.project));
+
+  // Reset streaks for projects that now pass
+  for (const name of Object.keys(streaks)) {
+    if (!violatingNames.has(name)) delete streaks[name];
+  }
+
+  for (const p of violationProjects) {
+    const entry = streaks[p.project] || { count: 0, last_filed: null };
+    entry.count += 1;
+
+    if (entry.count >= MEMORY_VIOLATION_STREAK_THRESHOLD) {
+      const pending = listPending({ project: p.project, category: 'watchtower-health' });
+      const alreadyPending = pending.some(i => i.title.startsWith('Memory budget violation'));
+      const daysSinceFiled = entry.last_filed
+        ? (Date.now() - new Date(entry.last_filed).getTime()) / 86400000
+        : Infinity;
+
+      if (!alreadyPending && daysSinceFiled >= MEMORY_VIOLATION_REFILE_DAYS) {
+        const projectPath = projects[p.project]?.path || projects[p.project] || '';
+        createItem({
+          project: p.project,
+          project_path: projectPath,
+          filed_by: 'ring2-slow',
+          category: 'watchtower-health',
+          urgency: 'normal',
+          title: `Memory budget violation: ${p.project}`,
+          summary: `MEMORY.md has failed validation for ${entry.count} consecutive Ring 2 runs:\n${(p.violations || []).map(v => `- ${v}`).join('\n')}\n\nOver-budget MEMORY.md only partially loads at session start — memories past the cap are invisible.`,
+          context_anchor: 'state/memory-health.md',
+          evidence: { violations: p.violations || [], streak: entry.count },
+          options: [
+            { key: 'trim', label: 'Trim MEMORY.md now' },
+            { key: 'defer', label: 'Defer — file a pib-db action' },
+            { key: 'dismiss', label: 'Dismiss' },
+          ],
+        });
+        entry.last_filed = new Date().toISOString();
+        log(`Slow: filed memory-budget violation item for ${p.project} (streak ${entry.count})`);
+      }
+    }
+
+    streaks[p.project] = entry;
+  }
+
+  atomicWrite(streakPath, JSON.stringify(streaks, null, 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +821,7 @@ async function crossProjectMemorySynthesis(config) {
           project: pair.a.project,
           project_path: pair.a.path,
           filed_by: 'ring2-slow',
-          category: 'routing-decision',
+          category: 'knowledge-extraction',
           urgency: 'low',
           title: `Cross-project insight: ${pair.a.project} + ${pair.b.project}`,
           summary: result.trim(),
@@ -917,7 +1006,12 @@ async function detectStaleWork(config) {
 // 4. Thread absorption
 // ---------------------------------------------------------------------------
 
-const ABSORPTION_SESSION_AGE_DAYS = 7;
+// Pruning safety gate (act:ef5a3842): pruning is the LOSSY step in the
+// memory-consolidation gradient — once session detail files are gone, every
+// recovery costs a full transcript replay. Until the re-enrichment ascent
+// (on-demand re-sharpening of the absorbed past) exists, keep the cheap
+// middle tier around for 90 days instead of 7.
+const ABSORPTION_SESSION_AGE_DAYS = 90;
 const DORMANT_THREAD_AGE_DAYS = 30;
 
 async function absorbThreadSessions(config) {
