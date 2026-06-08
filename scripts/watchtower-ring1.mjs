@@ -134,11 +134,23 @@ function collectPibState(projectPath) {
       "SELECT COUNT(*) as count FROM actions WHERE status IN ('open', 'in-progress', 'blocked')"
     ).get();
 
-    // Flagged count (deferred with trigger_condition)
+    // Flagged count (user-prioritized, still-open actions)
     let flaggedCount = 0;
     try {
       flaggedCount = db.prepare(
-        "SELECT COUNT(*) as count FROM actions WHERE status = 'deferred' AND trigger_condition IS NOT NULL"
+        "SELECT COUNT(*) as count FROM actions WHERE flagged = 1 AND status IN ('open', 'in-progress', 'blocked') AND deleted_at IS NULL"
+      ).get().count;
+    } catch {
+      // flagged column may not exist in older schemas
+    }
+
+    // Deferred actions waiting on triggers — standing state, not attention.
+    // Orient's deferred-check evaluates these every session; reported in the
+    // per-project deep file, never in the summary's attention list.
+    let deferredTriggerCount = 0;
+    try {
+      deferredTriggerCount = db.prepare(
+        "SELECT COUNT(*) as count FROM actions WHERE status = 'deferred' AND trigger_condition IS NOT NULL AND deleted_at IS NULL"
       ).get().count;
     } catch {
       // trigger_condition column may not exist in older schemas
@@ -150,7 +162,8 @@ function collectPibState(projectPath) {
     try {
       staleProjects = db.prepare(
         `SELECT DISTINCT p.fid, p.name FROM projects p
-         WHERE NOT EXISTS (
+         WHERE p.status = 'active' AND p.deleted_at IS NULL
+         AND NOT EXISTS (
            SELECT 1 FROM actions a
            WHERE a.project_fid = p.fid
            AND a.updated_at > ?
@@ -166,10 +179,12 @@ function collectPibState(projectPath) {
     try {
       completionCandidates = db.prepare(
         `SELECT p.fid, p.name FROM projects p
-         WHERE EXISTS (SELECT 1 FROM actions a WHERE a.project_fid = p.fid)
+         WHERE p.status = 'active' AND p.deleted_at IS NULL
+         AND EXISTS (SELECT 1 FROM actions a WHERE a.project_fid = p.fid AND a.deleted_at IS NULL)
          AND NOT EXISTS (
            SELECT 1 FROM actions a
            WHERE a.project_fid = p.fid
+           AND a.deleted_at IS NULL
            AND a.status != 'done'
          )`
       ).all();
@@ -195,6 +210,7 @@ function collectPibState(projectPath) {
     return {
       openActions: openActions.count,
       flaggedCount,
+      deferredTriggerCount,
       staleProjects,
       completionCandidates,
       projectBreakdown,
@@ -357,9 +373,14 @@ function createBranchDivergedItem(projectName, projectPath, branch) {
 // ---------------------------------------------------------------------------
 
 // Count uncommitted changes in a worktree, excluding CC/mux session
-// artifacts (.claude/, .mcp.json) and node_modules — node_modules is
-// untracked in every mux worktree, and counting it produced false
-// "unmerged work" alarms for fully-merged branches.
+// artifacts (.claude/, .mcp.json), node_modules, and package-manager
+// lockfiles — all of which churn in mux worktrees without representing
+// work to lose. node_modules is untracked in every worktree; lockfiles
+// regenerate with worktree-relative `file:` dependency paths (a worktree
+// sits deeper than the main repo, so any install rewrites resolved tarball
+// paths, e.g. ../../ → ../../../../). Both produced false "unmerged work"
+// alarms for fully-merged branches. A genuine dependency change also
+// dirties package.json, which is still counted, so real work still alarms.
 // safeExec trims output, which can shift porcelain column offsets —
 // match artifact patterns anywhere in the line instead.
 function countRealUncommitted(wtPath) {
@@ -370,6 +391,11 @@ function countRealUncommitted(wtPath) {
     if (/\s\.claude$/.test(l) || /\s\.claude\//.test(l)) return false;
     if (/\s\.mcp\.json$/.test(l)) return false;
     if (/\snode_modules$/.test(l) || /\snode_modules\//.test(l)) return false;
+    if (/(?:^|[\s/])package-lock\.json$/.test(l)) return false;
+    if (/(?:^|[\s/])npm-shrinkwrap\.json$/.test(l)) return false;
+    if (/(?:^|[\s/])yarn\.lock$/.test(l)) return false;
+    if (/(?:^|[\s/])pnpm-lock\.yaml$/.test(l)) return false;
+    if (/(?:^|[\s/])bun\.lockb$/.test(l)) return false;
     return true;
   }).length;
 }
@@ -766,7 +792,10 @@ function assembleProjectState(ps) {
   lines.push('## Standing Issues');
   const issues = [];
   if (ps.pib && ps.pib.flaggedCount > 0) {
-    issues.push(`${ps.pib.flaggedCount} flagged/deferred action(s) with triggers`);
+    issues.push(`${ps.pib.flaggedCount} flagged action(s)`);
+  }
+  if (ps.pib && ps.pib.deferredTriggerCount > 0) {
+    issues.push(`${ps.pib.deferredTriggerCount} deferred action(s) waiting on triggers`);
   }
   if (ps.divergedBranches && ps.divergedBranches.length > 0) {
     issues.push(`Diverged branches: ${ps.divergedBranches.join(', ')}`);

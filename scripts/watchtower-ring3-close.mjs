@@ -411,21 +411,32 @@ async function threadCapture(compressed, projectSlug, sessionId, summary, transc
 
   const systemPrompt = `You identify which LINES OF WORK a session contributed to, so future sessions can pick up where this one left off.
 
-A thread is a durable work stream — not a task, not a routine operation. Good thread names are project-area or initiative level: "watchtower", "engagement-management", "memory-architecture". Bad thread names are task-specific ("fix-sdk-loading-bug") or routine ("running-orient"). If a session just ran orient/debrief/status checks without doing real work, return an empty array.
+A thread is a durable work stream that spans multiple sessions — not a task, not a routine operation. Threads exist at DIFFERENT ZOOM LEVELS, and a session normally touches several at once:
+- Initiative level (REQUIRED when real work happened): the specific line of work — "maginnis-email-system", "watchtower-threading", "mux-dx". This is the level that matters most and the one most often missed. Always name it.
+- Project-area level (optional): the broader area the initiative sits in — "maginnis", "watchtower".
+- Cross-cutting level (optional): a CONCRETE line of work that spans projects — "audit-methodology", "worktree-infrastructure", "engagement-system". Still a real initiative, just one no single project owns.
+These are NOT competing categories; they are zoom levels on the same work. A session building a Maginnis email feature touches "maginnis-email-system" AND "maginnis" — list every one that genuinely applies, at whatever levels apply.
+
+Every thread, at every zoom level, is a CONCRETE LINE OF WORK. Bad thread names are task-specific ("fix-sdk-loading-bug"), routine ("running-orient"), or abstract DIMENSIONS ("code-quality", "security", "performance") — those are evaluation lenses cabinet members apply, not lines of work. If you reach for an abstract quality word, find the concrete initiative underneath it instead ("audit-methodology", not "code-quality"). If a session just ran orient/debrief/status checks without doing real work, return an empty array.
 
 The cursor is what makes threads valuable. It captures UNDERSTANDING — what a cold future session needs to think differently — not DESCRIPTION of what happened (the session summary already does that). Ask: "If I started a new session on this work tomorrow with no memory, what would I need to know that isn't obvious from reading the code?"
 
 Currently active threads:
 ${threadList}
 
-STRONGLY PREFER reusing existing thread slugs. Only create a new thread when the work genuinely doesn't fit any existing one.
+Choosing threads:
+- ALWAYS create or join the specific INITIATIVE thread for the real work. Never settle for only a broad project-area thread — that is the collapse failure mode (everything dumped into one bucket).
+- Each membership must be EARNED: include a thread only if this session genuinely advanced it, and say how in "contribution". Never add a session to a thread you cannot justify — that is overlap-as-laziness, the opposite of what threads are for.
+- Reuse an existing slug when the work continues the SAME line. Mint a new slug when it is a distinct initiative — but first scan the active threads above for a near-synonym and reuse that instead of creating a near-duplicate (no "watchtower-audit" beside "watchtower-audit-remediation").
 
 Respond with a JSON array. Each element:
 {
-  "thread": "slug-name",
+  "thread": "short-stable-slug",
   "is_new": true/false,
+  "display_name": "A rich one-line ARTICULATION of what this thread is really about — this is what a human reads. Make it carry the meaning the slug cannot; never just a restatement of the slug. It evolves as understanding deepens.",
+  "contribution": "What THIS session contributed to THIS thread — the reason it belongs here, one line",
   "cursor": {
-    "what": "The work stream in one line (project-area level, not task level)",
+    "what": "The work stream as you would frame it RIGHT NOW in one line — this evolves across sessions as understanding deepens, even when the work stream is the same",
     "why": "Why this work matters — the motivation, not the mechanism",
     "where_left_off": "Current state of understanding — what's proven, what's uncertain, what surprised you",
     "open_questions": ["Unresolved design questions, discovered risks, things that need validation"],
@@ -435,8 +446,11 @@ Respond with a JSON array. Each element:
 
 Rules:
 - Return [] for sessions that only did routine operations (orient, debrief, status checks)
-- Reuse existing thread slugs aggressively — 2-3 word names at the project-area level
-- A session typically touches 1-2 threads, rarely 3
+- ALWAYS include the specific initiative thread for real work; add project-area and cross-cutting threads when they genuinely apply
+- Expect SEVERAL threads at different zoom levels — a session touching only one thread is the exception, not the rule
+- Every thread needs a justified "contribution" — earned membership, never a lazy copy
+- Before minting a new slug, reuse a near-synonym from the active list instead
+- The slug is just a stable filing key — short, reused. The display_name is what carries understanding to a human — a rich, specific articulation, never a restatement of the slug
 - Capture what you LEARNED, not what you DID
 - Output ONLY the JSON array, no markdown fences`;
 
@@ -467,9 +481,11 @@ Rules:
       // Heal pre-versioning thread files (watchtower-contracts.md §Schema Versioning)
       if (threadData.schema_version === undefined) threadData.schema_version = 1;
       threadData.cursor = t.cursor;
+      if (t.display_name) threadData.display_name = t.display_name;
       threadData.last_updated = now;
       threadData.sessions.push({
         id: sessionId,
+        contribution: t.contribution || '',
         date,
         project: projectSlug,
         summary: summary.split('\n').slice(0, 3).join(' ').slice(0, 200),
@@ -479,9 +495,11 @@ Rules:
       threadData = {
         schema_version: 1,
         thread: threadSlug,
+        display_name: t.display_name || threadSlug,
         cursor: t.cursor,
         sessions: [{
           id: sessionId,
+          contribution: t.contribution || '',
           date,
           project: projectSlug,
           summary: summary.split('\n').slice(0, 3).join(' ').slice(0, 200),
