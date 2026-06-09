@@ -396,8 +396,28 @@ function countRealUncommitted(wtPath) {
     if (/(?:^|[\s/])yarn\.lock$/.test(l)) return false;
     if (/(?:^|[\s/])pnpm-lock\.yaml$/.test(l)) return false;
     if (/(?:^|[\s/])bun\.lockb$/.test(l)) return false;
+    if (isMainShadow(l, wtPath)) return false;
     return true;
   }).length;
+}
+
+// A worktree whose HEAD predates a file committed to main shows that file as
+// untracked ("?? path") even though main already owns it — a stale-worktree
+// shadow, not work to lose. (The mux/devex false-alarm: scripts/skill-usage.mjs
+// was added to main after devex branched, so it counted as a "real" uncommitted
+// change and blocked the merged branch from ever auto-resolving.) Exclude an
+// untracked file only when main holds the SAME path with byte-identical content
+// — a genuinely new untracked file, or a modified shadow, still counts, so real
+// work-to-lose still alarms.
+function isMainShadow(porcelainLine, wtPath) {
+  const m = porcelainLine.match(/^\?\?\s+(.+)$/);
+  if (!m) return false;
+  let p = m[1].trim();
+  if (p.startsWith('"') && p.endsWith('"')) p = p.slice(1, -1);
+  const mainBlob = safeExec(`git rev-parse --verify --quiet "main:${p}"`, { cwd: wtPath });
+  if (!mainBlob) return false;
+  const wtBlob = safeExec(`git hash-object "${p}"`, { cwd: wtPath });
+  return !!wtBlob && wtBlob === mainBlob;
 }
 
 // Does a worktree-unmerged item belong to this project? Can't trust

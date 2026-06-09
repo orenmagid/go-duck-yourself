@@ -34,6 +34,7 @@ import {
   atomicWrite, loadConfig, slugify,
   log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
+  migrateThreadCursor, currentCursor,
 } from './watchtower-lib.mjs';
 
 const require = createRequire(import.meta.url);
@@ -398,7 +399,7 @@ async function threadCapture(compressed, projectSlug, sessionId, summary, transc
         if (thread.status === 'active') {
           existingThreads.push({
             id: thread.thread,
-            what: thread.cursor?.what || '',
+            what: currentCursor(thread).what || '',
           });
         }
       } catch { /* skip malformed */ }
@@ -475,12 +476,19 @@ Rules:
     threadIds.push(threadSlug);
     const threadPath = join(threadsDir, `${threadSlug}.json`);
 
+    // One cursor snapshot per session that advanced this thread — appended,
+    // never overwritten (see migrateThreadCursor / cursor_history in
+    // watchtower-lib.mjs). The qa_handoff payload is a future SIBLING of this
+    // history, not a field inside the cursor (qa-handoff-protocol.md).
+    const cursorEntry = { date, session_id: sessionId, cursor: t.cursor };
+
     let threadData;
     if (existsSync(threadPath) && !t.is_new) {
       threadData = JSON.parse(readFileSync(threadPath, 'utf8'));
-      // Heal pre-versioning thread files (watchtower-contracts.md §Schema Versioning)
-      if (threadData.schema_version === undefined) threadData.schema_version = 1;
-      threadData.cursor = t.cursor;
+      // Heal pre-versioning + legacy single-cursor files into cursor_history
+      // (watchtower-contracts.md §Schema Versioning).
+      migrateThreadCursor(threadData);
+      threadData.cursor_history.push(cursorEntry);
       if (t.display_name) threadData.display_name = t.display_name;
       threadData.last_updated = now;
       threadData.sessions.push({
@@ -493,10 +501,10 @@ Rules:
       });
     } else {
       threadData = {
-        schema_version: 1,
+        schema_version: 2,
         thread: threadSlug,
         display_name: t.display_name || threadSlug,
-        cursor: t.cursor,
+        cursor_history: [cursorEntry],
         sessions: [{
           id: sessionId,
           contribution: t.contribution || '',

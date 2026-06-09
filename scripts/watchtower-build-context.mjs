@@ -12,6 +12,7 @@
 
 import { readFileSync, readdirSync, existsSync, statSync, mkdirSync } from 'fs';
 import { join, resolve, basename } from 'path';
+import { currentCursor } from './watchtower-lib.mjs';
 
 const WATCHTOWER_DIR = process.env.WATCHTOWER_DIR
   || join(process.env.HOME, '.claude-cabinet', 'watchtower');
@@ -143,7 +144,7 @@ function renderFocalZoom(threads, projectSlug) {
   // Cursor level: primary thread for this project, full detail
   if (projectThreads.length > 0) {
     const primary = projectThreads[0];
-    const c = primary.cursor || {};
+    const c = currentCursor(primary);
     lines.push(`**${primary.thread}** (primary)`);
     if (c.what) lines.push(`  What: ${c.what}`);
     if (c.why) lines.push(`  Why: ${c.why}`);
@@ -160,7 +161,7 @@ function renderFocalZoom(threads, projectSlug) {
 
   // Thread level: other project threads, one line each
   for (const t of projectThreads.slice(1)) {
-    const what = t.cursor?.what || '';
+    const what = currentCursor(t).what || '';
     const age = t.last_updated?.slice(0, 10) || '?';
     lines.push(`${t.thread}: ${what} (${age})`);
   }
@@ -170,7 +171,7 @@ function renderFocalZoom(threads, projectSlug) {
     lines.push('');
     lines.push('Other active threads:');
     for (const t of otherThreads.slice(0, 5)) {
-      const what = t.cursor?.what || '';
+      const what = currentCursor(t).what || '';
       const proj = t.sessions?.[t.sessions.length - 1]?.project || '?';
       lines.push(`  ${t.thread} [${proj}]: ${what}`);
     }

@@ -21,6 +21,15 @@ json_field() {
   node -p "try{JSON.parse(require('fs').readFileSync('$file','utf8'))${field}}catch{}" 2>/dev/null
 }
 
+# Read a field off a thread's CURRENT cursor (last cursor_history entry),
+# falling back to a legacy single `cursor` field for un-migrated thread files.
+# Mirrors currentCursor() in watchtower-lib.mjs. Returns '' when absent.
+current_cursor_field() {
+  local file="$1" sub="$2"
+  [ -f "$file" ] || return 1
+  node -p "try{const t=JSON.parse(require('fs').readFileSync('$file','utf8'));const h=t.cursor_history;const c=(Array.isArray(h)&&h.length?h[h.length-1].cursor:t.cursor)||{};c['$sub']??''}catch{}" 2>/dev/null
+}
+
 ts_to_epoch() {
   local ts="${1%%.*}"
   ts="${ts%%Z}"
@@ -226,9 +235,9 @@ if [ "$VERBOSE" = "--verbose" ] || [ "$VERBOSE" = "-v" ]; then
       status=$(json_field "$f" ".status")
       [ "$status" != "active" ] && continue
       slug=$(json_field "$f" ".thread")
-      what=$(json_field "$f" ".cursor?.what" 2>/dev/null || echo "")
+      what=$(current_cursor_field "$f" "what" 2>/dev/null || echo "")
       [ "$what" = "undefined" ] && what=""
-      left_off=$(json_field "$f" ".cursor?.where_left_off" 2>/dev/null || echo "")
+      left_off=$(current_cursor_field "$f" "where_left_off" 2>/dev/null || echo "")
       [ "$left_off" = "undefined" ] && left_off=""
       echo "  $slug"
       [ -n "$what" ] && echo "    $what"

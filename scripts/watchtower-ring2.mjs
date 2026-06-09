@@ -1048,8 +1048,9 @@ async function absorbThreadSessions(config) {
       continue;
     }
 
-    // Prune old session detail files that are already captured in the thread cursor.
-    // The session entry in the thread's sessions array (with transcript pointer) survives.
+    // Prune old session detail files that are already captured in the thread's
+    // cursor_history. The session entry in the thread's sessions array (with
+    // transcript pointer) survives.
     if (!thread.sessions || thread.sessions.length === 0) continue;
 
     const projects = config.projects || {};

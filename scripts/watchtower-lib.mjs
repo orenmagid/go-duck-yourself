@@ -67,6 +67,60 @@ export function slugify(text) {
 }
 
 // ---------------------------------------------------------------------------
+// Thread cursor history (schema v2)
+// ---------------------------------------------------------------------------
+// A thread's cursor is no longer a single overwritten object; it is an
+// append-only `cursor_history` array of point-in-time snapshots, one per
+// session that advanced the thread. Each entry is
+//   { date, session_id, cursor: { what, why, where_left_off, open_questions,
+//     next_steps } }
+// The "current" cursor is always the last entry. Overwriting threw away the
+// journey (symptom → diagnosis → solution → abstraction); the history keeps it.
+// `cursor_history` is the thread's first sibling timeline — the QA-handoff
+// protocol (.claude/plans/qa-handoff-protocol.md) adds a parallel
+// point-in-time event sibling rather than nesting inside the cursor.
+
+// migrateThreadCursor — convert a legacy (schema v1) thread object that has a
+// single `cursor` field into the v2 `cursor_history` shape, in place.
+// Idempotent: a thread already carrying `cursor_history` is left alone (beyond
+// stripping any stale `cursor` field and bumping the version). The single
+// migrated entry inherits the date/session_id of the thread's most recent
+// session, since the legacy cursor reflected the latest understanding.
+export function migrateThreadCursor(threadData) {
+  if (!threadData || typeof threadData !== 'object') return threadData;
+  if (threadData.schema_version === undefined) threadData.schema_version = 1;
+
+  if (Array.isArray(threadData.cursor_history)) {
+    delete threadData.cursor; // drop any stale legacy field
+    if (threadData.schema_version < 2) threadData.schema_version = 2;
+    return threadData;
+  }
+
+  const legacy = threadData.cursor;
+  const sessions = Array.isArray(threadData.sessions) ? threadData.sessions : [];
+  const last = sessions.length ? sessions[sessions.length - 1] : null;
+  threadData.cursor_history = legacy
+    ? [{
+        date: last?.date || (threadData.last_updated || '').slice(0, 10) || null,
+        session_id: last?.id || null,
+        cursor: legacy,
+      }]
+    : [];
+  delete threadData.cursor;
+  threadData.schema_version = 2;
+  return threadData;
+}
+
+// currentCursor — the most recent cursor snapshot for a thread. Reads the last
+// `cursor_history` entry, falling back to a legacy `cursor` field so consumers
+// stay correct against any un-migrated thread file. Always returns an object.
+export function currentCursor(thread) {
+  const hist = thread?.cursor_history;
+  if (Array.isArray(hist) && hist.length) return hist[hist.length - 1].cursor || {};
+  return thread?.cursor || {};
+}
+
+// ---------------------------------------------------------------------------
 // loadBetterSqlite3 — resolve better-sqlite3 from wherever it actually lives
 // ---------------------------------------------------------------------------
 // The ring scripts run from ~/.claude-cabinet/watchtower/scripts/ with no

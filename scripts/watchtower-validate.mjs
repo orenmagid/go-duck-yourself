@@ -54,6 +54,7 @@ const VALID_CATEGORIES = [
   'deferred-trigger', 'routing-decision', 'knowledge-extraction', 'methodology-capture',
   'upstream-friction', 'project-completion', 'completion-review', 'branch-diverged',
   'stale-project', 'pattern-promotion', 'watchtower-health', 'worktree-unmerged',
+  'qa-handoff',
 ];
 const VALID_ENRICHMENT = ['bare', 'in-progress', 'complete'];
 const VALID_URGENCY = ['urgent', 'normal', 'low'];

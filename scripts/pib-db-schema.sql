@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS engagement_events (
   target_fid    TEXT,
   packet_id     TEXT,
   kind          TEXT NOT NULL
-                  CHECK(kind IN ('client_feedback','status_push','delegation','approval','note','packet_sent')),
+                  CHECK(kind IN ('client_feedback','status_push','delegation','approval','note','packet_sent','packet_opened')),
   author        TEXT NOT NULL,
   verdict       TEXT CHECK(verdict IS NULL OR verdict IN ('approve','object','comment','none')),
   body          TEXT CHECK(body IS NULL OR length(body) <= 10000),
