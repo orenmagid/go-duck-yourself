@@ -12,7 +12,7 @@
 
 import { readFileSync, readdirSync, existsSync, statSync, mkdirSync } from 'fs';
 import { join, resolve, basename } from 'path';
-import { currentCursor } from './watchtower-lib.mjs';
+import { currentCursor, resolveProjectIdentity } from './watchtower-lib.mjs';
 
 const WATCHTOWER_DIR = process.env.WATCHTOWER_DIR
   || join(process.env.HOME, '.claude-cabinet', 'watchtower');
@@ -196,16 +196,20 @@ function main() {
     return;
   }
 
-  // Find project matching --project-path
+  // Find the project for --project-path via the canonical resolver. The old
+  // exact-path match could never match a mux worktree cwd, so every worktree
+  // session started with zero ambient project state. The resolver walks a
+  // worktree back to its main repo before matching. Unresolved or untracked
+  // (registered: false) → projectSlug stays null and we proceed exactly as
+  // before — no regression for unknown projects, no crash (resolver returns
+  // null rather than throwing).
   let projectSlug = null;
   let projectConfig = null;
   if (config.projects && projectPath) {
-    for (const [slug, proj] of Object.entries(config.projects)) {
-      if (proj.path && resolve(proj.path) === projectPath) {
-        projectSlug = slug;
-        projectConfig = proj;
-        break;
-      }
+    const identity = resolveProjectIdentity(projectPath, config);
+    if (identity?.registered) {
+      projectSlug = identity.slug;
+      projectConfig = config.projects[identity.name] || null;
     }
   }
 

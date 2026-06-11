@@ -136,7 +136,9 @@ export function validateMemoryDir(opts = {}) {
     if (!referenced.has(f)) {
       violations.push(
         `orphan memory file: ${f} exists in ${memoryDir} but is not referenced by MEMORY.md. ` +
-          `Either reference it (manually or via /cc-remember next time) or delete it.`
+          `NOTE: only **${f}** (bold) or [text](${f}) (markdown link) count as references — ` +
+          `a plain-text filename does not. Reference it in one of those forms ` +
+          `(manually or via /cc-remember next time) or delete it.`
       );
     }
   }
@@ -146,7 +148,9 @@ export function validateMemoryDir(opts = {}) {
     if (ref === MEMORY_INDEX_FILE) continue;
     if (!entries.includes(ref)) {
       violations.push(
-        `broken reference in MEMORY.md: ${ref} is indexed but does not exist on disk.`
+        `broken reference in MEMORY.md: ${ref} is indexed but does not exist on disk. ` +
+          `(References are parsed from **name.md** / [text](name.md) tokens — a partial or ` +
+          `abbreviated name inside those forms parses as a reference to a file that isn't there.)`
       );
     }
   }

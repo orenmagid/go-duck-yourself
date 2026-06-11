@@ -45,6 +45,199 @@ function generateId() {
 // Urgency sort order: urgent < normal < low (urgent first)
 const URGENCY_ORDER = { urgent: 0, normal: 1, low: 2 };
 
+// --- qa-handoff category contract (the staff-QA recipient gate) ---
+//
+// A qa-handoff item cannot leave the queue silently: resolution requires a
+// structured, field-validated qa_verdict; dismissal/supersession require a
+// typed reason; expiry never applies. The gate's playbook, tiers, and the
+// verdict shape are defined ONCE in the qa-handoff skill (SKILL.md, "The
+// recipient gate") — this section validates the SHAPE at the API so the one
+// sin, a silent stamp with no coverage look, is impossible rather than
+// discouraged. Keep all qa-handoff domain knowledge fenced here; the CRUD
+// functions below only call into it.
+
+const QA_CATEGORY = 'qa-handoff';
+const QA_TERMINAL_VERDICTS = ['runtime-verified', 'blocked'];
+// The parameterized token. Canonical form uses U+00B7 (·); input tolerates
+// common separator drift (-, –, —, *, •) because sessions retype labels.
+const QA_GAPS_TOKEN_RE = /^verified\s*[·•*\-–—]\s*(\d+)\s+gaps?\s+filed$/;
+const QA_COVERAGE_ASSESSMENTS = ['adequate', 'extended', 'gap-filed'];
+
+/**
+ * Normalize a qa-handoff verdict token to canonical form.
+ * Returns 'runtime-verified' | 'blocked' | 'verified · N gaps filed' (N >= 1),
+ * or null when the input is not a legal token (including bare 'verified').
+ * @param {string} raw
+ * @returns {string|null}
+ */
+export function normalizeQaVerdictToken(raw) {
+  if (typeof raw !== 'string') return null;
+  const t = raw.normalize('NFKC').trim().replace(/\s+/g, ' ');
+  if (QA_TERMINAL_VERDICTS.includes(t)) return t;
+  const m = t.match(QA_GAPS_TOKEN_RE);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (Number.isSafeInteger(n) && n >= 1) return `verified · ${n} gaps filed`;
+  }
+  return null;
+}
+
+function gateError(item, message) {
+  // Never echo resolution/notes content back — name fields only.
+  return new Error(`qa-handoff gate: cannot close ${item.id} — ${message}`);
+}
+
+/**
+ * Validate the structured verdict for a qa-handoff item. Throws naming the
+ * missing/invalid field; returns the canonical verdict token on success.
+ * Validates the RESOLUTION shape only — legacy items (no risk_surface /
+ * tier_hint, absent or non-array could_not_verify) stay resolvable.
+ * @param {object} item
+ * @param {object} qa_verdict
+ * @returns {string} canonical verdict token
+ */
+export function validateQaVerdict(item, qa_verdict) {
+  if (!qa_verdict || typeof qa_verdict !== 'object' || Array.isArray(qa_verdict)) {
+    throw gateError(item, "missing structured qa_verdict object (pass qa_verdict to resolveItem; shape: see 'The recipient gate' in the qa-handoff skill)");
+  }
+  if (typeof qa_verdict.commit_tested !== 'string' || !qa_verdict.commit_tested.trim()) {
+    throw gateError(item, 'qa_verdict.commit_tested is required (the main commit the QA ran against)');
+  }
+  if (qa_verdict.tier !== 'narrow' && qa_verdict.tier !== 'full') {
+    throw gateError(item, "qa_verdict.tier is required ('narrow' | 'full')");
+  }
+
+  const posture = qa_verdict.coverage_posture;
+  if (!posture || typeof posture !== 'object' || Array.isArray(posture)) {
+    throw gateError(item, 'qa_verdict.coverage_posture is required (the coverage look, separate from check results)');
+  }
+  if (!QA_COVERAGE_ASSESSMENTS.includes(posture.assessment)) {
+    throw gateError(item, `qa_verdict.coverage_posture.assessment must be one of: ${QA_COVERAGE_ASSESSMENTS.join(' | ')}`);
+  }
+  if (posture.assessment === 'gap-filed') {
+    const filed = posture.gap_filed;
+    if (!Array.isArray(filed) || filed.length === 0
+        || filed.some((g) => !g || typeof g.filed_as !== 'string' || !g.filed_as.trim())) {
+      throw gateError(item, "coverage_posture.assessment is 'gap-filed' but coverage_posture.gap_filed is not a non-empty array of {gap, filed_as}");
+    }
+  }
+
+  const verdict = normalizeQaVerdictToken(qa_verdict.verdict);
+  if (!verdict) {
+    throw gateError(item, "qa_verdict.verdict is not a legal token — use 'runtime-verified', 'blocked', or 'verified · N gaps filed' (N >= 1; bare 'verified' is illegal: the label may not out-run its substance)");
+  }
+
+  // The gaps-bearing label must match its substance, and a clean label may
+  // not hide filed gaps. ('blocked' + filed_gaps is deliberately legal — a
+  // blocked QA can still file follow-ups; the block itself is the headline.)
+  const gapsMatch = verdict.match(QA_GAPS_TOKEN_RE);
+  const filedGaps = Array.isArray(qa_verdict.filed_gaps) ? qa_verdict.filed_gaps : [];
+  if (gapsMatch) {
+    const n = parseInt(gapsMatch[1], 10);
+    if (filedGaps.length !== n
+        || filedGaps.some((g) => !g || typeof g.filed_as !== 'string' || !g.filed_as.trim())) {
+      throw gateError(item, `verdict claims ${n} gaps filed but qa_verdict.filed_gaps has ${filedGaps.length} entries with a filed_as fid — the count in the label must equal the gaps actually filed`);
+    }
+  } else if (verdict === 'runtime-verified' && filedGaps.length > 0) {
+    throw gateError(item, `verdict 'runtime-verified' with ${filedGaps.length} filed_gaps — use 'verified · ${filedGaps.length} gaps filed'`);
+  }
+
+  // Confessed gaps cannot be laundered: every could_not_verify entry must be
+  // discharged as fixed-in-session or an explicitly typed deferral. Absent /
+  // non-array / empty confession lists demand nothing (legacy compatibility).
+  const confessed = Array.isArray(item.evidence?.could_not_verify)
+    ? item.evidence.could_not_verify : [];
+  if (confessed.length > 0) {
+    const cg = qa_verdict.confessed_gap;
+    if (!cg || typeof cg !== 'object' || Array.isArray(cg)) {
+      throw gateError(item, `this handoff confessed ${confessed.length} could_not_verify entr${confessed.length === 1 ? 'y' : 'ies'} — qa_verdict.confessed_gap {written_and_run, deferred} is required to discharge them`);
+    }
+    const written = Array.isArray(cg.written_and_run) ? cg.written_and_run : [];
+    const deferred = Array.isArray(cg.deferred) ? cg.deferred : [];
+    written.forEach((w, i) => {
+      if (typeof w !== 'string' || !w.trim()) {
+        throw gateError(item, `confessed_gap.written_and_run[${i}] must be a non-empty string naming the test written and run`);
+      }
+    });
+    deferred.forEach((d, i) => {
+      if (!d || typeof d !== 'object'
+          || typeof d.gap !== 'string' || !d.gap.trim()
+          || typeof d.filed_as !== 'string' || !d.filed_as.trim()
+          || typeof d.justification !== 'string' || !d.justification.trim()) {
+        throw gateError(item, `confessed_gap.deferred[${i}] must be a typed deferral {gap, filed_as, justification} — a confessed gap is fixed in-session or explicitly deferred, never folded into 'filed'`);
+      }
+    });
+    if (written.length + deferred.length < confessed.length) {
+      throw gateError(item, `${confessed.length} confessed could_not_verify entr${confessed.length === 1 ? 'y' : 'ies'} but only ${written.length + deferred.length} dispositioned (written_and_run + typed deferrals) — every confessed gap must be discharged`);
+    }
+  }
+
+  return verdict;
+}
+
+/**
+ * Emit a pattern-promotion inbox item from a qa-gate class sweep.
+ * Threshold-gated (default >= 3 instances), deduplicated against pending
+ * pattern-promotion items by (source_item_id, failure_class), and refuses
+ * to file into a directory that is not a real watchtower install.
+ * @param {object} params
+ * @returns {string|null} The item id (existing id when deduplicated),
+ *   or null when instance_count is below threshold.
+ */
+export function emitPatternPromotion({
+  project,
+  project_path,
+  source_item_id,
+  failure_class,
+  instance_count,
+  pattern_text,
+  population = null,
+  desk = null,
+  threshold = 3,
+}) {
+  if (typeof failure_class !== 'string' || !failure_class.trim()) {
+    throw new Error('emitPatternPromotion: failure_class is required');
+  }
+  if (typeof source_item_id !== 'string' || !source_item_id.trim()) {
+    throw new Error('emitPatternPromotion: source_item_id is required (the qa-handoff item the sweep ran for — it is half the dedup key)');
+  }
+  if (!Number.isInteger(threshold) || threshold < 1) {
+    throw new Error('emitPatternPromotion: threshold must be a positive integer');
+  }
+  if (!Number.isInteger(instance_count) || instance_count < threshold) return null;
+  if (!existsSync(join(WATCHTOWER_DIR, 'config.json'))) {
+    throw new Error(`emitPatternPromotion: no watchtower install at ${WATCHTOWER_DIR} (config.json missing) — refusing to file into a phantom queue; record the promotion candidate in the stamped verdict instead`);
+  }
+  const existing = listPending({ category: 'pattern-promotion' }).find(
+    (i) => i.evidence?.source_item_id === source_item_id
+        && i.evidence?.failure_class === failure_class,
+  );
+  if (existing) return existing.id;
+  return createItem({
+    project,
+    project_path,
+    category: 'pattern-promotion',
+    urgency: 'normal',
+    title: `Pattern promotion: ${failure_class}`,
+    summary: `qa-gate class sweep found ${instance_count} instances${population ? ` (${population})` : ''} — recurring failure class, promotion candidate`,
+    context_anchor: `qa-handoff item ${source_item_id}`,
+    evidence: {
+      source: 'qa-gate-sweep',
+      source_item_id,
+      failure_class,
+      instance_count,
+      population,
+      pattern_text,
+    },
+    options: [
+      { value: 'write', label: 'Write pattern', description: 'Capture to the project pattern dir for later promotion review' },
+      { value: 'dismiss', label: 'Dismiss', description: 'Not a recurring class worth capturing' },
+    ],
+    filed_by: 'qa-gate',
+    desk,
+  });
+}
+
 // --- Exports ---
 
 /**
@@ -68,6 +261,8 @@ export function createItem({
   plan_fid = null,
   thread_ids = [],
   confidence = null,
+  project_unresolved = false,
+  desk = null,
 }) {
   ensureDir(QUEUE_DIR);
   const id = generateId();
@@ -76,6 +271,11 @@ export function createItem({
     id,
     project,
     project_path,
+    // Additive fields, present only when meaningful (older readers and items
+    // omit them): project_unresolved marks a basename-fallback identity,
+    // desk preserves the mux desk name as display metadata.
+    ...(project_unresolved ? { project_unresolved: true } : {}),
+    ...(desk ? { desk } : {}),
     filed_at: new Date().toISOString(),
     filed_by,
     status: 'pending',
@@ -104,14 +304,22 @@ export function createItem({
 
 /**
  * Resolve an inbox item.
+ * For qa-handoff items, a structured `qa_verdict` is REQUIRED and validated
+ * (validateQaVerdict) — invalid shapes THROW naming the missing field; the
+ * bare-null return remains reserved for "not pending". The validated verdict
+ * is stamped onto the item with its token canonicalized.
  * @param {string} id
  * @param {object} params
  * @returns {object} The updated item
  */
-export function resolveItem(id, { resolution, resolution_notes = null, resolution_type = null }) {
+export function resolveItem(id, { resolution, resolution_notes = null, resolution_type = null, qa_verdict = null }) {
   const fp = itemPath(id);
   const item = readItem(fp);
   if (item.status !== 'pending') return null;
+  if (item.category === QA_CATEGORY) {
+    const verdict = validateQaVerdict(item, qa_verdict);
+    item.qa_verdict = { ...qa_verdict, verdict };
+  }
   item.status = 'resolved';
   item.resolved_at = new Date().toISOString();
   item.resolution = resolution;
@@ -131,6 +339,11 @@ export function dismissItem(id, { notes = null, resolution_type = null } = {}) {
   const fp = itemPath(id);
   const item = readItem(fp);
   if (item.status !== 'pending') return null;
+  if (item.category === QA_CATEGORY
+      && (typeof resolution_type !== 'string' || !resolution_type.trim()
+          || typeof notes !== 'string' || !notes.trim())) {
+    throw gateError(item, 'dismissing a qa-handoff item requires a typed resolution_type AND notes naming why post-merge QA is being waived — dismissal is an audited escape hatch, not a bypass of the recipient gate');
+  }
   item.status = 'dismissed';
   item.resolved_at = new Date().toISOString();
   item.resolution_type = resolution_type;
@@ -149,6 +362,9 @@ export function supersedeItem(id, { reason = null } = {}) {
   const fp = itemPath(id);
   const item = readItem(fp);
   if (item.status !== 'pending') return null;
+  if (item.category === QA_CATEGORY && (typeof reason !== 'string' || !reason.trim())) {
+    throw gateError(item, 'superseding a qa-handoff item requires a reason naming what replaces it (e.g. the newer handoff covering the same merge)');
+  }
   item.status = 'superseded';
   item.resolution_notes = reason;
   atomicWrite(fp, item);
@@ -164,6 +380,9 @@ export function expireItem(id) {
   const fp = itemPath(id);
   const item = readItem(fp);
   if (item.status !== 'pending') return null;
+  if (item.category === QA_CATEGORY) {
+    throw gateError(item, 'qa-handoff items never expire — QA debt stays surfaced until a stamped verdict resolves it (or a typed dismissal waives it)');
+  }
   item.status = 'expired';
   item.resolution_notes = 'Auto-expired by age policy';
   atomicWrite(fp, item);
@@ -261,6 +480,12 @@ export function runExpiry({ warnDays = 14, expireDays = 30 } = {}) {
 
   for (const item of pending) {
     const age = now - new Date(item.filed_at).getTime();
+    // qa-handoff items never auto-expire: an expired handoff is exactly the
+    // silent QA gap the recipient gate forbids. They warn (by item) instead.
+    if (item.category === QA_CATEGORY) {
+      if (age >= warnMs) warned.push(item);
+      continue;
+    }
     if (age >= expireMs) {
       item.status = 'expired';
       item.resolution_notes = `Auto-expired after ${expireDays} days. If still relevant, re-file with updated context.`;

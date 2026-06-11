@@ -210,7 +210,10 @@ function validateSurfaceArea(notes) {
   }
 
   // Extract everything after ## Surface Area until the next ## or end
-  const sectionMatch = notes.match(/^## Surface Area[^\n]*\n([\s\S]*?)(?=\n## |\n*$)/m);
+  // Lookahead ends only at the next "## " header or absolute end-of-string.
+  // A bare `\n*$` here terminated the match at a blank line right after the
+  // header, yielding an empty capture for standard markdown spacing.
+  const sectionMatch = notes.match(/^## Surface Area[^\n]*\n([\s\S]*?)(?=\n## |$(?![\s\S]))/m);
   const sectionBody = sectionMatch ? sectionMatch[1] : '';
   const hasEntry = /^- (?:files|dirs):/m.test(sectionBody);
   if (!hasEntry) {

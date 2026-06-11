@@ -34,7 +34,7 @@ import {
   atomicWrite, loadConfig, slugify,
   log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
-  migrateThreadCursor, currentCursor,
+  updateThreadFile, currentCursor, resolveProjectIdentity,
 } from './watchtower-lib.mjs';
 
 const require = createRequire(import.meta.url);
@@ -101,7 +101,8 @@ async function claudeCall(systemPrompt, userMessage) {
 // Phase 2a: Worktree check — detect unmerged worktree at session close
 // ---------------------------------------------------------------------------
 
-function worktreeCheck(cwd, projectPath) {
+function worktreeCheck(cwd, project) {
+  const projectPath = project?.path;
   log('Phase 2a: Worktree check');
 
   if (!cwd || !projectPath) return 0;
@@ -164,21 +165,15 @@ function worktreeCheck(cwd, projectPath) {
   if (aheadCount > 0) detail.push(`${aheadCount} unmerged commit(s)`);
   if (uncommittedCount > 0) detail.push(`${uncommittedCount} uncommitted change(s)`);
 
-  // Attribute the item to the MAIN repo root, not the worktree — for
-  // worktree sessions projectPath is often the session cwd (the worktree
-  // itself), and items attributed to a worktree path can never be claimed
-  // by Ring 1's per-project auto-resolve pass. The worktree's
-  // --git-common-dir points at the main repo's .git.
-  const commonDir = safeExec(
-    'git rev-parse --path-format=absolute --git-common-dir',
-    { cwd }
-  );
-  const mainRoot = commonDir ? dirname(commonDir) : projectPath;
-  const projectName = basename(mainRoot);
-
+  // Attribute the item to the MAIN repo root, not the worktree — items
+  // attributed to a worktree path can never be claimed by Ring 1's
+  // per-project auto-resolve pass. The canonical resolver already did the
+  // worktree→main resolution, so project.path IS the main root and
+  // project.name the config key the readers group by.
   createItem({
-    project: projectName,
-    project_path: mainRoot,
+    project: project.name,
+    project_path: project.path,
+    ...(project.unresolved ? { project_unresolved: true } : {}),
     filed_by: 'ring3-close',
     category: 'worktree-unmerged',
     urgency: 'urgent',
@@ -473,54 +468,40 @@ Rules:
   for (const t of threads) {
     if (!t.thread || !t.cursor) continue;
     const threadSlug = slugify(t.thread);
-    threadIds.push(threadSlug);
     const threadPath = join(threadsDir, `${threadSlug}.json`);
 
     // One cursor snapshot per session that advanced this thread — appended,
-    // never overwritten (see migrateThreadCursor / cursor_history in
+    // never overwritten (see updateThreadFile / cursor_history in
     // watchtower-lib.mjs). The qa_handoff payload is a future SIBLING of this
     // history, not a field inside the cursor (qa-handoff-protocol.md).
     const cursorEntry = { date, session_id: sessionId, cursor: t.cursor };
+    const sessionRecord = {
+      id: sessionId,
+      contribution: t.contribution || '',
+      date,
+      project: projectSlug,
+      summary: summary.split('\n').slice(0, 3).join(' ').slice(0, 200),
+      transcript: transcriptPath,
+    };
 
-    let threadData;
-    if (existsSync(threadPath) && !t.is_new) {
-      threadData = JSON.parse(readFileSync(threadPath, 'utf8'));
-      // Heal pre-versioning + legacy single-cursor files into cursor_history
-      // (watchtower-contracts.md §Schema Versioning).
-      migrateThreadCursor(threadData);
-      threadData.cursor_history.push(cursorEntry);
-      if (t.display_name) threadData.display_name = t.display_name;
-      threadData.last_updated = now;
-      threadData.sessions.push({
-        id: sessionId,
-        contribution: t.contribution || '',
-        date,
-        project: projectSlug,
-        summary: summary.split('\n').slice(0, 3).join(' ').slice(0, 200),
-        transcript: transcriptPath,
-      });
-    } else {
-      threadData = {
-        schema_version: 2,
-        thread: threadSlug,
-        display_name: t.display_name || threadSlug,
-        cursor_history: [cursorEntry],
-        sessions: [{
-          id: sessionId,
-          contribution: t.contribution || '',
-          date,
-          project: projectSlug,
-          summary: summary.split('\n').slice(0, 3).join(' ').slice(0, 200),
-          transcript: transcriptPath,
-        }],
-        related_fids: [],
-        last_updated: now,
-        status: 'active',
-      };
+    // DISK WINS OVER MODEL: updateThreadFile appends whenever the thread
+    // file exists on disk — the model's `is_new` field is advisory naming
+    // metadata only and must never authorize a fresh-write over an existing
+    // file (one hallucinated is_new:true would irreversibly wipe the
+    // append-only cursor_history). Corrupt files are backed up aside and
+    // reported, never silently replaced. Per-thread try/catch so one bad
+    // thread cannot abort writes for the remaining threads.
+    try {
+      const outcome = updateThreadFile(threadPath, threadSlug, t, cursorEntry, sessionRecord, now);
+      threadIds.push(threadSlug);
+      if (outcome.startsWith('recovered')) {
+        logError(`Phase 2b2: Thread ${threadSlug} ${outcome}`);
+      } else {
+        log(`Phase 2b2: Thread ${threadSlug} ${outcome}`);
+      }
+    } catch (e) {
+      logError(`Phase 2b2: Thread ${threadSlug} write failed: ${e.message} — continuing with remaining threads`);
     }
-
-    atomicWrite(threadPath, JSON.stringify(threadData, null, 2));
-    log(`Phase 2b2: Thread ${threadSlug} ${t.is_new ? 'created' : 'updated'}`);
   }
 
   return threadIds;
@@ -530,7 +511,8 @@ Rules:
 // Phase 2c: Work item closure
 // ---------------------------------------------------------------------------
 
-async function workItemClosure(compressed, projectPath, threadIds = []) {
+async function workItemClosure(compressed, project, threadIds = []) {
+  const projectPath = project.path;
   log('Phase 2c: Work item closure');
 
   const dbPath = join(projectPath, 'pib.db');
@@ -604,10 +586,10 @@ Output ONLY the JSON array, no other text.`;
 
     const urgencyMap = { high: 'urgent', medium: 'normal', low: 'low' };
     try {
-      const projectName = basename(projectPath);
       createItem({
-        project: projectName,
+        project: project.name,
         project_path: projectPath,
+        ...(project.unresolved ? { project_unresolved: true } : {}),
         category: 'completion-review',
         urgency: 'normal',
         // Top-level typed field per design doc (act:6549289e); evidence.confidence
@@ -692,7 +674,8 @@ function isDuplicate(title, content, memoryLines, pendingTitles) {
 // Phase 2d: Knowledge extraction → inbox
 // ---------------------------------------------------------------------------
 
-async function decisionExtraction(compressed, projectPath, sessionId, transcriptPath, threadIds = []) {
+async function decisionExtraction(compressed, project, sessionId, transcriptPath, threadIds = []) {
+  const projectPath = project.path;
   log('Phase 2d: Knowledge extraction');
 
   const systemPrompt = `You are extracting decisions, constraints, lessons, and user preferences from a Claude Code session transcript. For each item found, classify its home:
@@ -733,9 +716,11 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
     return { autoWritten: 0, queued: 0 };
   }
 
-  // Load existing context for dedup
+  // Load existing context for dedup — query by the resolved name, the same
+  // key the items are filed under (the old basename query looked up a
+  // phantom project, so dedup never matched and duplicates re-filed).
   const memoryLines = loadMemoryIndex(projectPath);
-  const pending = listPending({ project: basename(projectPath) });
+  const pending = listPending({ project: project.name });
   const pendingTitles = pending.map(p => p.title);
 
   let queued = 0;
@@ -750,11 +735,11 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
     }
 
     try {
-      const projectName = basename(projectPath);
       const isMemory = item.home === 'memory';
       createItem({
-        project: projectName,
+        project: project.name,
         project_path: projectPath,
+        ...(project.unresolved ? { project_unresolved: true } : {}),
         category: 'knowledge-extraction',
         urgency: item.urgency || 'normal',
         title: fullTitle,
@@ -841,7 +826,8 @@ async function qualityPatternCapture(compressed, projectPath) {
 // Phase 2f: Methodology capture
 // ---------------------------------------------------------------------------
 
-async function methodologyCapture(compressed, projectPath, threadIds = []) {
+async function methodologyCapture(compressed, project, threadIds = []) {
+  const projectPath = project.path;
   log('Phase 2f: Methodology capture');
 
   try {
@@ -881,10 +867,10 @@ Output ONLY the JSON object.`,
       return;
     }
 
-    const projectName = basename(projectPath);
     createItem({
-      project: projectName,
+      project: project.name,
       project_path: projectPath,
+      ...(project.unresolved ? { project_unresolved: true } : {}),
       category: 'methodology-capture',
       urgency: 'normal',
       title: `methodology: ${result.title}`,
@@ -904,7 +890,8 @@ Output ONLY the JSON object.`,
 // Phase 2g: Upstream friction
 // ---------------------------------------------------------------------------
 
-async function upstreamFriction(compressed, projectPath, threadIds = []) {
+async function upstreamFriction(compressed, project, threadIds = []) {
+  const projectPath = project.path;
   log('Phase 2g: Upstream friction');
 
   const systemPrompt = `You are analyzing a Claude Code session transcript for friction with Claude Code itself (bugs, limitations, confusing behavior, missing features, workarounds). Only report genuine CC friction, not user errors or project-specific issues.
@@ -930,10 +917,10 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
     }
 
     for (const item of frictionItems) {
-      const projectName = basename(projectPath);
       createItem({
-        project: projectName,
+        project: project.name,
         project_path: projectPath,
+        ...(project.unresolved ? { project_unresolved: true } : {}),
         category: 'upstream-friction',
         urgency: item.severity === 'high' ? 'urgent' : 'normal',
         title: item.title,
@@ -1103,7 +1090,7 @@ function signalRing2() {
 // Phase 2l: Health
 // ---------------------------------------------------------------------------
 
-function writeHealth(sessionId, stats) {
+function writeHealth(sessionId, stats, project) {
   log('Phase 2l: Health');
 
   const healthPath = join(WATCHTOWER_DIR, 'state', 'ring3-health.json');
@@ -1115,6 +1102,13 @@ function writeHealth(sessionId, stats) {
     actions_closed: stats.actionsClosed || 0,
     status: 'success',
   };
+  // Fail loud, never silently: an unresolvable project identity is the
+  // anomaly that used to hide behind the basename fallback.
+  if (project?.unresolved) {
+    health.warnings = [
+      `project identity unresolved: filed under "${project.name}" (${project.path}) with project_unresolved`,
+    ];
+  }
 
   atomicWrite(healthPath, JSON.stringify(health, null, 2) + '\n');
   log('Phase 2l: ring3-health.json written');
@@ -1144,19 +1138,26 @@ function markProcessed(sessionId, stats) {
 // Resolve project from CWD
 // ---------------------------------------------------------------------------
 
+// Thin wrapper over the canonical resolver in watchtower-lib. The old local
+// implementation matched cwd.startsWith(configPath) and silently fell back to
+// basename(cwd) — every mux worktree session failed the match and filed all
+// its output under a phantom project the readers never looked up.
+//
+// Outcomes:
+//   registered/benign — the resolver named a real main repo; file under it.
+//   unresolved        — no repo root derivable (anomalous). We still file
+//     (never drop work), under basename(cwd), but every item carries
+//     project_unresolved: true and ring3 health gets a warning — fail loud,
+//     never silently.
 function resolveProject(cwd, config) {
-  const projects = config.projects || {};
+  const identity = resolveProjectIdentity(cwd, config);
+  if (identity) return identity;
 
-  for (const [name, proj] of Object.entries(projects)) {
-    const projPath = typeof proj === 'string' ? proj : proj?.path;
-    if (projPath && cwd.startsWith(projPath)) {
-      return { name, path: projPath, slug: slugify(name) };
-    }
-  }
-
-  // Fallback: use directory name
   const dirName = basename(cwd);
-  return { name: dirName, path: cwd, slug: slugify(dirName) };
+  return {
+    name: dirName, path: cwd, slug: slugify(dirName),
+    registered: false, unresolved: true,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,11 +1199,14 @@ async function main() {
   // Resolve project
   const project = resolveProject(args.cwd || process.cwd(), config);
   log(`Project: ${project.name} (${project.path})`);
+  if (project.unresolved) {
+    logError(`Project identity UNRESOLVED for cwd ${args.cwd || process.cwd()} — filing under "${project.name}" with project_unresolved`);
+  }
 
   // --- Phase 2a: Worktree check (pre-transcript, pure git, zero cost) ---
   let worktreeItemsFiled = 0;
   try {
-    worktreeItemsFiled = worktreeCheck(args.cwd, project.path);
+    worktreeItemsFiled = worktreeCheck(args.cwd, project);
   } catch (e) {
     logError(`Phase 2a failed: ${e.message}`);
   }
@@ -1213,7 +1217,7 @@ async function main() {
   if (!compressed || compressed.trim().length === 0) {
     log('Empty transcript after preprocessing, exiting');
     markProcessed(args.sessionId, { empty: true, worktreeItemsFiled });
-    writeHealth(args.sessionId, { itemsFiled: worktreeItemsFiled, actionsClosed: 0 });
+    writeHealth(args.sessionId, { itemsFiled: worktreeItemsFiled, actionsClosed: 0 }, project);
     process.exit(0);
   }
 
@@ -1247,7 +1251,7 @@ async function main() {
 
   // Phase 2c: Work item closure
   try {
-    const result = await workItemClosure(compressed, project.path, threadIds);
+    const result = await workItemClosure(compressed, project, threadIds);
     stats.actionsClosed = result.closed;
     stats.actionsQueued += result.queued;
     stats.itemsFiled += result.queued;
@@ -1257,7 +1261,7 @@ async function main() {
 
   // Phase 2d: Decision/lesson extraction
   try {
-    const result = await decisionExtraction(compressed, project.path, args.sessionId, args.transcriptPath, threadIds);
+    const result = await decisionExtraction(compressed, project, args.sessionId, args.transcriptPath, threadIds);
     stats.memoryWritten = result.autoWritten;
     stats.extractionsQueued = result.queued;
     stats.itemsFiled += result.queued;
@@ -1275,7 +1279,7 @@ async function main() {
   // Phase 2f: Methodology capture (feature-flagged)
   if (config.defaults?.methodology_capture !== false) {
     try {
-      await methodologyCapture(compressed, project.path, threadIds);
+      await methodologyCapture(compressed, project, threadIds);
     } catch (e) {
       logError(`Phase 2f failed: ${e.message}`);
     }
@@ -1284,7 +1288,7 @@ async function main() {
   // Phase 2g: Upstream friction (feature-flagged)
   if (config.defaults?.upstream_friction_detection !== false) {
     try {
-      await upstreamFriction(compressed, project.path, threadIds);
+      await upstreamFriction(compressed, project, threadIds);
     } catch (e) {
       logError(`Phase 2g failed: ${e.message}`);
     }
@@ -1328,7 +1332,7 @@ async function main() {
 
   // Phase 2l: Health
   try {
-    writeHealth(args.sessionId, stats);
+    writeHealth(args.sessionId, stats, project);
   } catch (e) {
     logError(`Phase 2l failed: ${e.message}`);
   }

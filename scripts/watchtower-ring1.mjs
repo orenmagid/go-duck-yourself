@@ -26,6 +26,7 @@ import { homedir } from 'os';
 import {
   atomicWrite, loadConfig, slugify, log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, resolveItem, loadBetterSqlite3,
+  preserveRing3LastSession,
 } from './watchtower-lib.mjs';
 
 const WATCHTOWER_DIR = getWatchtowerDir();
@@ -917,11 +918,26 @@ function main() {
     const summary = assembleSummary(projectStates, config);
     atomicWrite(join(stateDir, 'summary.md'), summary);
 
-    // Write per-project state files
+    // Write per-project state files.
+    // Section ownership (watchtower-contracts.md §Project State Section
+    // Ownership): Ring 3 owns "## Last Session" once it has authored a rich
+    // session summary there (marked by its `_<date> (<session-id>)_`
+    // attribution line). Ring 1 rebuilds every OTHER section from scratch,
+    // but must carry a Ring 3-authored Last Session forward verbatim —
+    // otherwise this rebuild deterministically clobbers Ring 3's summary
+    // within one cron tick.
     for (const ps of projectStates) {
       const slug = slugify(ps.name);
-      const projectMd = assembleProjectState(ps);
-      atomicWrite(join(projectsDir, `${slug}.md`), projectMd);
+      const statePath = join(projectsDir, `${slug}.md`);
+      let projectMd = assembleProjectState(ps);
+      if (existsSync(statePath)) {
+        try {
+          projectMd = preserveRing3LastSession(projectMd, readFileSync(statePath, 'utf8'));
+        } catch (e) {
+          logError(`could not merge existing state for ${slug}: ${e.message} — writing fresh`);
+        }
+      }
+      atomicWrite(statePath, projectMd);
     }
 
     log(`collected state for ${projectStates.length} project(s)`);

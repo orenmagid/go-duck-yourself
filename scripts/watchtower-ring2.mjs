@@ -479,8 +479,10 @@ async function escalateQueueItems() {
     const ageMs = now - new Date(item.filed_at).getTime();
     const ageDays = ageMs / (24 * 60 * 60 * 1000);
 
-    if (ageDays >= ESCALATION_EXPIRE_DAYS) {
-      // 30+ days: expire
+    if (ageDays >= ESCALATION_EXPIRE_DAYS && item.category !== 'qa-handoff') {
+      // 30+ days: expire. qa-handoff items are exempt — they never expire
+      // (recipient-gate contract: expireItem THROWS on them); they fall
+      // through to the [AGING] path below and stay surfaced as QA debt.
       expireItem(item.id);
       expired++;
       log(`Fast: expired queue item ${item.id} (${Math.floor(ageDays)}d old)`);
