@@ -8,9 +8,18 @@
 // None of them do console.log — callers decide how to present output.
 
 import { existsSync, readFileSync } from 'node:fs';
-import { ENGAGEMENT_EVENTS_CREATE, ENGAGEMENT_EVENTS_INDEXES } from '../.claude/engagement/sql-constants.mjs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+
+// sql-constants lives in the installed engagement runtime (.claude/engagement/),
+// which is gitignored in the CC source repo — absent on every fresh checkout/CI,
+// where npm test must still pass (act:d64feaac). Fall back to the committed
+// template source of truth. Same code in template and installed copies — no fork.
+const { ENGAGEMENT_EVENTS_CREATE, ENGAGEMENT_EVENTS_INDEXES } =
+  await import('../.claude/engagement/sql-constants.mjs').catch((err) => {
+    if (err.code !== 'ERR_MODULE_NOT_FOUND') throw err;
+    return import('../templates/engagement/sql-constants.mjs');
+  });
 
 // ---------------------------------------------------------------------------
 // Helpers
