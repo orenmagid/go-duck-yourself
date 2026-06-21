@@ -14,7 +14,9 @@
 //   2e: Quality pattern capture — recurring patterns from any session
 //   2f: Methodology capture — detect new skills/conventions
 //   2g: Upstream friction — CC friction detection
-//   2h: Feedback outbox flush — deliver pending feedback items
+//   2h: (removed 2026-06-12, act:6c3a4763 — feedback delivery is Ring 1's
+//       flushFeedbackOutbox in watchtower-lib.mjs; see tombstone below)
+//   2m: Session advisor pass — re-homed standing advisors, transcript-fed
 //   2i: Session auto-naming — generate descriptive session name
 //   2j: Consumer hooks — ring3-close-post hooks
 //   2k: Signal Ring 2 — write fast-trigger lock
@@ -24,18 +26,23 @@
 
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync,
-  renameSync, statSync,
+  renameSync, statSync, realpathSync,
 } from 'fs';
 import { join, basename, dirname } from 'path';
 import { execSync } from 'child_process';
 import { createRequire } from 'module';
 import { homedir } from 'os';
+import { pathToFileURL } from 'url';
 import {
   atomicWrite, loadConfig, slugify,
   log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
   updateThreadFile, currentCursor, resolveProjectIdentity,
 } from './watchtower-lib.mjs';
+// Direct queue import (precedent: ring2 imports expireItem this way) —
+// watchtower-lib deliberately not extended for this (lane separation).
+import { listItems } from './watchtower-queue.mjs';
+import { runRoutinePass } from './watchtower-routines.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -44,6 +51,21 @@ const WATCHTOWER_DIR = getWatchtowerDir();
 const CLAUDE_HOME = join(homedir(), '.claude');
 const CONSUMER_HOOK_TIMEOUT_MS = 120_000;
 const MODEL = 'claude-sonnet-4-6';
+
+// --- Dedup tuning constants (Phase 2c/2d noise reduction) ---
+// How far back resolved/dismissed inbox items count as a dedup corpus.
+// Older dismissals no longer suppress — re-surfacing once a quarter is
+// acceptable; the friction loop this kills is week-scale re-filing.
+const RESOLUTION_CORPUS_DAYS = 90;
+// Token-overlap threshold against resolved-item titles (same as pending).
+const RESOLVED_OVERLAP_TOKENS = 3;
+// Stricter threshold against dismissed-item titles — the user explicitly
+// said "not worth keeping", so suppress on less overlap.
+const DISMISSED_OVERLAP_TOKENS = 2;
+// A completion-review item resolved/dismissed within this window suppresses
+// re-filing for the same fid (a dismissed "is this done?" must not re-file
+// next session while the action is still open).
+const COMPLETION_REVIEW_DEDUP_DAYS = 14;
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -580,9 +602,48 @@ Output ONLY the JSON array, no other text.`;
   }
 
   let queued = 0;
+  let skipped = 0;
+
+  // Emit guards (act:ec508dbe): one prepared status re-check statement,
+  // reused across evaluations, and a per-fid dedup corpus built once from
+  // pending ∪ recently-closed completion-review items. Both setups FAIL OPEN
+  // (distinct logError, empty guard) — never wholesale suppression.
+  let statusStmt = null;
+  try {
+    statusStmt = db.prepare(
+      'SELECT status FROM actions WHERE fid = ? AND deleted_at IS NULL');
+  } catch (e) {
+    logError(`Phase 2c: could not prepare emit-time status re-check (${e.message}) — failing open`);
+  }
+  let existingCompletionItems = [];
+  try {
+    const since = new Date(
+      Date.now() - COMPLETION_REVIEW_DEDUP_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    existingCompletionItems = [
+      ...listPending({ project: project.name, category: 'completion-review' }),
+      ...listItems({
+        project: project.name,
+        category: 'completion-review',
+        statuses: ['resolved', 'dismissed'],
+        since,
+      }),
+    ];
+  } catch (e) {
+    logError(`Phase 2c: could not load existing completion-review items (${e.message}) — failing open`);
+  }
 
   for (const evalItem of evaluations) {
     if (!evalItem.fid || evalItem.confidence === 'none') continue;
+
+    const guard = completionReviewEmitGuard(evalItem.fid, {
+      statusStmt,
+      existingItems: existingCompletionItems,
+    });
+    if (!guard.emit) {
+      skipped++;
+      log(`Phase 2c: skip ${evalItem.fid} — ${guard.reason}`);
+      continue;
+    }
 
     const urgencyMap = { high: 'urgent', medium: 'normal', low: 'low' };
     try {
@@ -620,7 +681,7 @@ Output ONLY the JSON array, no other text.`;
   }
 
   db.close();
-  log(`Phase 2c: ${queued} completion candidates queued for review`);
+  log(`Phase 2c: ${queued} completion candidates queued for review${skipped ? ` (${skipped} skipped by emit guards)` : ''}`);
   return { closed: 0, queued };
 }
 
@@ -648,26 +709,162 @@ function tokenize(text) {
     .filter(w => w.length > 3);
 }
 
-function isDuplicate(title, content, memoryLines, pendingTitles) {
+// isDuplicate — token-overlap dedup across all corpora.
+//
+// `memoryLines` is the PROSE corpus (substring containment): memory-index
+// lines AND thread-cursor lines, lowercased, merged by the caller.
+// `pendingTitles` are already-pending inbox item titles.
+//
+// The trailing options object is the DESIGNATED GROWTH POINT for all future
+// corpora — add new corpus arrays there, never as positional parameters, so
+// the next corpus doesn't invent a third convention.
+//
+// Returns false when not a duplicate, or a truthy { corpus, match } naming
+// which corpus matched and the matching title/line — callers must log one
+// line per suppression (the 2-token dismissed matcher is the loosest in the
+// system; silent over-suppression would be invisible in a cron context).
+function isDuplicate(title, content, memoryLines, pendingTitles,
+  { resolvedTitles = [], dismissedTitles = [] } = {}) {
   const titleTokens = tokenize(title);
   const contentTokens = tokenize(content).slice(0, 10);
   const allTokens = [...new Set([...titleTokens, ...contentTokens])];
   if (allTokens.length === 0) return false;
 
-  // Check against memory index lines
+  const titleOverlap = (otherTitle) => {
+    const otherTokens = tokenize(otherTitle);
+    return allTokens.filter(t => otherTokens.includes(t)).length;
+  };
+
+  // Check against prose lines (memory index + thread cursors)
   for (const line of memoryLines) {
     const matchCount = allTokens.filter(t => line.includes(t)).length;
-    if (matchCount >= Math.min(3, allTokens.length)) return true;
+    if (matchCount >= Math.min(3, allTokens.length)) {
+      return { corpus: 'memory', match: line };
+    }
   }
 
   // Check against already-pending inbox items
   for (const pending of pendingTitles) {
-    const pendingTokens = tokenize(pending);
-    const overlap = allTokens.filter(t => pendingTokens.includes(t)).length;
-    if (overlap >= Math.min(3, allTokens.length)) return true;
+    if (titleOverlap(pending) >= Math.min(3, allTokens.length)) {
+      return { corpus: 'pending', match: pending };
+    }
+  }
+
+  // Resolved items — same threshold as pending. Resolved-as-routed-to-memory
+  // items are usually caught by the memory corpus too; this is the
+  // belt-and-suspenders title check.
+  for (const t of resolvedTitles) {
+    if (titleOverlap(t) >= Math.min(RESOLVED_OVERLAP_TOKENS, allTokens.length)) {
+      return { corpus: 'resolved', match: t };
+    }
+  }
+
+  // Dismissed items — STRICTER suppression: the user explicitly said
+  // "not worth keeping".
+  for (const t of dismissedTitles) {
+    if (titleOverlap(t) >= Math.min(DISMISSED_OVERLAP_TOKENS, allTokens.length)) {
+      return { corpus: 'dismissed', match: t };
+    }
   }
 
   return false;
+}
+
+// resolutionCorpus — titles of recently resolved/dismissed/superseded inbox
+// items for a project, split into the two suppression corpora isDuplicate
+// consumes. Recency-capped at RESOLUTION_CORPUS_DAYS to keep the corpus
+// bounded (~hundreds of titles max).
+function resolutionCorpus(projectName) {
+  const since = new Date(
+    Date.now() - RESOLUTION_CORPUS_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const closed = listItems({
+    project: projectName,
+    statuses: ['resolved', 'dismissed', 'superseded'],
+    since,
+  });
+  const dismissedTitles = closed
+    .filter(i => i.status === 'dismissed' || /not.?relevant/i.test(i.resolution || ''))
+    .map(i => i.title)
+    .filter(Boolean);
+  const dismissedSet = new Set(dismissedTitles);
+  const resolvedTitles = closed
+    .map(i => i.title)
+    .filter(t => t && !dismissedSet.has(t));
+  return { resolvedTitles, dismissedTitles };
+}
+
+// threadCursorLines — prose corpus from active thread cursors. Thread cursors
+// (what / where_left_off / open_questions) are exactly "what the system
+// already knows the user is working on"; an extraction that restates them is
+// noise. Returned lines are lowercased, ready for the memoryLines containment
+// pass in isDuplicate.
+function threadCursorLines(threadsDir, projectSlug) {
+  if (!projectSlug || !existsSync(threadsDir)) return [];
+  const lines = [];
+  const push = (v) => {
+    if (typeof v === 'string' && v.trim()) lines.push(v.toLowerCase());
+  };
+  for (const f of readdirSync(threadsDir)) {
+    if (!f.endsWith('.json')) continue;
+    let thread;
+    try {
+      thread = JSON.parse(readFileSync(join(threadsDir, f), 'utf8'));
+    } catch { continue; } // skip unparseable thread files
+    if (thread.status !== 'active') continue;
+    // Primary membership key: the sessions[].project entries Ring 3 itself
+    // writes; slug-match on the thread name is the fallback.
+    const sessions = Array.isArray(thread.sessions) ? thread.sessions : [];
+    const memberOfProject = sessions.some(s => s && s.project === projectSlug);
+    const slugMatches =
+      (typeof thread.thread === 'string' && slugify(thread.thread).includes(projectSlug))
+      || (typeof thread.display_name === 'string' && slugify(thread.display_name).includes(projectSlug));
+    if (!memberOfProject && !slugMatches) continue;
+    const cursor = currentCursor(thread);
+    push(thread.display_name);
+    push(cursor.what);
+    push(cursor.where_left_off);
+    if (Array.isArray(cursor.open_questions)) cursor.open_questions.forEach(push);
+  }
+  return lines;
+}
+
+// completionReviewEmitGuard — emit-time guards for Phase 2c (one call per
+// evaluation, immediately before createItem):
+//
+//   1. Status re-check: skip unless the action is STILL open/in-progress in
+//      pib.db at emit time — kills the done-between-snapshot-and-emit and the
+//      deferred classes in one check. FAIL-OPEN with a distinct logError: if
+//      the SELECT throws (e.g. sqlite lock contention at session close), the
+//      item emits anyway — a DB hiccup degrades to today's behavior, never to
+//      silent wholesale suppression. The try/catch is the guard's own so a
+//      throw can't abort the remaining evaluations.
+//   2. Per-fid dedup: skip when an existing completion-review item for the
+//      same fid is in `existingItems` (the caller builds that set from
+//      pending ∪ resolved/dismissed-within-COMPLETION_REVIEW_DEDUP_DAYS).
+//
+// Returns { emit: true } or { emit: false, reason }.
+function completionReviewEmitGuard(fid, { statusStmt, existingItems = [] } = {}) {
+  if (statusStmt) {
+    try {
+      const row = statusStmt.get(fid);
+      const status = row ? row.status : null;
+      if (status !== 'open' && status !== 'in-progress') {
+        return { emit: false, reason: `status now '${status ?? 'gone'}'` };
+      }
+    } catch (e) {
+      // FAIL-OPEN: emit despite the failed re-check.
+      logError(`Phase 2c: emit-time status re-check threw for ${fid} (${e.message}) — failing open, item will emit`);
+    }
+  }
+  const existing = existingItems.find(
+    i => i.plan_fid === fid || i.evidence?.fid === fid);
+  if (existing) {
+    return {
+      emit: false,
+      reason: `existing completion-review item ${existing.id} (${existing.status})`,
+    };
+  }
+  return { emit: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -719,9 +916,29 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
   // Load existing context for dedup — query by the resolved name, the same
   // key the items are filed under (the old basename query looked up a
   // phantom project, so dedup never matched and duplicates re-filed).
+  //
+  // memoryLines is the PROSE corpus: memory-index lines AND thread-cursor
+  // lines (what the system already knows the user is working on), both
+  // checked with the same >=3-token containment pass. Corpus builders fail
+  // open (logError + empty) — a corpus hiccup must never abort extraction.
   const memoryLines = loadMemoryIndex(projectPath);
+  try {
+    memoryLines.push(
+      ...threadCursorLines(join(WATCHTOWER_DIR, 'state', 'threads'), project.slug));
+  } catch (e) {
+    logError(`Phase 2d: thread-cursor corpus failed (${e.message}) — continuing without it`);
+  }
   const pending = listPending({ project: project.name });
   const pendingTitles = pending.map(p => p.title);
+  // Resolution corpora: titles the user already resolved or explicitly
+  // dismissed within RESOLUTION_CORPUS_DAYS — a dismissed lesson must not
+  // re-file the next time a session touches the same area.
+  let resolutionTitles = { resolvedTitles: [], dismissedTitles: [] };
+  try {
+    resolutionTitles = resolutionCorpus(project.name);
+  } catch (e) {
+    logError(`Phase 2d: resolution corpus failed (${e.message}) — continuing without it`);
+  }
 
   let queued = 0;
   let deduped = 0;
@@ -729,8 +946,13 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
   for (const item of extractions) {
     const fullTitle = `${item.type}: ${item.title}`;
 
-    if (isDuplicate(fullTitle, item.content || '', memoryLines, pendingTitles)) {
+    const dup = isDuplicate(
+      fullTitle, item.content || '', memoryLines, pendingTitles, resolutionTitles);
+    if (dup) {
       deduped++;
+      // One line per suppression — the dismissed matcher is the loosest in
+      // the system; over-suppression must be visible and tunable.
+      log(`Phase 2d: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
       continue;
     }
 
@@ -939,50 +1161,180 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2h: Feedback outbox flush
+// Phase 2m: Session advisor pass (act:aded4fc9)
 // ---------------------------------------------------------------------------
+//
+// The standing session advisors (historian, system-advocate, user-advocate,
+// anthropic-insider) were re-homed from /orient + /debrief standing mandates
+// to this transcript-fed close pass (plus /briefing's live panel on the
+// start side — the two halves of the operator's keep-the-whole-roster
+// ruling). Roster discovery is INDEX-DRIVEN, never hardcoded: any member
+// whose standing-mandate includes `session-close` AND declares a
+// `directives.session-close` runs here, so consumer projects can re-home or
+// extend the roster via directives-project.yaml without touching this
+// script. Findings file as `advisor-finding` inbox items; /briefing
+// re-surfaces fresh ones at the top of the owning project's chunk (a Step
+// 3b candidate class — never a permanent section). Cost control: reuses
+// this run's pinned-sonnet claudeCall — no Claude Code spawn, no extra
+// process; silence is the expected common case.
 
-async function feedbackOutboxFlush(projectPath) {
-  log('Phase 2h: Feedback outbox flush');
+const ADVISOR_MAX_FINDINGS = 2;          // per member per session
+const ADVISOR_TRANSCRIPT_SLICE = 40_000; // chars, same scale as Phase 2g
+const ADVISOR_SKILL_SLICE = 8_000;       // chars of member identity
 
-  const outboxPath = join(projectPath, 'cc-feedback-outbox.json');
-  if (!existsSync(outboxPath)) {
-    log('Phase 2h: No feedback outbox found');
-    return;
+function discoverSessionAdvisors(projectPath) {
+  const indexPath = join(projectPath, '.claude', 'skills', '_index.json');
+  if (!existsSync(indexPath)) {
+    return { advisors: [], reason: 'no skills index' };
   }
-
-  let outbox;
+  let index;
   try {
-    outbox = JSON.parse(readFileSync(outboxPath, 'utf8'));
+    index = JSON.parse(readFileSync(indexPath, 'utf8'));
   } catch (e) {
-    logError(`Phase 2h: Cannot parse outbox: ${e.message}`);
-    return;
+    return { advisors: [], reason: `unparseable skills index (${e.message})` };
   }
-
-  if (!Array.isArray(outbox) || outbox.length === 0) {
-    log('Phase 2h: Outbox empty');
-    return;
+  // Index shape: a JSON object with a top-level `skills` array.
+  const skills = Array.isArray(index?.skills) ? index.skills : [];
+  const advisors = [];
+  for (const entry of skills) {
+    const mandate = entry.standingMandate;
+    if (!Array.isArray(mandate) || !mandate.includes('session-close')) continue;
+    const directive = entry.directives?.['session-close'];
+    if (!directive || typeof directive !== 'string' || !directive.trim()) {
+      // A mandate without a directive is a data error — visible, not fatal.
+      logError(`Phase 2m: ${entry.name} has a session-close mandate but no directives.session-close — skipping (data error)`);
+      continue;
+    }
+    advisors.push({ name: entry.name, path: entry.path, directive });
   }
-
-  const undelivered = outbox.filter(item => !item.delivered);
-  if (undelivered.length === 0) {
-    log('Phase 2h: No undelivered feedback items');
-    return;
-  }
-
-  let delivered = 0;
-  for (const item of undelivered) {
-    // Mark as delivered (actual delivery mechanism depends on transport config)
-    item.delivered = true;
-    item.delivered_at = new Date().toISOString();
-    item.delivered_by = 'ring3-close';
-    delivered++;
-  }
-
-  // Atomic rewrite
-  atomicWrite(outboxPath, JSON.stringify(outbox, null, 2) + '\n');
-  log(`Phase 2h: ${delivered} feedback item(s) marked as delivered`);
+  return { advisors, reason: null };
 }
+
+function parseAdvisorFindings(text) {
+  const jsonMatch = String(text || '').match(/\[[\s\S]*\]/);
+  if (!jsonMatch) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonMatch[0]);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter(f => f && typeof f.title === 'string' && f.title.trim())
+    .slice(0, ADVISOR_MAX_FINDINGS)
+    .map(f => ({
+      title: f.title.trim(),
+      summary: typeof f.summary === 'string' ? f.summary : '',
+      urgency: ['urgent', 'normal', 'low'].includes(f.urgency) ? f.urgency : 'normal',
+    }));
+}
+
+// callFn is injectable for hermetic tests — production callers omit it and
+// get this run's pinned-sonnet claudeCall.
+async function advisorPass(compressed, project, sessionId, threadIds = [],
+  { callFn = claudeCall } = {}) {
+  log('Phase 2m: Session advisor pass');
+
+  const { advisors, reason } = discoverSessionAdvisors(project.path);
+  if (advisors.length === 0) {
+    log(`Phase 2m: No session-close advisors (${reason || 'none declared'}) — skipping`);
+    return { filed: 0 };
+  }
+  log(`Phase 2m: Roster — ${advisors.map(a => a.name).join(', ')}`);
+
+  // Dedup corpora — same suppression machinery as Phase 2d; builders fail
+  // open (an advisor finding re-filing once beats losing the whole pass).
+  let pendingTitles = [];
+  try {
+    pendingTitles = listPending({ project: project.name }).map(p => p.title);
+  } catch (e) {
+    logError(`Phase 2m: pending corpus failed (${e.message}) — continuing without it`);
+  }
+  let resolutionTitles = { resolvedTitles: [], dismissedTitles: [] };
+  try {
+    resolutionTitles = resolutionCorpus(project.name);
+  } catch (e) {
+    logError(`Phase 2m: resolution corpus failed (${e.message}) — continuing without it`);
+  }
+
+  const transcriptSlice = compressed.slice(0, ADVISOR_TRANSCRIPT_SLICE);
+
+  const results = await Promise.all(advisors.map(async (advisor) => {
+    try {
+      const skillPath = join(project.path, advisor.path);
+      const skillBody = existsSync(skillPath)
+        ? readFileSync(skillPath, 'utf8').slice(0, ADVISOR_SKILL_SLICE)
+        : '';
+      const systemPrompt = `You are the cabinet member "${advisor.name}", running your AUTOMATIC SESSION-CLOSE pass over a finished Claude Code session transcript. Your identity:
+
+${skillBody}
+
+Your session-close directive: ${advisor.directive}
+
+Review the transcript through that directive ONLY — do not free-range into other domains. File at most ${ADVISOR_MAX_FINDINGS} findings, and only things that genuinely meet the bar: a finding must be worth the operator's attention at their next briefing, not commentary on the session. SILENCE IS FINE and is the expected common case.
+
+Output a JSON array: [{"title":"short title","summary":"what you observed and why it matters","urgency":"urgent|normal|low"}]
+If nothing meets the bar, output exactly: []
+Output ONLY the JSON array, no other text.`;
+
+      const response = await callFn(systemPrompt, transcriptSlice);
+      return { advisor, findings: parseAdvisorFindings(response) };
+    } catch (e) {
+      logError(`Phase 2m: ${advisor.name} pass failed: ${e.message}`);
+      return { advisor, findings: [] };
+    }
+  }));
+
+  let filed = 0;
+  let suppressed = 0;
+  for (const { advisor, findings } of results) {
+    const shortName = advisor.name.replace(/^cabinet-/, '');
+    for (const f of findings) {
+      const fullTitle = `${shortName}: ${f.title}`;
+      const dup = isDuplicate(fullTitle, f.summary, [], pendingTitles, resolutionTitles);
+      if (dup) {
+        suppressed++;
+        log(`Phase 2m: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
+        continue;
+      }
+      try {
+        createItem({
+          project: project.name,
+          project_path: project.path,
+          ...(project.unresolved ? { project_unresolved: true } : {}),
+          category: 'advisor-finding',
+          urgency: f.urgency,
+          title: fullTitle,
+          summary: f.summary,
+          context_anchor: `session ${sessionId} — ${advisor.name} close pass`,
+          evidence: {
+            member: advisor.name,
+            directive_key: 'session-close',
+            session_id: sessionId,
+          },
+          filed_by: 'ring3-close',
+          thread_ids: threadIds,
+        });
+        filed++;
+      } catch (e) {
+        logError(`Phase 2m: Failed to file finding from ${advisor.name}: ${e.message}`);
+      }
+    }
+  }
+
+  log(`Phase 2m: ${filed} advisor finding(s) filed${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
+  return { filed };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2h (feedback outbox flush) was REMOVED (act:6c3a4763). It marked
+// items delivered without delivering them — a silent feedback-loss trap —
+// and read a project-local outbox path the real pipeline never writes.
+// Delivery is now a Ring 1 mechanical duty: flushFeedbackOutbox() in
+// watchtower-lib.mjs reads the GLOBAL ~/.claude/cc-feedback-outbox.json
+// and writes real files into the CC repo's feedback/ directory.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Phase 2i: Session auto-naming
@@ -1294,11 +1646,21 @@ async function main() {
     }
   }
 
-  // Phase 2h: Feedback outbox flush
-  try {
-    await feedbackOutboxFlush(project.path);
-  } catch (e) {
-    logError(`Phase 2h failed: ${e.message}`);
+  // Phase 2h removed — feedback delivery is a Ring 1 mechanical duty
+  // (flushFeedbackOutbox in watchtower-lib.mjs; act:6c3a4763).
+
+  // Phase 2m: Session advisor pass (feature-flagged) — the re-homed standing
+  // advisors' close-side seat (act:aded4fc9). Runs after the extraction
+  // phases so threadIds tag the findings; reuses this run's pinned-sonnet
+  // claudeCall for cost control.
+  if (config.defaults?.session_advisors !== false) {
+    try {
+      const result = await advisorPass(compressed, project, args.sessionId, threadIds);
+      stats.advisorFindings = result.filed;
+      stats.itemsFiled += result.filed;
+    } catch (e) {
+      logError(`Phase 2m failed: ${e.message}`);
+    }
   }
 
   // Phase 2i: Session auto-naming (feature-flagged)
@@ -1323,6 +1685,28 @@ async function main() {
     logError(`Phase 2j failed: ${e.message}`);
   }
 
+  // Phase 2j2: Session-close routine dispatch (feature-flagged). Declared
+  // routines with a session-close trigger fire for the RESOLVED project (a
+  // worktree session fires its main project's routines) and dispatch to the
+  // desk's main session via the engine's single mux path. Mechanical-tick
+  // triggers belong to Ring 1; only session-close events originate here.
+  // Skipped for unresolved identities — a phantom project has no declared
+  // routines, and firing under a basename key would split routine state.
+  if (config.defaults?.routine_dispatch !== false && !project.unresolved) {
+    try {
+      const pass = runRoutinePass({
+        config,
+        event: { type: 'session-close', project: project.name },
+        filedBy: 'ring3-close',
+      });
+      if (pass.fired.length > 0) {
+        log(`Phase 2j2: fired ${pass.fired.map((f) => `${f.key} (${f.status})`).join(', ')}`);
+      }
+    } catch (e) {
+      logError(`Phase 2j2 failed: ${e.message}`);
+    }
+  }
+
   // Phase 2k: Signal Ring 2
   try {
     signalRing2();
@@ -1344,7 +1728,40 @@ async function main() {
   log(`Ring 3 close complete in ${duration}ms. Actions closed: ${stats.actionsClosed}, items filed: ${stats.itemsFiled}, memory written: ${stats.memoryWritten}, threads updated: ${stats.threadsUpdated || 0}`);
 }
 
-main().catch(e => {
-  logError(`Fatal: ${e.message}`);
-  process.exit(1);
-});
+// ---------------------------------------------------------------------------
+// Entry guard — run main() only when this file is the invoked module, so
+// tests can import the helpers without firing a transcript run. realpathSync
+// matters: node realpath-resolves the main module for import.meta.url while
+// argv[1] keeps the given path — a symlinked invocation would otherwise make
+// main() silently never run.
+// ---------------------------------------------------------------------------
+
+const isMain = (() => {
+  try {
+    return process.argv[1]
+      && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+})();
+
+if (isMain) {
+  main().catch(e => {
+    logError(`Fatal: ${e.message}`);
+    process.exit(1);
+  });
+}
+
+// Exported for tests (ring3-dedup.test.mjs, advisor-pass.test.mjs). Runtime
+// behavior is unchanged — the session-end hook invokes this file directly,
+// which runs main() above.
+export {
+  tokenize,
+  isDuplicate,
+  resolutionCorpus,
+  threadCursorLines,
+  completionReviewEmitGuard,
+  discoverSessionAdvisors,
+  parseAdvisorFindings,
+  advisorPass,
+};

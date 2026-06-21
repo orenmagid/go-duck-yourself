@@ -4,7 +4,7 @@
 // All writes use atomic temp+rename per watchtower-contracts.md.
 // Queue uses directory listing, not index files (no-index convention).
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, renameSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
 
@@ -12,6 +12,23 @@ const WATCHTOWER_DIR = process.env.WATCHTOWER_DIR
   || join(process.env.HOME, '.claude-cabinet', 'watchtower');
 
 const QUEUE_DIR = join(WATCHTOWER_DIR, 'queue', 'items');
+
+// mux's dispatch queue (bin/mux `qa` verbs — the single desk-dispatch path,
+// carrying qa-handoffs AND routine dispatches). Descriptors are routing
+// convenience keyed <desk>/<item_id>.json (plus <desk>/in-flight/ once
+// drained); the inbox item is the durable record. Terminal exits here must
+// clear the matching descriptor or the two stores drift (act:796fe6dc —
+// resolved ghosts get re-offered by `mux qa drain`). The dir name is legacy.
+const MUX_QA_DIR = process.env.MUX_QA_DIR
+  || join(process.env.HOME, '.local', 'share', 'mux', 'qa-handoff');
+
+// Categories whose items are pushed to a desk via the mux dispatch queue.
+// Every terminal exit (resolve / dismiss / supersede / expire) on an item in
+// one of these categories clears its dispatch descriptor(s). Exported so
+// consumers (e.g. the /session-handoff epilogue drain) exclude dispatched
+// items by importing this set rather than re-listing categories in prose —
+// a hand-maintained copy would drift the moment a third category is added.
+export const DISPATCHED_CATEGORIES = new Set(['qa-handoff', 'routine']);
 
 // --- Helpers ---
 
@@ -42,6 +59,27 @@ function generateId() {
   return 'dec-' + randomBytes(4).toString('hex');
 }
 
+// Best-effort removal of the mux dispatch-queue descriptor(s) for an item —
+// both the queued copy and the in-flight copy, across every desk dir (desk
+// names differ from project names, so we sweep rather than guess). Never
+// throws: a routing-cleanup failure must not block a gate exit. The ·N badge
+// is recomputed by mux on its next mutation/desk-open, so a deletion here is
+// picked up without tmux involvement.
+function clearDispatchEntries(item) {
+  try {
+    if (!existsSync(MUX_QA_DIR)) return;
+    for (const desk of readdirSync(MUX_QA_DIR, { withFileTypes: true })) {
+      if (!desk.isDirectory()) continue;
+      for (const sub of ['.', 'in-flight']) {
+        const fp = join(MUX_QA_DIR, desk.name, sub, `${item.id}.json`);
+        try {
+          if (existsSync(fp)) unlinkSync(fp);
+        } catch { /* best-effort per file */ }
+      }
+    }
+  } catch { /* best-effort overall */ }
+}
+
 // Urgency sort order: urgent < normal < low (urgent first)
 const URGENCY_ORDER = { urgent: 0, normal: 1, low: 2 };
 
@@ -57,6 +95,15 @@ const URGENCY_ORDER = { urgent: 0, normal: 1, low: 2 };
 // functions below only call into it.
 
 const QA_CATEGORY = 'qa-handoff';
+
+// Categories whose items carry a structural recipient gate: they may never be
+// included in a batch disposition — each leaves the queue only through its own
+// gate (per-item resolve with a validated verdict, or a typed per-item
+// dismissal). Distinct from DISPATCHED_CATEGORIES: 'routine' is dispatched but
+// NOT gated — stale routines are legal batch fodder. Future gated categories
+// join this set and inherit batch refusal for free.
+export const GATED_CATEGORIES = new Set([QA_CATEGORY]);
+
 const QA_TERMINAL_VERDICTS = ['runtime-verified', 'blocked'];
 // The parameterized token. Canonical form uses U+00B7 (·); input tolerates
 // common separator drift (-, –, —, *, •) because sessions retype labels.
@@ -326,6 +373,7 @@ export function resolveItem(id, { resolution, resolution_notes = null, resolutio
   item.resolution_type = resolution_type;
   item.resolution_notes = resolution_notes;
   atomicWrite(fp, item);
+  if (DISPATCHED_CATEGORIES.has(item.category)) clearDispatchEntries(item);
   return item;
 }
 
@@ -349,6 +397,7 @@ export function dismissItem(id, { notes = null, resolution_type = null } = {}) {
   item.resolution_type = resolution_type;
   item.resolution_notes = notes;
   atomicWrite(fp, item);
+  if (DISPATCHED_CATEGORIES.has(item.category)) clearDispatchEntries(item);
   return item;
 }
 
@@ -368,6 +417,7 @@ export function supersedeItem(id, { reason = null } = {}) {
   item.status = 'superseded';
   item.resolution_notes = reason;
   atomicWrite(fp, item);
+  if (DISPATCHED_CATEGORIES.has(item.category)) clearDispatchEntries(item);
   return item;
 }
 
@@ -386,7 +436,62 @@ export function expireItem(id) {
   item.status = 'expired';
   item.resolution_notes = 'Auto-expired by age policy';
   atomicWrite(fp, item);
+  if (DISPATCHED_CATEGORIES.has(item.category)) clearDispatchEntries(item);
   return item;
+}
+
+/**
+ * Apply ONE disposition to a batch of ungated items — the single bulk path,
+ * used by /briefing's batch dispositions and /inbox's bulk triage. A batch is one
+ * operator decision applied to many items, so the typed reason is REQUIRED:
+ * it lands on every item as its audit trail.
+ *
+ * All-or-nothing pre-validation: throws BEFORE any write when (a) any id is
+ * unknown, (b) any item is in a GATED_CATEGORIES category — gated items never
+ * batch; each goes through its own gate — or (c) the typed reason is absent.
+ * A batch that would hit a gate fails whole, never half-applies.
+ * Non-pending items are not an error (another session may have raced the
+ * disposition); they are skipped and reported.
+ * @param {string[]} ids
+ * @param {object} params
+ * @param {'dismiss'|'resolve'} params.disposition
+ * @param {string} params.resolution_type - typed reason (e.g. 'stale',
+ *   'noise', 'captured-to-memory', 'acted-on') — required
+ * @param {string} params.notes - plain-language reason — required
+ * @param {string} [params.resolution] - resolve batches: the resolution
+ *   value stamped on each item (defaults to resolution_type)
+ * @returns {{applied: string[], skipped_not_pending: string[]}}
+ */
+export function applyBatch(ids, { disposition, resolution_type, notes, resolution = null } = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new Error('applyBatch: ids must be a non-empty array');
+  }
+  if (disposition !== 'dismiss' && disposition !== 'resolve') {
+    throw new Error("applyBatch: disposition must be 'dismiss' or 'resolve'");
+  }
+  if (typeof resolution_type !== 'string' || !resolution_type.trim()
+      || typeof notes !== 'string' || !notes.trim()) {
+    throw new Error('applyBatch: a typed resolution_type AND notes are required — a batch is one decision applied to many items, and the reason lands on every one');
+  }
+  const items = ids.map((id) => {
+    const item = getItem(id);
+    if (!item) throw new Error(`applyBatch: unknown item ${id} — batches pre-validate whole; nothing was applied`);
+    return item;
+  });
+  const gated = items.filter((i) => GATED_CATEGORIES.has(i.category));
+  if (gated.length > 0) {
+    throw new Error(`applyBatch: ${gated.map((i) => `${i.id} (${i.category})`).join(', ')} carr${gated.length === 1 ? 'ies' : 'y'} a recipient gate — gated items never batch; handle each through its own gate. Nothing was applied`);
+  }
+  const applied = [];
+  const skipped_not_pending = [];
+  for (const item of items) {
+    const result = disposition === 'dismiss'
+      ? dismissItem(item.id, { notes, resolution_type })
+      : resolveItem(item.id, { resolution: resolution ?? resolution_type, resolution_notes: notes, resolution_type });
+    if (result) applied.push(item.id);
+    else skipped_not_pending.push(item.id);
+  }
+  return { applied, skipped_not_pending };
 }
 
 /**
@@ -422,6 +527,45 @@ export function listPending({ project, category, urgency, maxAge } = {}) {
     if (urgDiff !== 0) return urgDiff;
     return new Date(b.filed_at) - new Date(a.filed_at);
   });
+  return items;
+}
+
+/**
+ * List inbox items across ALL statuses with optional filters — the single
+ * source for "read non-pending items". (Ring 2's private readAllQueueItems
+ * fork predates this helper; consolidating it is a separate-lane follow-up.)
+ * @param {object} filters
+ * @param {string} [filters.project] - exact match on item.project
+ * @param {string} [filters.category] - exact match on item.category
+ * @param {string[]} [filters.statuses] - keep items whose status is in the
+ *   array (omit = all statuses)
+ * @param {string} [filters.since] - ISO date; keep items whose
+ *   `resolved_at || filed_at` >= since (bounds corpus growth for dedup callers)
+ * @returns {Array} items sorted newest first by (resolved_at || filed_at)
+ */
+export function listItems({ project, category, statuses, since } = {}) {
+  if (!existsSync(QUEUE_DIR)) return [];
+  const sinceMs = since ? new Date(since).getTime() : null;
+  const entries = readdirSync(QUEUE_DIR, { withFileTypes: true });
+  const items = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    try {
+      const item = readItem(join(QUEUE_DIR, entry.name));
+      if (project && item.project !== project) continue;
+      if (category && item.category !== category) continue;
+      if (Array.isArray(statuses) && !statuses.includes(item.status)) continue;
+      if (sinceMs != null) {
+        const ts = new Date(item.resolved_at || item.filed_at).getTime();
+        if (!(ts >= sinceMs)) continue;
+      }
+      items.push(item);
+    } catch {
+      // Skip unparseable items
+    }
+  }
+  items.sort((a, b) =>
+    new Date(b.resolved_at || b.filed_at) - new Date(a.resolved_at || a.filed_at));
   return items;
 }
 
@@ -490,6 +634,7 @@ export function runExpiry({ warnDays = 14, expireDays = 30 } = {}) {
       item.status = 'expired';
       item.resolution_notes = `Auto-expired after ${expireDays} days. If still relevant, re-file with updated context.`;
       atomicWrite(itemPath(item.id), item);
+      if (DISPATCHED_CATEGORIES.has(item.category)) clearDispatchEntries(item);
       expired.push(item);
     } else if (age >= warnMs) {
       warned.push(item);

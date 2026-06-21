@@ -6,7 +6,7 @@
 
 import {
   readFileSync, writeFileSync, existsSync,
-  mkdirSync, renameSync, realpathSync,
+  mkdirSync, renameSync, realpathSync, readdirSync,
 } from 'fs';
 import { join, dirname, basename, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
@@ -66,6 +66,133 @@ export function loadConfig(watchtowerDir) {
 
 export function slugify(text) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+}
+
+// ---------------------------------------------------------------------------
+// flushFeedbackOutbox — deliver the GLOBAL cc-feedback outbox to the CC repo
+// ---------------------------------------------------------------------------
+// Ring 1 mechanical duty (act:6c3a4763). Ports orient's delivery algorithm:
+// read ~/.claude/cc-feedback-outbox.json, resolve the CC source repo via
+// cc-registry (the entry whose package.json name is create-claude-cabinet),
+// write each undelivered item's body to <cc>/feedback/{date}-{slug}.md with
+// a skip-if-exists guard against feedback/ AND feedback/resolved/ — a name
+// containing the slug, or a delivery-scheme name whose slug is a whole-token
+// prefix/subset of the new one, means a prior session already delivered or
+// resolved it — then atomically rewrite the outbox — [] on a clean pass, only the
+// failed items otherwise. Fail-safe: if the destination cannot be resolved,
+// the outbox is left untouched — an item is never dropped without a file
+// existing for it. Ring 1 is now the SOLE feedback-delivery owner: orient's
+// duplicate flush (incompatible {date}-{slug}-{seq}.md scheme) was retired
+// (act:d53ff509) once this duty was verified in the live runtime.
+
+const CC_PACKAGE_NAME = 'create-claude-cabinet';
+
+function resolveCcFeedbackDir(registryPath) {
+  if (!existsSync(registryPath)) return null;
+  let registry;
+  try {
+    registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+  } catch {
+    return null;
+  }
+  for (const proj of registry.projects || []) {
+    const pkgPath = join(proj.path || '', 'package.json');
+    if (!existsSync(pkgPath)) continue;
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+      if (pkg.name === CC_PACKAGE_NAME) return join(proj.path, 'feedback');
+    } catch { /* unreadable package.json — not the CC repo */ }
+  }
+  return null;
+}
+
+function feedbackFileExists(feedbackDir, slug) {
+  for (const dir of [feedbackDir, join(feedbackDir, 'resolved')]) {
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir)) {
+      if (name.includes(slug)) return true;
+      // Reverse direction (act:ca0aee25): a re-report under a LONGER title
+      // must still match its already-delivered shorter twin. Deliberately
+      // narrow — only delivery-scheme names ({date}-{slug}[-{seq}].md)
+      // carry slug semantics, and the existing slug must sit on whole
+      // dash-token boundaries inside the new one. Silent suppression of
+      // genuinely new feedback is worse than a duplicate delivery, so no
+      // substring fuzz and no participation by hand-named files.
+      const m = /^\d{4}-\d{2}-\d{2}-(.+?)(?:-\d+)?\.md$/.exec(name);
+      if (m && `-${slug}-`.includes(`-${m[1]}-`)) return true;
+    }
+  }
+  return false;
+}
+
+export function flushFeedbackOutbox(opts = {}) {
+  const outboxPath = opts.outboxPath
+    || join(homedir(), '.claude', 'cc-feedback-outbox.json');
+  const registryPath = opts.registryPath
+    || join(homedir(), '.claude', 'cc-registry.json');
+
+  const result = { status: 'ok', delivered: 0, skipped: 0, kept: 0, destination: null };
+
+  if (!existsSync(outboxPath)) {
+    result.status = 'no-outbox';
+    return result;
+  }
+
+  let outbox;
+  try {
+    outbox = JSON.parse(readFileSync(outboxPath, 'utf8'));
+  } catch {
+    // Malformed outbox: per orient's contract, warn and reset to [].
+    atomicWrite(outboxPath, '[]\n');
+    result.status = 'malformed-reset';
+    return result;
+  }
+
+  if (!Array.isArray(outbox) || outbox.length === 0) {
+    result.status = 'empty';
+    return result;
+  }
+
+  const undelivered = outbox.filter((item) => item && item.delivered !== true);
+  if (undelivered.length === 0) {
+    // Only stale delivered:true markers remain — don't accumulate them.
+    atomicWrite(outboxPath, '[]\n');
+    result.status = 'markers-cleared';
+    return result;
+  }
+
+  const feedbackDir = opts.destination || resolveCcFeedbackDir(registryPath);
+  if (!feedbackDir) {
+    // Cannot resolve where feedback lives. Leave the outbox untouched —
+    // never mark/drop an item without a delivered file existing for it.
+    result.status = 'no-destination';
+    result.kept = outbox.length;
+    return result;
+  }
+  result.destination = feedbackDir;
+
+  const failed = [];
+  for (const item of undelivered) {
+    try {
+      const slug = slugify(item.title || 'untitled') || 'untitled';
+      if (feedbackFileExists(feedbackDir, slug)) {
+        result.skipped++;
+        continue;
+      }
+      const date = item.date || new Date().toISOString().slice(0, 10);
+      if (!existsSync(feedbackDir)) mkdirSync(feedbackDir, { recursive: true });
+      writeFileSync(join(feedbackDir, `${date}-${slug}.md`), item.body || item.title || '');
+      result.delivered++;
+    } catch {
+      failed.push(item);
+    }
+  }
+
+  // Clean pass resets to []; otherwise keep only the failed items.
+  atomicWrite(outboxPath, JSON.stringify(failed, null, 2) + '\n');
+  result.kept = failed.length;
+  if (failed.length > 0) result.status = 'partial';
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +361,55 @@ export function preserveRing3LastSession(freshContent, existingContent) {
   const next = freshContent.indexOf('\n## ', freshIdx + PROJECT_STATE_LAST_SESSION_HEADER.length);
   const end = next > 0 ? next : freshContent.length;
   return freshContent.slice(0, freshIdx) + preserved + '\n' + freshContent.slice(end);
+}
+
+// ---------------------------------------------------------------------------
+// writeProjectStatePreservingRing3 — race-safe project-state rebuild write
+// ---------------------------------------------------------------------------
+// preserveRing3LastSession is a pure merge; a raw read→merge→atomicWrite
+// around it has a read-then-write race: if Ring 3 writes its fresh Last
+// Session between Ring 1's snapshot read and the rename, the rebuild is
+// computed from a stale snapshot and silently drops the just-authored
+// summary until the NEXT session close. This helper closes that window
+// with a re-read check-and-retry: merge against a snapshot, re-read to
+// verify nothing changed underneath us, and only then write; on change,
+// re-merge against the fresh read (up to maxAttempts). If attempts are
+// exhausted (pathological churn), it merges against the FRESHEST read and
+// writes anyway — the rebuild is never skipped.
+//
+// Residual window: a write landing between the verify read and the rename
+// inside atomicWrite is still theoretically possible — microseconds wide,
+// down from the full merge-computation window. If it ever bites in
+// practice, the structural fix is the Ring 3 sidecar-file design (option c
+// in .claude/plans/watchtower-ring1-race-fix.md).
+//
+// opts._beforeVerifyHook is a TEST-ONLY injection seam, fired between the
+// merge and the verify re-read so tests can deterministically simulate a
+// concurrent Ring 3 write. Production callers must not pass it.
+//
+// Returns { written: true, attempts, exhausted? }.
+export function writeProjectStatePreservingRing3(statePath, freshContent, opts = {}) {
+  const maxAttempts = opts.maxAttempts ?? 3;
+  const read = () => (existsSync(statePath) ? readFileSync(statePath, 'utf8') : null);
+
+  let snapshot = read();
+  for (let i = 0; i < maxAttempts; i++) {
+    const merged = preserveRing3LastSession(freshContent, snapshot);
+    opts._beforeVerifyHook?.();
+    const verify = read();
+    if (verify !== snapshot) {
+      // Someone (Ring 3) wrote since our read — re-merge against it.
+      snapshot = verify;
+      continue;
+    }
+    atomicWrite(statePath, merged);
+    return { written: true, attempts: i + 1 };
+  }
+
+  // Attempts exhausted (pathological churn): merge against the freshest
+  // read and write anyway — never skip the rebuild.
+  atomicWrite(statePath, preserveRing3LastSession(freshContent, read()));
+  return { written: true, attempts: maxAttempts, exhausted: true };
 }
 
 // ---------------------------------------------------------------------------

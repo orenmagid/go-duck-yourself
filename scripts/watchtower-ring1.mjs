@@ -13,6 +13,10 @@
 // and per-project state/projects/<slug>.md files.
 // Writes ring1-health.json with last-run timestamp.
 //
+// Also delivers the global CC feedback outbox (~/.claude/
+// cc-feedback-outbox.json) to the CC repo's feedback/ dir every tick —
+// deterministic file IO belongs at the mechanical layer (act:6c3a4763).
+//
 // Consumer hooks: reads config.json hooks.ring1-post-collect, spawns
 // each with 30s timeout, passes project state JSON on stdin.
 
@@ -26,8 +30,9 @@ import { homedir } from 'os';
 import {
   atomicWrite, loadConfig, slugify, log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, resolveItem, loadBetterSqlite3,
-  preserveRing3LastSession,
+  writeProjectStatePreservingRing3, flushFeedbackOutbox,
 } from './watchtower-lib.mjs';
+import { runRoutinePass } from './watchtower-routines.mjs';
 
 const WATCHTOWER_DIR = getWatchtowerDir();
 
@@ -208,12 +213,32 @@ function collectPibState(projectPath) {
       // best-effort
     }
 
+    // Overdue actions (due date is in the past). The `due` column is
+    // unconstrained free text (TEXT, no CHECK), so a malformed value like
+    // "06/18/2026" would string-compare as overdue — the GLOB guard skips
+    // anything that isn't a well-formed YYYY-MM-DD. `<= date('now')` (not
+    // `<`) matches pib-db-lib.mjs's existing overdue convention, the single
+    // source of truth; due-today counts as overdue.
+    let overdueActions = [];
+    try {
+      overdueActions = db.prepare(
+        `SELECT fid, text, due FROM actions
+         WHERE status IN ('open','in-progress','blocked')
+           AND due GLOB '????-??-??' AND due <= date('now')
+           AND deleted_at IS NULL`
+      ).all();
+    } catch {
+      // due column may not exist in older schemas
+    }
+
     return {
       openActions: openActions.count,
       flaggedCount,
       deferredTriggerCount,
       staleProjects,
       completionCandidates,
+      overdueActions,
+      overdueCount: overdueActions.length,
       projectBreakdown,
     };
   } finally {
@@ -288,6 +313,39 @@ function detectActiveSessions(projectPath) {
 // ---------------------------------------------------------------------------
 // Deployment detection (cached per config cycle)
 // ---------------------------------------------------------------------------
+
+// CC-repo feedback-arrival check (act:b08efbc2). Only the CC SOURCE repo
+// (package.json name === 'create-claude-cabinet') has a feedback/ root and a
+// proposals/ dir; everywhere else this returns null at near-zero cost.
+// feedback/ root files are untriaged BY DEFINITION (triage-at-arrival moves
+// them to feedback/resolved/), and proposals/ holds pending extraction
+// proposals. Any count > 0 raises a LOUD attention line in summary.md —
+// recomputed every tick, so it cannot expire while the files remain. The
+// blocking triage rule itself lives in the CC repo's always-loaded
+// instructions (CLAUDE.md), not here: Ring 1 surfaces, the session acts.
+function checkCcFeedbackArrival(projectPath) {
+  try {
+    const pkgPath = join(projectPath, 'package.json');
+    if (!existsSync(pkgPath)) return null;
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    if (pkg.name !== 'create-claude-cabinet') return null;
+    const countMd = (dir) => {
+      try {
+        return readdirSync(join(projectPath, dir), { withFileTypes: true })
+          .filter((e) => e.isFile() && e.name.endsWith('.md') && !e.name.startsWith('.'))
+          .length;
+      } catch {
+        return 0;
+      }
+    };
+    const feedbackCount = countMd('feedback');
+    const proposalCount = countMd('proposals');
+    if (feedbackCount === 0 && proposalCount === 0) return null;
+    return { feedbackCount, proposalCount };
+  } catch {
+    return null;
+  }
+}
 
 function detectDeployment(projectPath) {
   const found = [];
@@ -639,6 +697,9 @@ function assembleSummary(projectStates, config) {
     if (ps.pib && ps.pib.flaggedCount > 0) {
       attention.push(`${ps.name}: ${ps.pib.flaggedCount} flagged action(s)`);
     }
+    if (ps.pib && ps.pib.overdueCount > 0) {
+      attention.push(`${ps.name}: ${ps.pib.overdueCount} overdue action(s)`);
+    }
     if (ps.pib && ps.pib.staleProjects && ps.pib.staleProjects.length > 0) {
       for (const sp of ps.pib.staleProjects) {
         attention.push(`${ps.name}/${sp.name}: stale (no activity in ${STALE_DAYS}d)`);
@@ -658,6 +719,13 @@ function assembleSummary(projectStates, config) {
       for (const wt of ps.orphanedWorktrees) {
         attention.unshift(`⚠ ${ps.name}: worktree "${wt.branch}" has unmerged work — MERGE OR LOSE`);
       }
+    }
+    if (ps.ccFeedbackArrival) {
+      const { feedbackCount, proposalCount } = ps.ccFeedbackArrival;
+      const parts = [];
+      if (feedbackCount > 0) parts.push(`${feedbackCount} untriaged feedback file(s) in feedback/ root`);
+      if (proposalCount > 0) parts.push(`${proposalCount} pending extraction proposal(s) in proposals/`);
+      attention.unshift(`⚠ ${ps.name}: ${parts.join(' + ')} — TRIAGE AT ARRIVAL (file to pib-db or decline, then stamp + move to feedback/resolved/)`);
     }
     if (ps.memoryIntegrity) {
       const mi = ps.memoryIntegrity;
@@ -815,8 +883,20 @@ function assembleProjectState(ps) {
   if (ps.pib && ps.pib.flaggedCount > 0) {
     issues.push(`${ps.pib.flaggedCount} flagged action(s)`);
   }
+  if (ps.pib && ps.pib.overdueCount > 0) {
+    issues.push(`${ps.pib.overdueCount} overdue action(s)`);
+  }
   if (ps.pib && ps.pib.deferredTriggerCount > 0) {
     issues.push(`${ps.pib.deferredTriggerCount} deferred action(s) waiting on triggers`);
+  }
+  // Stale + completion-candidate counts are the data feed for /briefing's
+  // backlog-hygiene nudge (act:5e8a9e89) — surfaced here in the per-project
+  // deep file so the nudge reads one source instead of re-querying pib.
+  if (ps.pib && ps.pib.staleProjects && ps.pib.staleProjects.length > 0) {
+    issues.push(`${ps.pib.staleProjects.length} stale project(s)`);
+  }
+  if (ps.pib && ps.pib.completionCandidates && ps.pib.completionCandidates.length > 0) {
+    issues.push(`${ps.pib.completionCandidates.length} completion candidate(s)`);
   }
   if (ps.divergedBranches && ps.divergedBranches.length > 0) {
     issues.push(`Diverged branches: ${ps.divergedBranches.join(', ')}`);
@@ -865,6 +945,40 @@ function main() {
       status = 'no-projects';
     }
 
+    // Feedback outbox delivery — global duty, not per-project. Failure
+    // must not kill the state-collection pass.
+    try {
+      const flush = flushFeedbackOutbox();
+      if (flush.delivered || flush.skipped) {
+        log(`feedback outbox: ${flush.delivered} delivered, ${flush.skipped} already-present → ${flush.destination}`);
+      }
+      if (flush.status === 'no-destination') {
+        logError(`feedback outbox has ${flush.kept} item(s) but the CC repo could not be resolved from cc-registry — items kept`);
+      } else if (flush.status === 'malformed-reset') {
+        logError('feedback outbox was malformed JSON — reset to []');
+      } else if (flush.status === 'partial') {
+        logError(`feedback outbox: ${flush.kept} item(s) failed delivery and were kept`);
+      }
+    } catch (e) {
+      logError(`feedback outbox flush failed: ${e.message}`);
+    }
+
+    // Routine tick — evaluate declared interactive routines' mechanical
+    // triggers (time-of-day / interval / path-nonempty) and dispatch any
+    // that fire to their desk's main session (act:c2a55c08). The engine
+    // never throws, but belt-and-suspenders: a routine failure must not
+    // kill the state-collection pass.
+    if (config.defaults?.routine_dispatch !== false) {
+      try {
+        const pass = runRoutinePass({ config, event: { type: 'tick' }, filedBy: 'ring1' });
+        if (pass.fired.length > 0) {
+          log(`routines: fired ${pass.fired.map((f) => `${f.key} (${f.status})`).join(', ')}`);
+        }
+      } catch (e) {
+        logError(`routine tick failed: ${e.message}`);
+      }
+    }
+
     const projectStates = [];
 
     for (const name of projectNames) {
@@ -881,6 +995,7 @@ function main() {
         pib: collectPibState(projectPath),
         activeSessions: detectActiveSessions(projectPath),
         deployment: detectDeployment(projectPath),
+        ccFeedbackArrival: checkCcFeedbackArrival(projectPath),
         memoryIntegrity: checkMemoryIntegrity(projectPath),
         divergedBranches: [],
         hookResults: [],
@@ -925,19 +1040,24 @@ function main() {
     // attribution line). Ring 1 rebuilds every OTHER section from scratch,
     // but must carry a Ring 3-authored Last Session forward verbatim —
     // otherwise this rebuild deterministically clobbers Ring 3's summary
-    // within one cron tick.
+    // within one cron tick. The rebuild goes through the lib's re-read
+    // check-and-retry helper so a Ring 3 write landing mid-merge is
+    // re-merged instead of silently dropped.
     for (const ps of projectStates) {
       const slug = slugify(ps.name);
       const statePath = join(projectsDir, `${slug}.md`);
-      let projectMd = assembleProjectState(ps);
-      if (existsSync(statePath)) {
-        try {
-          projectMd = preserveRing3LastSession(projectMd, readFileSync(statePath, 'utf8'));
-        } catch (e) {
-          logError(`could not merge existing state for ${slug}: ${e.message} — writing fresh`);
+      const projectMd = assembleProjectState(ps);
+      try {
+        const res = writeProjectStatePreservingRing3(statePath, projectMd);
+        if (res.exhausted) {
+          log(`state merge for ${slug} exhausted retries — merged against freshest snapshot`);
         }
+      } catch (e) {
+        // Best-effort: a failed merge/write for one project must not kill
+        // the whole Ring 1 pass.
+        logError(`could not write state for ${slug}: ${e.message} — writing fresh`);
+        atomicWrite(statePath, projectMd);
       }
-      atomicWrite(statePath, projectMd);
     }
 
     log(`collected state for ${projectStates.length} project(s)`);

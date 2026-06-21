@@ -13,6 +13,7 @@
 import { readFileSync, readdirSync, existsSync, statSync, mkdirSync } from 'fs';
 import { join, resolve, basename } from 'path';
 import { currentCursor, resolveProjectIdentity } from './watchtower-lib.mjs';
+import { runAdvisoryPass } from './watchtower-advisories.mjs';
 
 const WATCHTOWER_DIR = process.env.WATCHTOWER_DIR
   || join(process.env.HOME, '.claude-cabinet', 'watchtower');
@@ -21,6 +22,18 @@ const MAX_OUTPUT_CHARS = 9500;
 const STALENESS_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
 const RINGS_WARNING_THRESHOLD_MS = 48 * 60 * 60 * 1000; // 48 hours
 const PROJECT_STALENESS_DAYS = 7;
+
+// Section truncation priority — LOWER survives, HIGHER is dropped first.
+// `assembleSections` removes whole sections (never trims within one) in
+// descending priority order until the output fits MAX_OUTPUT_CHARS;
+// PRIORITY_NEVER is never dropped.
+const PRIORITY_NEVER = 0;    // summary — always kept
+const PRIORITY_KEEP = 1;     // threads, inbox, advisories — try hard to keep
+const PRIORITY_PROJECT = 2;  // per-project state
+const PRIORITY_DOMAIN = 3;   // injected domain files
+const PRIORITY_PATTERNS = 4; // enforcement patterns — nice-to-have, drop first
+
+const MAX_PATTERN_LINES = 5;
 
 // --- Argument parsing ---
 
@@ -183,6 +196,63 @@ function renderFocalZoom(threads, projectSlug) {
   return lines.join('\n');
 }
 
+// --- Enforcement patterns (.claude/memory/patterns/) ---
+
+// Pull the project-root patterns directory (NOT the ~/.claude/projects/<slug>/
+// memory tree) so captured enforcement lessons keep shaping behavior past
+// orient (act:202e5934). Index-line style only — name + one-line description,
+// budget-capped. A two-field line scan, NOT a YAML parser: there is no shared
+// frontmatter parser in templates/scripts/ and a full YAML parse trips on flow
+// sequences (see MEMORY.md lesson_parsefrontmatter_flow_sequences).
+function extractField(content, field) {
+  // Only look inside the leading --- frontmatter block.
+  const m = content.match(/^---\n([\s\S]*?)\n---/);
+  const block = m ? m[1] : content;
+  for (const line of block.split('\n')) {
+    const fm = line.match(new RegExp(`^${field}:\\s*(.+)$`));
+    if (fm) return fm[1].trim().replace(/^["']|["']$/g, '');
+  }
+  return null;
+}
+
+function renderPatterns(projectPath) {
+  if (!projectPath) return null;
+  const patternsDir = join(projectPath, '.claude', 'memory', 'patterns');
+  if (!existsSync(patternsDir)) return null;
+
+  let files;
+  try {
+    files = readdirSync(patternsDir)
+      .filter(f => f.endsWith('.md') && !f.startsWith('_'))
+      .sort();
+  } catch {
+    return null;
+  }
+  if (files.length === 0) return null;
+
+  const lines = [];
+  for (const f of files.slice(0, MAX_PATTERN_LINES)) {
+    let name = null, desc = null;
+    try {
+      const content = safeReadFile(join(patternsDir, f));
+      if (content) {
+        name = extractField(content, 'name');
+        desc = extractField(content, 'description');
+      }
+    } catch {
+      // fall through to basename fallback
+    }
+    if (!name) name = f.replace(/\.md$/, '');
+    lines.push(desc ? `- ${name} — ${desc}` : `- ${name}`);
+  }
+  if (lines.length === 0) return null;
+
+  const more = files.length > MAX_PATTERN_LINES
+    ? `\n…and ${files.length - MAX_PATTERN_LINES} more`
+    : '';
+  return `--- Enforcement Patterns ---\n${lines.join('\n')}${more}`;
+}
+
 // --- Main ---
 
 function main() {
@@ -234,7 +304,7 @@ function main() {
   }
 
   // Summary is always included and never truncated
-  sections.push({ key: 'summary', content: summarySection, priority: 0 });
+  sections.push({ key: 'summary', content: summarySection, priority: PRIORITY_NEVER });
 
   // Step 3: If project has inject_domains, read each state/<domain>.md
   const domainSections = [];
@@ -246,7 +316,7 @@ function main() {
         domainSections.push({
           key: `domain:${domain}`,
           content: `--- ${domain} ---\n${domainContent.trim()}`,
-          priority: 3, // Truncated first
+          priority: PRIORITY_DOMAIN,
         });
       }
     }
@@ -264,7 +334,7 @@ function main() {
         sections.push({
           key: `project:${projectSlug}`,
           content: `--- Project: ${projectSlug} ---\n${projectStateContent.trim()}`,
-          priority: 2, // Truncated second (after domains)
+          priority: PRIORITY_PROJECT,
         });
       }
     }
@@ -278,7 +348,7 @@ function main() {
       sections.push({
         key: 'threads',
         content: focalZoom,
-        priority: 1,
+        priority: PRIORITY_KEEP,
       });
     }
   }
@@ -293,8 +363,36 @@ function main() {
     sections.push({
       key: 'queue',
       content: `--- Inbox ---\n${headline}\n${breakdown}`,
-      priority: 1,
+      priority: PRIORITY_KEEP,
     });
+  }
+
+  // Step 6b: Enforcement patterns from the project-root patterns dir
+  const patternsSection = renderPatterns(projectPath);
+  if (patternsSection) {
+    sections.push({
+      key: 'patterns',
+      content: patternsSection,
+      priority: PRIORITY_PATTERNS,
+    });
+  }
+
+  // Step 6c: Environment advisories (LSP / Railway-MCP / hookify / briefing
+  // file / registry orphans) with per-project dismissal memory. The module
+  // owns all logic + I/O and never throws; the builder only renders. This is
+  // orient's advisory home now that orient is being retired (act:f9ea075d).
+  try {
+    const advisories = runAdvisoryPass({ projectPath });
+    if (advisories.length > 0) {
+      const body = advisories.map(a => `- ${a.action}`).join('\n');
+      sections.push({
+        key: 'advisories',
+        content: `--- Advisories ---\n${body}`,
+        priority: PRIORITY_KEEP,
+      });
+    }
+  } catch {
+    // never block session start on advisory rendering
   }
 
   // Untracked project mode — if no project match, just add a note
@@ -302,7 +400,7 @@ function main() {
     sections.push({
       key: 'untracked',
       content: '(This project is not tracked by watchtower. Only global state is shown.)',
-      priority: 1,
+      priority: PRIORITY_KEEP,
     });
   }
 
@@ -322,16 +420,17 @@ function assembleSections(sections) {
   }
 
   // Need to truncate. Remove sections in reverse priority order (highest first).
-  // Priority 3 = domain files (truncated first)
-  // Priority 2 = project file (truncated second)
-  // Priority 0 = summary (never truncated)
-  // Priority 1 = queue/untracked (try to keep)
+  // PRIORITY_PATTERNS (4) = enforcement patterns (truncated first)
+  // PRIORITY_DOMAIN (3)   = domain files
+  // PRIORITY_PROJECT (2)  = project file
+  // PRIORITY_KEEP (1)     = threads/queue/advisories/untracked (try to keep)
+  // PRIORITY_NEVER (0)    = summary (never truncated)
 
   const sortedByTruncPriority = [...sections].sort((a, b) => b.priority - a.priority);
 
   let remaining = [...sections];
   for (const section of sortedByTruncPriority) {
-    if (section.priority === 0) break; // Never truncate summary
+    if (section.priority === PRIORITY_NEVER) break; // Never truncate summary
 
     const idx = remaining.findIndex(s => s.key === section.key);
     if (idx === -1) continue;

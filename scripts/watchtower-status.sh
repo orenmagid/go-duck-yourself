@@ -264,7 +264,7 @@ if [ "$VERBOSE" = "--verbose" ] || [ "$VERBOSE" = "-v" ]; then
 
   echo ""
   echo "  Session capture (last session):"
-  latest_log=$(ls -t "$WATCHTOWER_DIR/logs/ring3-close-"*.log 2>/dev/null | head -1)
+  latest_log=$(ls -t "$WATCHTOWER_DIR/logs/ring3-close-"*.log 2>/dev/null | head -1 || true)
   if [ -n "$latest_log" ]; then
     tail -8 "$latest_log" | sed 's/^/    /'
   else
