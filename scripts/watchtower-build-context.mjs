@@ -10,10 +10,14 @@
 // Outputs a string to stdout. Empty output means "nothing to inject."
 // Never crashes — all errors are caught and noted inline or skipped.
 
-import { readFileSync, readdirSync, existsSync, statSync, mkdirSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, statSync, mkdirSync, realpathSync } from 'fs';
+import { execSync } from 'child_process';
+import { pathToFileURL } from 'url';
 import { join, resolve, basename } from 'path';
 import { currentCursor, resolveProjectIdentity } from './watchtower-lib.mjs';
 import { runAdvisoryPass } from './watchtower-advisories.mjs';
+import { listPending } from './watchtower-queue.mjs';
+import { buildPickupPrompt } from './watchtower-routines.mjs';
 
 const WATCHTOWER_DIR = process.env.WATCHTOWER_DIR
   || join(process.env.HOME, '.claude-cabinet', 'watchtower');
@@ -27,7 +31,7 @@ const PROJECT_STALENESS_DAYS = 7;
 // `assembleSections` removes whole sections (never trims within one) in
 // descending priority order until the output fits MAX_OUTPUT_CHARS;
 // PRIORITY_NEVER is never dropped.
-const PRIORITY_NEVER = 0;    // summary — always kept
+const PRIORITY_NEVER = 0;    // summary + missed-routine directive — always kept
 const PRIORITY_KEEP = 1;     // threads, inbox, advisories — try hard to keep
 const PRIORITY_PROJECT = 2;  // per-project state
 const PRIORITY_DOMAIN = 3;   // injected domain files
@@ -77,6 +81,96 @@ function fileAge(filePath) {
   } catch {
     return Infinity;
   }
+}
+
+// --- Cached git-attention re-verification (act:a136b362) ---
+//
+// Ring 1's summary.md is a cached snapshot — its "MERGE OR LOSE" worktree
+// lines and "diverged from main" lines are git facts that may have gone stale
+// (the branch merged, the worktree was cleaned) between the last ring tick and
+// this SessionStart. Relaying them verbatim asserts a stale fact as live; the
+// recurring false MERGE-OR-LOSE banner is exactly what trains the operator to
+// ignore the attention block. So before relaying, re-verify each git-attention
+// fact (from the structured sidecar Ring 1 writes alongside summary.md)
+// against current git reality and rewrite the matching summary line:
+//   - now-merged / branch-gone  → DROP the line (it's resolved)
+//   - still genuinely ahead     → keep it verbatim
+//   - git unreachable / no path  → STAMP "(unverified)" rather than assert it
+//
+// The git runner is injectable for hermetic tests; the default shells git.
+function gitRunner(cmd, cwd) {
+  try {
+    return execSync(cmd, {
+      cwd, encoding: 'utf8', timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+// Returns 'resolved' (drop), 'live' (keep), or 'unverified' (stamp) for one
+// git-attention fact. A fact is resolved when its branch is gone or already an
+// ancestor of compare_ref; live when it is still ahead; unverified when git
+// can't answer (no project path on disk, fetch/command failure).
+//
+// `fetched` is an optional Set used to dedupe the per-repo fetch across many
+// facts in one re-verify pass (SessionStart should not fetch the same repo N
+// times). When absent (direct callers / tests), each fact fetches once.
+function verifyGitFact(fact, exec, fetched) {
+  const cwd = fact.project_path;
+  if (!cwd || !existsSync(cwd)) return 'unverified';
+  const compareRef = fact.compare_ref || 'origin/main';
+
+  // Best-effort refresh so origin/<main> is current; tolerate failure, fetch
+  // each repo at most once per pass.
+  if (!fetched || !fetched.has(cwd)) {
+    exec('git fetch origin --quiet', cwd);
+    fetched?.add(cwd);
+  }
+
+  const compareExists = exec(`git rev-parse --verify --quiet ${compareRef}`, cwd);
+  if (compareExists === null) return 'unverified'; // not even a git repo / no ref
+
+  const branchRef = exec(`git rev-parse --verify --quiet ${fact.branch}`, cwd);
+  if (branchRef === null) return 'resolved'; // branch gone → merged or deleted
+
+  // merge-base --is-ancestor exits 0 (→ non-null trimmed '') when merged.
+  const merged = exec(`git merge-base --is-ancestor ${fact.branch} ${compareRef}`, cwd) !== null;
+  return merged ? 'resolved' : 'live';
+}
+
+// Rewrite summary.md text: drop lines for resolved facts, stamp unverified
+// ones. Lines for facts that are still live, and any line NOT tracked by a
+// fact (everything that isn't a git ahead-check), pass through untouched.
+function reverifyGitAttention(summaryText, sidecar, exec = gitRunner) {
+  if (!sidecar || !Array.isArray(sidecar.facts) || sidecar.facts.length === 0) {
+    return summaryText;
+  }
+
+  // Build a map: cached line text → verdict. Fetch each repo at most once.
+  const verdict = new Map();
+  const fetched = new Set();
+  for (const fact of sidecar.facts) {
+    if (!fact || !fact.line) continue;
+    verdict.set(fact.line, verifyGitFact(fact, exec, fetched));
+  }
+
+  const out = [];
+  for (const rawLine of summaryText.split('\n')) {
+    // Summary attention lines are rendered as "- <line>"; match the payload.
+    const m = rawLine.match(/^(\s*-\s+)(.*)$/);
+    const payload = m ? m[2] : null;
+    const v = payload != null ? verdict.get(payload) : undefined;
+    if (v === undefined) { out.push(rawLine); continue; }
+    if (v === 'resolved') continue; // drop the stale banner entirely
+    if (v === 'unverified') {
+      out.push(`${m[1]}${payload} (unverified — git state could not be re-checked this session)`);
+      continue;
+    }
+    out.push(rawLine); // 'live' → relay verbatim
+  }
+  return out.join('\n');
 }
 
 // --- Queue helpers ---
@@ -253,6 +347,50 @@ function renderPatterns(projectPath) {
   return `--- Enforcement Patterns ---\n${lines.join('\n')}${more}`;
 }
 
+// --- Missed-routine re-delivery (act:4b4fa7d9) ---
+//
+// A routine that fired while the desk was closed or window 1 was busy queues
+// as a pending 'routine' inbox item + ·badge, but nothing re-runs it. For
+// routines (unlike qa-handoffs, which are deliberately operator-chosen), the
+// intended UX is "if I missed the 8am briefing, it runs first thing when I
+// open the desk." So at the project's MAIN session open, surface any pending
+// routine item as a run-first directive — delivery becomes automatic the way
+// firing already is. The directive reuses the dispatch `buildPickupPrompt`
+// (single-sourced wording, including the resolve-on-run that clears the badge).
+
+// Is this projectPath the project's MAIN checkout (not a linked worktree)?
+// A worktree's --git-dir differs from its --git-common-dir; the main checkout
+// has them equal. Non-git / unreadable → false (stay silent), so worktree
+// windows and odd cwds never get the directive.
+function isMainCheckout(projectPath) {
+  if (!projectPath) return false;
+  try {
+    const opts = { cwd: projectPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 };
+    const gitDir = execSync('git rev-parse --git-dir', opts).trim();
+    const commonDir = execSync('git rev-parse --git-common-dir', opts).trim();
+    return realpathSync(resolve(projectPath, gitDir)) === realpathSync(resolve(projectPath, commonDir));
+  } catch {
+    return false;
+  }
+}
+
+// Render the run-first directive for pending routine items, or null when there
+// are none. qa-handoff items never reach here — the caller filters to
+// category 'routine'. Caps the inline list at 3; the rest stay in the inbox.
+function renderMissedRoutineSection(pendingItems, projectName, projectPath) {
+  if (!Array.isArray(pendingItems) || pendingItems.length === 0) return null;
+  const n = pendingItems.length;
+  const header = `⚡ ${n} scheduled routine${n === 1 ? '' : 's'} fired while you were away and ${n === 1 ? 'has' : 'have'} not run yet. Run ${n === 1 ? 'it' : 'them'} FIRST, before other work:`;
+  const lines = ['--- Scheduled Routine Waiting ---', header];
+  for (const item of pendingItems.slice(0, 3)) {
+    const ev = item.evidence || {};
+    const routine = { name: ev.routine_name || 'routine', script: ev.script || '', trigger: ev.trigger || {} };
+    lines.push(`- ${buildPickupPrompt({ routine, projectName, projectPath, itemId: item.id })}`);
+  }
+  if (n > 3) lines.push(`…and ${n - 3} more (run /inbox)`);
+  return lines.join('\n');
+}
+
 // --- Main ---
 
 function main() {
@@ -274,11 +412,13 @@ function main() {
   // before — no regression for unknown projects, no crash (resolver returns
   // null rather than throwing).
   let projectSlug = null;
+  let projectName = null;
   let projectConfig = null;
   if (config.projects && projectPath) {
     const identity = resolveProjectIdentity(projectPath, config);
     if (identity?.registered) {
       projectSlug = identity.slug;
+      projectName = identity.name;
       projectConfig = config.projects[identity.name] || null;
     }
   }
@@ -300,11 +440,40 @@ function main() {
     } else if (summaryAge > STALENESS_THRESHOLD_MS) {
       stalenessWarning = 'Note: State data is >24h old — may be stale.\n';
     }
-    summarySection = `--- Watchtower State ---\n${stalenessWarning}${summaryContent.trim()}`;
+    // Re-verify the cached git-attention lines (MERGE-OR-LOSE / diverged
+    // branch) against current git before relaying — a since-merged branch
+    // should not assert a live banner (act:a136b362).
+    let relayedSummary = summaryContent.trim();
+    try {
+      const sidecar = safeReadJSON(join(WATCHTOWER_DIR, 'state', 'git-attention.json'));
+      relayedSummary = reverifyGitAttention(relayedSummary, sidecar);
+    } catch {
+      // never block session start on re-verification; relay the cache as-is
+    }
+    summarySection = `--- Watchtower State ---\n${stalenessWarning}${relayedSummary}`;
   }
 
   // Summary is always included and never truncated
   sections.push({ key: 'summary', content: summarySection, priority: PRIORITY_NEVER });
+
+  // Step 2b: Missed-routine re-delivery (act:4b4fa7d9). A routine that fired
+  // while the desk was closed/busy queued as a pending 'routine' item but
+  // never ran; surface it as a run-first directive at the project's MAIN
+  // session open. Gated to the main checkout (worktree windows stay silent);
+  // qa-handoff items are excluded by the category filter (operator-initiated
+  // by design). Pushed right after summary so it renders at the top, and
+  // never truncated.
+  if (projectName && isMainCheckout(projectPath)) {
+    try {
+      const pendingRoutines = listPending({ project: projectName, category: 'routine' });
+      const routineSection = renderMissedRoutineSection(pendingRoutines, projectName, projectPath);
+      if (routineSection) {
+        sections.push({ key: 'missed-routine', content: routineSection, priority: PRIORITY_NEVER });
+      }
+    } catch {
+      // never block session start on routine re-delivery
+    }
+  }
 
   // Step 3: If project has inject_domains, read each state/<domain>.md
   const domainSections = [];
@@ -447,9 +616,24 @@ function assembleSections(sections) {
   return remaining.map(s => s.content).join('\n\n');
 }
 
-try {
-  main();
-} catch {
-  // Never crash — silent exit if something unexpected happens
-  process.exit(0);
+// Exports for hermetic tests (act:a136b362). Importing this module must NOT
+// run main() — gate the entry on an argv/url match (matches the ring scripts).
+export { reverifyGitAttention, verifyGitFact, renderMissedRoutineSection, isMainCheckout };
+
+const isMain = (() => {
+  try {
+    return process.argv[1]
+      && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+})();
+
+if (isMain) {
+  try {
+    main();
+  } catch {
+    // Never crash — silent exit if something unexpected happens
+    process.exit(0);
+  }
 }

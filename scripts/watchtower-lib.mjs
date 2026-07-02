@@ -5,7 +5,7 @@
 // Ring scripts import from here instead of maintaining local copies.
 
 import {
-  readFileSync, writeFileSync, existsSync,
+  readFileSync, writeFileSync, existsSync, appendFileSync,
   mkdirSync, renameSync, realpathSync, readdirSync,
 } from 'fs';
 import { join, dirname, basename, resolve as resolvePath } from 'path';
@@ -44,6 +44,79 @@ export function atomicWrite(filePath, content) {
 }
 
 // ---------------------------------------------------------------------------
+// Suppression ledger — structured sidecar of every Ring 3 dedup suppression
+// ---------------------------------------------------------------------------
+//
+// `recordSuppression` appends one structured JSON line per suppression so the
+// Ring 2 slow over-suppression canary (M5) can read what was killed and what
+// it matched — a STRUCTURED record, never the human `log()` prose lines
+// (format-coupling = silent failure; a reworded log line would silently break
+// the canary, and per-session logs rotate away). Shape is the shared contract
+// documented in `watchtower-contracts.md` ("Suppression Ledger").
+//
+// FAIL-OPEN is load-bearing: this ledger is observability, not the filing
+// decision. A failed append logs one line and continues — a dropped ledger
+// record must NEVER block an extraction from filing. The record shape is
+// additive: new fields ride alongside; readers default missing fields.
+//
+// Append-only and atomic-enough: a single short line via appendFileSync is a
+// POSIX atomic append on local fs. Growth is bounded by the canary, which
+// prunes the ledger to its window on each run (not on the hot path here).
+
+export function suppressionLedgerPath(watchtowerDir) {
+  return join(watchtowerDir || getWatchtowerDir(),
+    'state', 'suppression-ledger.jsonl');
+}
+
+// ---------------------------------------------------------------------------
+// recentSlice — the most-recent `n` chars of a (preprocessed) transcript
+// ---------------------------------------------------------------------------
+//
+// The M2 recall fix (act:edd79e15). `preprocessTranscript` already keeps the
+// most-recent ~80% of an oversized session, but every extraction lens then
+// threw that away with `compressed.slice(0, n)` — the OLDEST n chars — so a
+// lesson set up in the back half of a session was silently dropped. recentSlice
+// keeps the TAIL instead. When `n >= text.length` the whole string is returned
+// (most sessions: one full-transcript call, zero extra cost). The leading
+// partial line is trimmed (same as preprocessTranscript's tail-truncation) so a
+// call never starts mid-JSON-line. The SINGLE definition every lens routes
+// through — no more copy-pasted front-slices.
+export function recentSlice(text, n) {
+  if (typeof text !== 'string' || text.length === 0) return '';
+  // Fail-open (recall-favoring, invariant #9): a non-positive or non-finite
+  // budget is a misconfiguration — keep the WHOLE transcript rather than
+  // silently feeding the model an empty string (an empty transcript = zero
+  // extraction = the exact knowledge-drop this program exists to prevent).
+  if (!Number.isFinite(n) || n <= 0) return text;
+  if (text.length <= n) return text;
+  let tail = text.slice(text.length - n);
+  const nl = tail.indexOf('\n');
+  if (nl >= 0) tail = tail.slice(nl + 1);
+  return tail;
+}
+
+export function recordSuppression(record = {}, { watchtowerDir, ts } = {}) {
+  try {
+    const path = suppressionLedgerPath(watchtowerDir);
+    const dir = dirname(path);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const line = JSON.stringify({
+      ts: ts || record.ts || new Date().toISOString(),
+      project: record.project ?? null,
+      corpus: record.corpus ?? null,
+      suppressed_title: record.suppressed_title ?? null,
+      matched_against: record.matched_against ?? null,
+      session_id: record.session_id ?? null,
+    }) + '\n';
+    appendFileSync(path, line);
+  } catch (e) {
+    // Fail-open: never throw out of a suppression site.
+    try { logError('suppression-ledger', `append failed (${e.message}) — continuing`); }
+    catch { /* logging itself must never throw the caller */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // loadConfig — read and validate config.json with schema_version check
 // ---------------------------------------------------------------------------
 
@@ -69,6 +142,53 @@ export function slugify(text) {
 }
 
 // ---------------------------------------------------------------------------
+// Authored-.claude re-inclusion for worktree dirty detection (act:e91fdfcf)
+// ---------------------------------------------------------------------------
+// The JS-side ring dirty counts (Ring 1 countRealUncommitted, Ring 3 close)
+// historically BLANKET-excluded every `.claude/` porcelain line as mux infra
+// churn — which silently under-reported real authored work in worktrees
+// (.claude/plans, .claude/methodology, .claude/rules: authored PROJECT RECORD
+// per .claude/rules/artifacts-of-thought.md). This mirrors the canonical
+// shell EXCLUSION CONTRACT in templates/mux/config/worktree-dirty-check.sh
+// (point 1 EXCEPTION): a top-level `.claude/` entry that holds TRACKED files
+// is authored, so churn under it counts; only disposable infra is ignored.
+// The shell and JS sides remain separate implementations (one bash, one JS) —
+// this is the JS single source the two rings delegate to.
+const AUTHORED_CLAUDE_FLOOR = ['plans', 'methodology'];
+
+// The set of top-level `.claude/` dirs that hold tracked files in this
+// worktree's index (authored project record). Derived from `git ls-files`
+// at run time; the static plans/methodology floor is ALWAYS included so a
+// failed/partial index read can never drop authored work (fail-DIRTY).
+export function authoredClaudeDirs(cwd, execFn) {
+  const dirs = new Set(AUTHORED_CLAUDE_FLOOR);
+  let out;
+  try {
+    out = execFn('git ls-files .claude/', { cwd });
+  } catch {
+    return dirs;
+  }
+  if (!out) return dirs;
+  for (const line of out.split('\n')) {
+    const m = line.trim().match(/^\.claude\/([^/]+)\//);
+    if (m) dirs.add(m[1]);
+  }
+  return dirs;
+}
+
+// Is this porcelain line DISPOSABLE `.claude/` infra churn (safe to ignore)?
+// A `.claude/` path under an authored top-level dir is real work → false
+// (count it). A non-`.claude/` line is not our concern here → false. Only
+// `.claude/` churn outside the authored subtrees (untracked infra, top-level
+// config files) is disposable → true.
+export function claudeChurnIsDisposable(porcelainLine, authoredDirs) {
+  if (!/\s\.claude(?:\/|$)/.test(porcelainLine)) return false;
+  const m = porcelainLine.match(/\.claude\/([^/\s]+)/);
+  if (m && authoredDirs.has(m[1])) return false; // authored subtree → count it
+  return true; // disposable .claude/ infra
+}
+
+// ---------------------------------------------------------------------------
 // flushFeedbackOutbox — deliver the GLOBAL cc-feedback outbox to the CC repo
 // ---------------------------------------------------------------------------
 // Ring 1 mechanical duty (act:6c3a4763). Ports orient's delivery algorithm:
@@ -87,7 +207,11 @@ export function slugify(text) {
 
 const CC_PACKAGE_NAME = 'create-claude-cabinet';
 
-function resolveCcFeedbackDir(registryPath) {
+// Resolve the CC source repo ROOT via cc-registry — the single registered
+// project whose package.json name is create-claude-cabinet. The one place
+// "which checkout is the CC source?" is answered, so callers (feedback
+// delivery, the Ring 1 runtime-drift check) never re-derive it.
+export function resolveCcSourceRepo(registryPath) {
   if (!existsSync(registryPath)) return null;
   let registry;
   try {
@@ -96,14 +220,20 @@ function resolveCcFeedbackDir(registryPath) {
     return null;
   }
   for (const proj of registry.projects || []) {
-    const pkgPath = join(proj.path || '', 'package.json');
+    const root = proj.path || '';
+    const pkgPath = join(root, 'package.json');
     if (!existsSync(pkgPath)) continue;
     try {
       const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
-      if (pkg.name === CC_PACKAGE_NAME) return join(proj.path, 'feedback');
+      if (pkg.name === CC_PACKAGE_NAME) return root;
     } catch { /* unreadable package.json — not the CC repo */ }
   }
   return null;
+}
+
+function resolveCcFeedbackDir(registryPath) {
+  const repo = resolveCcSourceRepo(registryPath);
+  return repo ? join(repo, 'feedback') : null;
 }
 
 function feedbackFileExists(feedbackDir, slug) {
@@ -249,6 +379,103 @@ export function currentCursor(thread) {
   return thread?.cursor || {};
 }
 
+// ---------------------------------------------------------------------------
+// Shared thread-file reading (single source of truth)
+// ---------------------------------------------------------------------------
+// Reading `state/threads/*.json`, skipping corrupt files, keeping only active
+// threads, and deciding which threads "belong to" a given item/project was
+// independently implemented twice (Ring 2's loadActiveThreads/threadsForItem
+// for enrichment context, Ring 3-close's threadCursorLines for the dedup prose
+// corpus). Two copies of one concept drift — and they did: Ring 3's membership
+// FALLBACK matched on slug-substring containment (slugify(thread).includes(
+// projectSlug)), so a short project slug ("flow") over-matched any thread whose
+// slug merely contained it ("…workflow…"), pulling FOREIGN cursor prose into a
+// project's suppression corpus where it could silently suppress legitimate new
+// extractions. The shared membership rule below has NO slug-substring fallback:
+// a thread belongs to a project only by EXPLICIT thread_ids membership OR EXACT
+// sessions[].project equality (the key Ring 3 itself writes). Both rings now
+// consume these helpers.
+
+// loadActiveThreads — read all active thread files from threadsDir. Corrupt
+// JSON and dormant/non-active threads are skipped; a missing/empty dir yields
+// []. Never throws.
+export function loadActiveThreads(threadsDir) {
+  if (!existsSync(threadsDir)) return [];
+  const threads = [];
+  try {
+    for (const entry of readdirSync(threadsDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      try {
+        const thread = JSON.parse(readFileSync(join(threadsDir, entry.name), 'utf8'));
+        if (thread && thread.status === 'active') threads.push(thread);
+      } catch { /* skip corrupt */ }
+    }
+  } catch { /* skip */ }
+  return threads;
+}
+
+// threadMatchesProject — THE single membership predicate. A thread belongs to a
+// project iff (a) its slug is in `explicitIds` (explicit thread_ids membership)
+// OR (b) any of its sessions records that exact project slug. Deliberately NO
+// slug-substring fallback — that over-matched foreign threads. `projectSlug`
+// must already be slugified; `explicitIds` defaults to none. Returns
+// { match: bool, explicit: bool } so selectors can rank explicit matches first.
+export function threadMatchesProject(thread, projectSlug, explicitIds = []) {
+  const explicit = Array.isArray(explicitIds) && explicitIds.includes(thread?.thread);
+  const byProject = !!projectSlug
+    && Array.isArray(thread?.sessions)
+    && thread.sessions.some(s => s && s.project === projectSlug);
+  return { match: explicit || byProject, explicit };
+}
+
+// Threads matched to an item, capped, ranked explicit-first then by recency.
+const THREAD_MATCH_CAP = 3;
+
+// threadsForItem — match active threads to a queue item: explicit
+// item.thread_ids membership OR exact sessions[].project equality (slugify(
+// item.project)). Explicit matches rank first, then most recent last_updated;
+// capped at THREAD_MATCH_CAP. Built on threadMatchesProject so the membership
+// rule lives in one place.
+export function threadsForItem(item, threads) {
+  const explicitIds = Array.isArray(item?.thread_ids) ? item.thread_ids : [];
+  const projectSlug = item?.project ? slugify(item.project) : '';
+  const matches = [];
+  for (const thread of threads) {
+    const { match, explicit } = threadMatchesProject(thread, projectSlug, explicitIds);
+    if (match) matches.push({ thread, explicit });
+  }
+  matches.sort((a, b) => {
+    if (a.explicit !== b.explicit) return a.explicit ? -1 : 1;
+    return new Date(b.thread.last_updated || 0) - new Date(a.thread.last_updated || 0);
+  });
+  return matches.slice(0, THREAD_MATCH_CAP).map(m => m.thread);
+}
+
+// projectThreadCursorLines — the dedup PROSE corpus from a project's active
+// thread cursors. Thread cursors (display_name / what / where_left_off /
+// open_questions) are exactly "what the system already knows the user is
+// working on"; an extraction that restates them is noise. Membership is the
+// shared threadMatchesProject rule (exact sessions[].project equality — NO
+// slug-substring over-match). Only the CURRENT cursor counts (currentCursor),
+// not history. Returned lines are lowercased, ready for the memoryLines
+// containment pass in Ring 3's isDuplicate. Never throws.
+export function projectThreadCursorLines(threadsDir, projectSlug) {
+  if (!projectSlug) return [];
+  const lines = [];
+  const push = (v) => {
+    if (typeof v === 'string' && v.trim()) lines.push(v.toLowerCase());
+  };
+  for (const thread of loadActiveThreads(threadsDir)) {
+    if (!threadMatchesProject(thread, projectSlug).match) continue;
+    const cursor = currentCursor(thread);
+    push(thread.display_name);
+    push(cursor.what);
+    push(cursor.where_left_off);
+    if (Array.isArray(cursor.open_questions)) cursor.open_questions.forEach(push);
+  }
+  return lines;
+}
+
 // updateThreadFile — disk-wins thread file update (Ring 3 thread capture).
 //
 // DISK WINS OVER MODEL: if the thread file exists on disk, this ALWAYS
@@ -319,6 +546,12 @@ export function updateThreadFile(threadPath, threadSlug, modelThread, cursorEntr
 // its own fallback ("Active: …" / last-commit line). Full ownership table:
 // watchtower-contracts.md §Project State Section Ownership.
 export const PROJECT_STATE_LAST_SESSION_HEADER = '## Last Session';
+
+// Shared UI-path heuristic for the verify-coverage feature. The verify-backfill
+// scan (Ring 2) and the verify-coverage lens (Ring 3) must agree on what counts
+// as "UI-touching" — single source of truth so the two rings never drift.
+// (act:1be47d42)
+export const VERIFY_UI_PATHS = ['webapp/frontend/', 'components/', 'pages/', 'app/'];
 const RING3_LAST_SESSION_ATTRIBUTION = /^_\d{4}-\d{2}-\d{2} \(.+\)_$/;
 
 // Line-anchored header search: the header must start a line and be the
@@ -335,6 +568,42 @@ function extractSection(content, header) {
   if (idx < 0) return null;
   const next = content.indexOf('\n## ', idx + header.length);
   return content.slice(idx, next > 0 ? next : content.length);
+}
+
+// buildLastSessionBlock — THE single source of the "## Last Session" block
+// format. Ring 3's sessionSummary builds the per-session file body and this
+// inline block from the SAME `bullets` string, so the inline section can never
+// be a lossy subset of the per-session record (act:ac119994). The
+// `_<date> (<sessionId>)_` attribution line is the ownership marker
+// preserveRing3LastSession keys on — emit it here so a Ring 3-authored section
+// is always recognized as Ring 3's. `bullets` is the COMPLETE model bullet set;
+// it is never truncated or sliced for the inline block.
+export function buildLastSessionBlock({ date, sessionId, bullets }) {
+  return `${PROJECT_STATE_LAST_SESSION_HEADER}\n_${date} (${sessionId})_\n${String(bullets).trim()}\n`;
+}
+
+// upsertLastSessionSection — splice a freshly-built "## Last Session" block into
+// the project-state file, replacing an existing section in place or appending
+// one when absent. Reuses the line-anchored headerLineIndex so a "### Last
+// Session" or a mid-line mention of the header text is never matched (the same
+// machinery preserveRing3LastSession reads with — one splice convention, not
+// two). `block` must already end with a trailing newline (buildLastSessionBlock
+// guarantees this). When the section is not the file's last, a blank line is
+// inserted before the following "## " so the markdown structure stays valid.
+export function upsertLastSessionSection(existingContent, block) {
+  const base = existingContent || '';
+  const idx = headerLineIndex(base, PROJECT_STATE_LAST_SESSION_HEADER);
+  if (idx < 0) {
+    if (!base.trim()) return block;
+    return `${base.trimEnd()}\n\n${block}`;
+  }
+  const next = base.indexOf(
+    '\n## ', idx + PROJECT_STATE_LAST_SESSION_HEADER.length);
+  if (next > 0) {
+    // Replacing a non-terminal section: keep a blank line before the next "## ".
+    return base.slice(0, idx) + block.trimEnd() + '\n\n' + base.slice(next + 1);
+  }
+  return base.slice(0, idx) + block;
 }
 
 export function preserveRing3LastSession(freshContent, existingContent) {

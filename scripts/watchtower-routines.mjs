@@ -188,7 +188,7 @@ function triggerSummary(routine) {
 // Dispatch — inbox item (durable) + mux descriptor (routing), no fork
 // ---------------------------------------------------------------------------
 
-function buildPickupPrompt({ routine, projectName, projectPath, itemId }) {
+export function buildPickupPrompt({ routine, projectName, projectPath, itemId }) {
   const scriptPath = isAbsolute(routine.script)
     ? routine.script : join(projectPath, routine.script);
   return `Routine '${routine.name}' for ${projectName} fired (${triggerSummary(routine)}). `

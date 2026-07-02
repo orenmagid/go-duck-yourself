@@ -22,23 +22,35 @@
 
 import {
   readFileSync, readdirSync, existsSync, statSync,
-  mkdirSync,
+  mkdirSync, realpathSync,
 } from 'fs';
+import { pathToFileURL } from 'url';
 import { join, basename } from 'path';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
 import {
   atomicWrite, loadConfig, slugify, log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, resolveItem, loadBetterSqlite3,
-  writeProjectStatePreservingRing3, flushFeedbackOutbox,
+  writeProjectStatePreservingRing3, flushFeedbackOutbox, resolveCcSourceRepo,
+  authoredClaudeDirs, claudeChurnIsDisposable,
 } from './watchtower-lib.mjs';
 import { runRoutinePass } from './watchtower-routines.mjs';
+import { analyze, resolveRoots } from './watchtower-sync.mjs';
 
 const WATCHTOWER_DIR = getWatchtowerDir();
 
 const CLAUDE_HOME = join(homedir(), '.claude');
 const STALE_DAYS = 14;
 const ACTIVE_SESSION_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+
+// The flagged-actions query (act:b1b21a15). Exported so the hermetic test
+// asserts the SAME SQL collectPibState runs — one source for the filter, no
+// divergent copy. Scope: active work only (open/in-progress/blocked),
+// deliberately excluding flagged *deferred* actions (the documented narrowing
+// from orient's `completed = 0`) and excluding soft-deleted rows.
+export const FLAGGED_ACTIONS_SQL =
+  "SELECT fid, text FROM actions WHERE flagged = 1 " +
+  "AND status IN ('open', 'in-progress', 'blocked') AND deleted_at IS NULL";
 const DEPLOY_MARKERS = ['railway.toml', 'fly.toml', 'vercel.json'];
 const HOOK_TIMEOUT_MS = 30_000;
 
@@ -75,6 +87,109 @@ function safeExec(cmd, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Default-branch / origin comparison helpers
+// ---------------------------------------------------------------------------
+//
+// The unmerged-branch ahead-check (act:6f36cbe2) compares against
+// origin/<main>, NEVER the stale local <main> ref. A worktree is often cut
+// from a non-main HEAD, and the local main ref can lag origin/main by many
+// commits — so `git log main..<branch>` reported the branch as carrying all
+// of main's drift as its own work (the recurring "2 commits look like 80
+// files of baggage" trap that produced false MERGE-OR-LOSE / N-commits-ahead
+// banners). Comparing against origin/<main> is the WHAT fix; build-context's
+// re-verify-at-read is the WHEN fix (act:a136b362).
+//
+// resolveMainRef takes an injectable exec (the inline call sites pass a
+// safeExec bound to a cwd) so the logic is hermetically testable against a
+// temp git repo. It:
+//   - resolves the default branch's *name* from `origin/HEAD` (fall back to
+//     'main', then 'master'),
+//   - fetches origin first so origin/<main> is current — but TOLERATES fetch
+//     failure (Ring 1's launchd cron PATH/network is constrained) and falls
+//     back to whatever origin/<main> ref already exists locally,
+//   - picks compareRef = origin/<main> when that remote-tracking ref exists,
+//     else the local <main> (a repo with no remote still works), and
+//   - flags localLagsRemote when the local <main> is a strict ancestor of
+//     origin/<main> (a stale local main is itself worth surfacing).
+function resolveMainRef(exec, { fetch = true } = {}) {
+  if (fetch) {
+    // Best-effort refresh; never let a failed/blocked fetch error the check.
+    exec('git fetch origin --quiet');
+  }
+
+  // Default branch name from origin/HEAD, e.g. "origin/main" → "main".
+  let mainName = null;
+  const headRef = exec('git rev-parse --abbrev-ref origin/HEAD');
+  if (headRef) mainName = headRef.replace(/^origin\//, '').trim() || null;
+  if (!mainName) {
+    // No origin/HEAD (no remote, or never set) — probe local refs.
+    if (exec('git rev-parse --verify --quiet main')) mainName = 'main';
+    else if (exec('git rev-parse --verify --quiet master')) mainName = 'master';
+    else mainName = 'main';
+  }
+
+  const remoteRef = `origin/${mainName}`;
+  const remoteSha = exec(`git rev-parse --verify --quiet ${remoteRef}`);
+  const localSha = exec(`git rev-parse --verify --quiet ${mainName}`);
+
+  // Prefer the remote-tracking ref; fall back to local main when there is no
+  // remote (a brand-new repo, or origin unreachable and never fetched).
+  const compareRef = remoteSha ? remoteRef : mainName;
+
+  // localLagsRemote: local main is behind its remote (strict ancestor, not
+  // equal). Only meaningful when both refs resolve and we're comparing
+  // against the remote. This is the stale-local-main signal worth a NOTE.
+  let localLagsRemote = false;
+  if (remoteSha && localSha && remoteSha !== localSha) {
+    localLagsRemote = exec(`git merge-base --is-ancestor ${mainName} ${remoteRef}`) !== null;
+  }
+
+  return { mainName, compareRef, localLagsRemote, hasRemote: !!remoteSha };
+}
+
+// Commits on `branch` not yet in `compareRef` (origin/<main>). Uses
+// `git log <branch> --not <compareRef>` — the work range that is correct for
+// both pre- and post-merge states (see qa-handoff Step 1). Returns a count.
+function aheadCount(exec, branch, compareRef) {
+  const out = exec(`git log --oneline ${branch} --not ${compareRef}`);
+  return out ? out.split('\n').filter(l => l.trim()).length : 0;
+}
+
+// True when `branch`'s tip is already an ancestor of `compareRef` (merged).
+function isMergedInto(exec, branch, compareRef) {
+  return exec(`git merge-base --is-ancestor ${branch} ${compareRef}`) !== null;
+}
+
+// True when `branch` carries content not already present in `compareRef`.
+// SQUASH-ROBUST and direction-aware, unlike the ancestry/ahead-count gates it
+// replaced (act:a152cf6c): a squash-merge leaves `branch` a NON-ancestor of
+// main with different commit hashes but an IDENTICAL tree, so `isMergedInto`
+// (ancestry) and `aheadCount` both report phantom unmerged work — permanently,
+// since main never gains `branch` as an ancestor. ~40 of 48 maginnis worktree
+// false positives were squash-merged branches that no ahead-check could clear.
+//
+// A two-dot `compareRef..branch` diff is NOT a valid content test: it is a
+// symmetric tip-vs-tip comparison, so once `compareRef` advances past the
+// squash point (true for every aging item) it reports compareRef's OWN newer
+// files as differences (verified empirically). The correct test is a trial
+// in-memory merge: if merging `branch` into `compareRef` changes nothing
+// (result tree == compareRef's tree), `branch` contributes no unmerged
+// content. `git merge-tree --write-tree` (git >= 2.38) touches no working tree
+// or index. It exits non-zero on a merge conflict (→ null here) — a conflict
+// means real divergent content, so we fail toward flagging. Likewise a missing
+// ref, an old git without --write-tree, or any git error fails toward flagging,
+// so real work is never silently suppressed.
+function hasUnmergedContent(exec, branch, compareRef) {
+  // Fast path: a true ancestor is unambiguously merged (and cheaper to test).
+  if (isMergedInto(exec, branch, compareRef)) return false;
+  const baseTree = exec(`git rev-parse --verify --quiet ${compareRef}^{tree}`);
+  const mergedOut = exec(`git merge-tree --write-tree ${compareRef} ${branch}`);
+  if (baseTree === null || mergedOut === null) return true; // error/conflict → flag
+  const mergedTree = mergedOut.split('\n')[0].trim();
+  return mergedTree !== baseTree;
+}
+
+// ---------------------------------------------------------------------------
 // Git state collection
 // ---------------------------------------------------------------------------
 
@@ -84,6 +199,7 @@ function collectGitState(projectPath) {
   }
 
   const cwd = projectPath;
+  const exec = (cmd) => safeExec(cmd, { cwd });
   const branch = safeExec('git rev-parse --abbrev-ref HEAD', { cwd });
   const lastCommitRaw = safeExec(
     'git log -1 --format="%H%x00%s%x00%aI"',
@@ -96,20 +212,25 @@ function collectGitState(projectPath) {
     lastCommit = { hash, message, timestamp };
   }
 
-  // Branches ahead of main
+  // Branches ahead of origin/<main> — compared against the remote-tracking
+  // ref, not the local <main> ref (act:6f36cbe2). A branch counts as "ahead"
+  // only when it carries CONTENT not yet in origin/<main> — squash-merged
+  // branches (non-ancestor, different hashes, identical tree) are NOT ahead
+  // (act:a152cf6c). hasUnmergedContent short-circuits on the ancestry fast
+  // path, so this is no more expensive than the old isMergedInto check for the
+  // common already-merged case.
+  const { mainName, compareRef, localLagsRemote } = resolveMainRef(exec);
   const branchesAhead = [];
-  const mainBranch = safeExec('git rev-parse --verify main 2>/dev/null && echo main || echo master', { cwd });
-  if (mainBranch) {
-    const branchList = safeExec('git branch --no-merged ' + mainBranch + ' 2>/dev/null', { cwd });
-    if (branchList) {
-      for (const line of branchList.split('\n')) {
-        const b = line.trim().replace(/^\* /, '');
-        if (b && b !== mainBranch) branchesAhead.push(b);
-      }
+  const branchList = safeExec(`git for-each-ref --format='%(refname:short)' refs/heads/`, { cwd });
+  if (branchList) {
+    for (const line of branchList.split('\n')) {
+      const b = line.trim().replace(/^\* /, '');
+      if (!b || b === mainName) continue;
+      if (hasUnmergedContent(exec, b, compareRef)) branchesAhead.push(b);
     }
   }
 
-  return { branch, lastCommit, branchesAhead, mainBranch };
+  return { branch, lastCommit, branchesAhead, mainBranch: mainName, compareRef, localLagsRemote };
 }
 
 // ---------------------------------------------------------------------------
@@ -140,15 +261,21 @@ function collectPibState(projectPath) {
       "SELECT COUNT(*) as count FROM actions WHERE status IN ('open', 'in-progress', 'blocked')"
     ).get();
 
-    // Flagged count (user-prioritized, still-open actions)
-    let flaggedCount = 0;
+    // Flagged actions (user-prioritized, still-open work). The LIST — not
+    // just a count — so the per-project state file surfaces WHICH actions are
+    // flagged, at parity with orient's work-scan (act:b1b21a15). flaggedCount
+    // is derived from the list: one query, one source (mirrors overdueActions
+    // below). Scope is Ring 1's standard "active work" set
+    // (open/in-progress/blocked) — deliberately NARROWER than orient's
+    // `completed = 0`, which also surfaced flagged *deferred* actions; that
+    // narrowing is recorded in the orient→watchtower coverage ledger.
+    let flaggedActions = [];
     try {
-      flaggedCount = db.prepare(
-        "SELECT COUNT(*) as count FROM actions WHERE flagged = 1 AND status IN ('open', 'in-progress', 'blocked') AND deleted_at IS NULL"
-      ).get().count;
+      flaggedActions = db.prepare(FLAGGED_ACTIONS_SQL).all();
     } catch {
       // flagged column may not exist in older schemas
     }
+    const flaggedCount = flaggedActions.length;
 
     // Deferred actions waiting on triggers — standing state, not attention.
     // Orient's deferred-check evaluates these every session; reported in the
@@ -234,6 +361,7 @@ function collectPibState(projectPath) {
     return {
       openActions: openActions.count,
       flaggedCount,
+      flaggedActions,
       deferredTriggerCount,
       staleProjects,
       completionCandidates,
@@ -418,8 +546,8 @@ function createBranchDivergedItem(projectName, projectPath, branch) {
       category: 'branch-diverged',
       urgency: 'normal',
       title: `Branch "${branch}" diverged from main`,
-      summary: `Branch "${branch}" in ${projectName} is ahead of main with no active session on it. Consider merging or cleaning up.`,
-      context_anchor: `git log main..${branch} in ${projectPath}`,
+      summary: `Branch "${branch}" in ${projectName} is ahead of origin/main with no active session on it. Consider merging or cleaning up.`,
+      context_anchor: `git log ${branch} --not origin/main in ${projectPath}`,
       evidence: { branch, project_path: projectPath },
     });
   } catch (e) {
@@ -445,9 +573,25 @@ function createBranchDivergedItem(projectName, projectPath, branch) {
 function countRealUncommitted(wtPath) {
   const uncommitted = safeExec('git status --porcelain', { cwd: wtPath });
   if (!uncommitted) return 0;
+  // Authored .claude/ subtrees (plans, methodology, rules, …) are real work,
+  // not disposable mux infra — re-included per the canonical exclusion
+  // contract (act:e91fdfcf, claudeChurnIsDisposable in watchtower-lib).
+  const authoredDirs = authoredClaudeDirs(wtPath, safeExec);
   return uncommitted.split('\n').filter(l => {
     if (!l.trim()) return false;
-    if (/\s\.claude$/.test(l) || /\s\.claude\//.test(l)) return false;
+    if (claudeChurnIsDisposable(l, authoredDirs)) return false;
+    // Disposable runtime state written by the watchtower/verify harnesses
+    // (act:a152cf6c). These churn in every worktree without representing work
+    // to lose. Gitignored in this repo (so invisible to porcelain here), but a
+    // consumer's .claude/ gitignore differs and DOES surface them — the
+    // flow/maginnis false positives. Scoped to UNTRACKED (`??`) lines so a
+    // deliberately-tracked file of the same name (e.g. a committed
+    // .claude/verification/*.json) still counts as authored work, never
+    // silently dropped. Runs AFTER claudeChurnIsDisposable so it overrides the
+    // dir-level authored re-inclusion (.claude/cabinet/ is authored here).
+    if (/^\?\?\s+\.claude\/verification\//.test(l)) return false;
+    if (/^\?\?\s+\.claude\/cabinet\/advisories-state\.json$/.test(l)) return false;
+    if (/^\?\?\s+e2e\/\.verify-progress\.jsonl$/.test(l)) return false;
     if (/\s\.mcp\.json$/.test(l)) return false;
     if (/\snode_modules$/.test(l) || /\snode_modules\//.test(l)) return false;
     if (/(?:^|[\s/])package-lock\.json$/.test(l)) return false;
@@ -499,8 +643,8 @@ function itemBelongsToProject(item, projectPath) {
 
 // Auto-resolve pending worktree-unmerged items whose branch is now clean.
 // Mechanical truth-checking, not judgment: if the branch has 0 commits
-// ahead of main and no real uncommitted changes, the alarm is stale —
-// and it will never self-heal otherwise, because dedup suppresses
+// ahead of origin/<main> and no real uncommitted changes, the alarm is
+// stale — and it will never self-heal otherwise, because dedup suppresses
 // refiling but nothing retracts the original. Stale alarms train the
 // operator to ignore real ones.
 function autoResolveWorktreeItems(projectName, projectPath) {
@@ -510,6 +654,9 @@ function autoResolveWorktreeItems(projectName, projectPath) {
   } catch {
     return;
   }
+
+  const exec = (cmd) => safeExec(cmd, { cwd: projectPath });
+  const { compareRef } = resolveMainRef(exec);
 
   for (const item of pending) {
     if (!itemBelongsToProject(item, projectPath)) continue;
@@ -524,13 +671,17 @@ function autoResolveWorktreeItems(projectName, projectPath) {
       // either way there is nothing left to lose.
       staleReason = `branch "${ev.branch}" no longer exists`;
     } else {
-      const ahead = safeExec(`git log --oneline main..${ev.branch}`, { cwd: projectPath });
-      const aheadCount = ahead ? ahead.split('\n').filter(l => l.trim()).length : 0;
+      // Content-based, squash-aware retraction: an item whose branch carries no
+      // unmerged content vs origin/<main> and no real uncommitted work is a
+      // stale alarm — this is what finally retracts the ~40 squash-merged
+      // false positives that the old ahead===0 test never cleared
+      // (act:a152cf6c).
+      const unmerged = hasUnmergedContent(exec, ev.branch, compareRef);
       const uncommittedCount = (ev.worktree_path && existsSync(ev.worktree_path))
         ? countRealUncommitted(ev.worktree_path)
         : 0;
-      if (aheadCount === 0 && uncommittedCount === 0) {
-        staleReason = '0 commits ahead of main, no uncommitted changes (session artifacts excluded)';
+      if (!unmerged && uncommittedCount === 0) {
+        staleReason = `no unmerged content vs ${compareRef} (squash/merge-aware), no uncommitted changes (session artifacts excluded)`;
       }
     }
 
@@ -578,22 +729,34 @@ function scanWorktrees(projectName, projectPath) {
   const muxDir = join(homedir(), '.mux', 'worktrees');
   const orphaned = [];
 
+  // Resolve the comparison ref once for this project — origin/<main>, never
+  // the stale local main (act:6f36cbe2).
+  const exec = (cmd) => safeExec(cmd, { cwd: projectPath });
+  const { compareRef, hasRemote } = resolveMainRef(exec);
+  if (!hasRemote && !safeExec(`git rev-parse --verify --quiet ${compareRef}`, { cwd: projectPath })) {
+    return []; // No comparison ref at all — nothing to measure against.
+  }
+
   for (const wt of worktrees) {
     if (wt.bare || !wt.path.startsWith(muxDir)) continue;
     if (wt.path === projectPath) continue;
+    // Detached / branch-less worktree — no branch to content-compare. Skip
+    // rather than let the merge-tree call fail toward flagging an
+    // "undefined"-branch worktree (act:a152cf6c).
+    if (!wt.branch) continue;
 
-    // Check if branch has unmerged commits
-    const mainRef = safeExec('git rev-parse --verify main', { cwd: projectPath });
-    if (!mainRef) continue;
-
-    const ahead = safeExec(`git log --oneline main..${wt.branch}`, { cwd: projectPath });
-    const aheadCount = ahead ? ahead.split('\n').filter(l => l.trim()).length : 0;
+    // Flag on CONTENT, not ahead-count: a squash-merged branch is a
+    // non-ancestor with phantom "ahead" commits but no real unmerged content
+    // (act:a152cf6c). aheadCount is retained only for the human-readable
+    // "N unmerged commit(s)" detail line, which is shown only when we flag.
+    const unmerged = hasUnmergedContent(exec, wt.branch, compareRef);
+    const ahead = aheadCount(exec, wt.branch, compareRef);
 
     // Also check for uncommitted changes in the worktree
     // (artifact exclusions live in countRealUncommitted)
     const uncommittedCount = countRealUncommitted(wt.path);
 
-    if (aheadCount === 0 && uncommittedCount === 0) continue;
+    if (!unmerged && uncommittedCount === 0) continue;
 
     // Check if there's an active tmux window for this worktree
     const windowName = basename(wt.path).replace(/^[^-]+-/, '');
@@ -605,7 +768,7 @@ function scanWorktrees(projectName, projectPath) {
     orphaned.push({
       path: wt.path,
       branch: wt.branch,
-      ahead: aheadCount,
+      ahead,
       uncommitted: uncommittedCount,
     });
   }
@@ -632,7 +795,7 @@ function scanWorktrees(projectName, projectPath) {
         urgency: 'urgent',
         title: `Orphaned worktree "${wt.branch}" has unmerged work`,
         summary: `Worktree at ${wt.path} has ${detail.join(' and ')} with no active tmux window. Merge to main or the work may be lost.`,
-        context_anchor: `git log main..${wt.branch} in ${wt.path}`,
+        context_anchor: `git log ${wt.branch} --not origin/main in ${wt.path}`,
         evidence: { branch: wt.branch, worktree_path: wt.path, ahead: wt.ahead, uncommitted: wt.uncommitted },
         options: [
           { key: 'merge', label: 'Merge to main now' },
@@ -652,7 +815,94 @@ function scanWorktrees(projectName, projectPath) {
 // Summary assembly (30-line hard cap)
 // ---------------------------------------------------------------------------
 
-function assembleSummary(projectStates, config) {
+// Structured, re-verifiable form of the git-derived attention facts (the
+// MERGE-OR-LOSE worktree lines and the diverged-branch lines). The build
+// context re-checks each entry against live git before relaying the matching
+// summary line, so a stale cached banner is dropped/stamped rather than
+// asserted as a live fact (act:a136b362). Each fact carries everything needed
+// to re-run the same origin/<main> ahead-check at read time.
+function buildGitAttentionSidecar(projectStates) {
+  const generatedAt = new Date().toISOString();
+  const facts = [];
+  for (const ps of projectStates) {
+    const compareRef = ps.git?.compareRef || 'origin/main';
+    if (ps.orphanedWorktrees) {
+      for (const wt of ps.orphanedWorktrees) {
+        facts.push({
+          kind: 'worktree-unmerged',
+          project: ps.name,
+          project_path: ps.path,
+          branch: wt.branch,
+          worktree_path: wt.path,
+          compare_ref: compareRef,
+          // The cached banner — what build-context relays only if re-verified.
+          line: `⚠ ${ps.name}: worktree "${wt.branch}" has unmerged work — MERGE OR LOSE`,
+        });
+      }
+    }
+    if (ps.divergedBranches) {
+      for (const b of ps.divergedBranches) {
+        facts.push({
+          kind: 'diverged-branch',
+          project: ps.name,
+          project_path: ps.path,
+          branch: b,
+          compare_ref: compareRef,
+          line: `${ps.name}: branch "${b}" diverged from main`,
+        });
+      }
+    }
+  }
+  return { generated_at: generatedAt, facts };
+}
+
+// Runtime-script drift check (act:e81fe82f). The watchtower runtime that
+// launchd/cron executes lives at ~/.claude-cabinet/watchtower/; a one-file
+// fix is durable only when that runtime matches the CC source templates.
+// Surfaces a stale runtime as an ambient attention line so the operator
+// doesn't have to run `/watchtower status` to notice it. READ-ONLY from a
+// cron context — never auto-heals. Stays SILENT (skipped) whenever there is
+// no authoritative source to compare against (no CC repo in cc-registry, no
+// templates/tracked tier) — a false "drift" nag would be the worse failure,
+// exactly the cry-wolf decay act:a136b362 just removed.
+function checkRuntimeScriptDrift(opts = {}) {
+  const registryPath = opts.registryPath
+    || join(homedir(), '.claude', 'cc-registry.json');
+  const runtimeDir = opts.runtimeDir || WATCHTOWER_DIR;
+  try {
+    const ccRepo = resolveCcSourceRepo(registryPath);
+    if (!ccRepo) return { skipped: true, reason: 'no-cc-source' };
+    const roots = resolveRoots({ cwd: ccRepo, runtime: runtimeDir });
+    // No authoritative tier (no templates/ and no tracked scripts/) or no
+    // runtime on disk → nothing meaningful to diff. Stay silent.
+    if (!roots.template && !roots.tracked) return { skipped: true, reason: 'no-source-tier' };
+    if (!roots.runtime) return { skipped: true, reason: 'no-runtime' };
+    const analysis = analyze(roots);
+    // Count only files whose RUNTIME copy needs a heal (drift/missing) plus
+    // runtime-resident orphans — the precise "live runtime is stale" signal.
+    let driftCount = 0;
+    let orphanCount = 0;
+    for (const f of analysis.files) {
+      if (f.healTargets?.some((h) => h.tier === 'runtime')) driftCount++;
+      else if (f.status === 'orphan' && f.tiers?.runtime?.present) orphanCount++;
+    }
+    return { skipped: false, driftCount, orphanCount, total: analysis.summary.total };
+  } catch (e) {
+    return { skipped: true, reason: `error: ${e.message}` };
+  }
+}
+
+// Build the global runtime-drift attention line, or null when in sync/skipped.
+function runtimeDriftAttentionLine(drift) {
+  if (!drift || drift.skipped) return null;
+  if (!drift.driftCount && !drift.orphanCount) return null;
+  const parts = [];
+  if (drift.driftCount) parts.push(`${drift.driftCount} script(s) differ from the CC source templates`);
+  if (drift.orphanCount) parts.push(`${drift.orphanCount} runtime orphan(s)`);
+  return `⚠ watchtower runtime drift: ${parts.join(' + ')} — run \`/watchtower sync\``;
+}
+
+function assembleSummary(projectStates, config, extraAttention = []) {
   const now = new Date().toISOString();
   const lines = [];
 
@@ -692,7 +942,7 @@ function assembleSummary(projectStates, config) {
 
   // --- What Needs Attention ---
   lines.push('## What Needs Attention');
-  const attention = [];
+  const attention = [...extraAttention];
   for (const ps of projectStates) {
     if (ps.pib && ps.pib.flaggedCount > 0) {
       attention.push(`${ps.name}: ${ps.pib.flaggedCount} flagged action(s)`);
@@ -709,6 +959,9 @@ function assembleSummary(projectStates, config) {
       for (const b of ps.divergedBranches) {
         attention.push(`${ps.name}: branch "${b}" diverged from main`);
       }
+    }
+    if (ps.git && ps.git.localLagsRemote) {
+      attention.push(`${ps.name}: local ${ps.git.mainBranch} lags origin/${ps.git.mainBranch} — run \`git fetch && git merge\` (comparisons use origin/${ps.git.mainBranch})`);
     }
     if (ps.pib && ps.pib.completionCandidates && ps.pib.completionCandidates.length > 0) {
       for (const c of ps.pib.completionCandidates) {
@@ -843,6 +1096,46 @@ function assembleSummary(projectStates, config) {
 // Per-project state file
 // ---------------------------------------------------------------------------
 
+// Cap on how many flagged actions are listed by fid in Standing Issues. Every
+// other Standing Issues entry is count-only; an uncapped list would dump every
+// flagged row into the file on each 5-min tick. The full count is always shown
+// in the header line, so nothing is hidden — only the per-action detail is
+// bounded (the same discipline as the inline-capped missed-routine section).
+export const FLAGGED_RENDER_CAP = 5;
+
+// Render the flagged-action Standing Issues entry — the count header plus a
+// capped sub-list of WHICH actions are flagged (fid + one-line text), at
+// parity with orient's work-scan (act:b1b21a15). Pass the FULL flagged list;
+// the count is derived from it. Returns null when nothing is flagged so the
+// caller can fall back / skip. Pure (no I/O) for hermetic testing.
+export function renderFlaggedEntry(flaggedActions, cap = FLAGGED_RENDER_CAP) {
+  const list = Array.isArray(flaggedActions) ? flaggedActions : [];
+  const count = list.length;
+  if (count === 0) return null;
+  const out = [`${count} flagged action(s)`];
+  for (const a of list.slice(0, cap)) {
+    const text = String(a && a.text != null ? a.text : '').replace(/\s+/g, ' ').trim();
+    const shown = text.length > 80 ? text.slice(0, 79) + '…' : text;
+    const fid = a && a.fid ? a.fid : '(no fid)';
+    out.push(`    - ${fid}${shown ? `: ${shown}` : ''}`);
+  }
+  if (count > cap) out.push(`    - …and ${count - cap} more`);
+  return out.join('\n');
+}
+
+// readRecallCanary — load the Ring 2 slow over-suppression canary sidecar
+// (M5, act:6354a9db). Returns the per-project map (or {} if absent/corrupt).
+// Ring 1 renders an alerting project's entry into its Standing Issues so the
+// signal reaches /briefing — the canary is Ring 2's, the render is Ring 1's
+// (Ring 1 owns the per-project state file).
+function readRecallCanary() {
+  const path = join(WATCHTOWER_DIR, 'state', 'recall-canary.json');
+  if (!existsSync(path)) return {};
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')).projects || {};
+  } catch { return {}; }
+}
+
 function assembleProjectState(ps) {
   const now = new Date().toISOString();
   const lines = [];
@@ -881,7 +1174,13 @@ function assembleProjectState(ps) {
   lines.push('## Standing Issues');
   const issues = [];
   if (ps.pib && ps.pib.flaggedCount > 0) {
-    issues.push(`${ps.pib.flaggedCount} flagged action(s)`);
+    // Surface WHICH actions are flagged (capped), not just the count — orient
+    // parity (act:b1b21a15). Falls back to the count line if the list is
+    // somehow absent (older state shape).
+    issues.push(
+      renderFlaggedEntry(ps.pib.flaggedActions) ||
+        `${ps.pib.flaggedCount} flagged action(s)`
+    );
   }
   if (ps.pib && ps.pib.overdueCount > 0) {
     issues.push(`${ps.pib.overdueCount} overdue action(s)`);
@@ -898,8 +1197,22 @@ function assembleProjectState(ps) {
   if (ps.pib && ps.pib.completionCandidates && ps.pib.completionCandidates.length > 0) {
     issues.push(`${ps.pib.completionCandidates.length} completion candidate(s)`);
   }
+  // Recall over-suppression canary (M5, act:6354a9db) — render only on alert
+  // (the data feed for /briefing's State-file-flags reader). Over-suppression
+  // only; the operator eyeballs the sample in recall-canary.json.
+  if (ps.recall && ps.recall.alert) {
+    const pct = (n) => `${Math.round((n || 0) * 100)}%`;
+    issues.push(
+      `recall canary: ${ps.recall.suppressed} dedup suppression(s), rate ` +
+      `${pct(ps.recall.rate)} vs baseline ${pct(ps.recall.baseline)} — review the ` +
+      `sample (over-suppression only; recall-canary.json / see /briefing)`
+    );
+  }
   if (ps.divergedBranches && ps.divergedBranches.length > 0) {
     issues.push(`Diverged branches: ${ps.divergedBranches.join(', ')}`);
+  }
+  if (ps.git && ps.git.localLagsRemote) {
+    issues.push(`Local ${ps.git.mainBranch} lags origin/${ps.git.mainBranch} (comparisons use origin/${ps.git.mainBranch})`);
   }
   if (issues.length === 0) {
     lines.push('None.');
@@ -980,6 +1293,9 @@ function main() {
     }
 
     const projectStates = [];
+    // Ring 2 slow writes the recall-canary sidecar; Ring 1 renders an alerting
+    // project's entry into its Standing Issues (the canary's named reader).
+    const recallCanaryProjects = readRecallCanary();
 
     for (const name of projectNames) {
       const projectPath = projects[name].path || projects[name];
@@ -997,6 +1313,7 @@ function main() {
         deployment: detectDeployment(projectPath),
         ccFeedbackArrival: checkCcFeedbackArrival(projectPath),
         memoryIntegrity: checkMemoryIntegrity(projectPath),
+        recall: recallCanaryProjects[name] || null,
         divergedBranches: [],
         hookResults: [],
       };
@@ -1029,9 +1346,35 @@ function main() {
     const projectsDir = join(stateDir, 'projects');
     mkdirSync(projectsDir, { recursive: true });
 
+    // Runtime-script drift — a global (portfolio-level) check that the live
+    // runtime matches the CC source templates (act:e81fe82f). Read-only;
+    // surfaced as one ambient attention line. Failure must not kill the pass.
+    const extraAttention = [];
+    if (config.defaults?.script_sync_check !== false) {
+      try {
+        const drift = checkRuntimeScriptDrift();
+        const line = runtimeDriftAttentionLine(drift);
+        if (line) extraAttention.push(line);
+      } catch (e) {
+        logError(`runtime script-drift check failed: ${e.message}`);
+      }
+    }
+
     // Write summary.md
-    const summary = assembleSummary(projectStates, config);
+    const summary = assembleSummary(projectStates, config, extraAttention);
     atomicWrite(join(stateDir, 'summary.md'), summary);
+
+    // Write the git-attention sidecar — the structured, re-verifiable form of
+    // the git-derived attention lines (worktree-unmerged + diverged-branch).
+    // Ring 1's summary is a cached snapshot; the SessionStart context builder
+    // re-verifies each fact against current git reality before relaying it,
+    // so a banner can't assert "MERGE OR LOSE" about a branch that has since
+    // merged (act:a136b362). Prose lines are the human surface; this sidecar
+    // is the machine-verifiable join key.
+    atomicWrite(
+      join(stateDir, 'git-attention.json'),
+      JSON.stringify(buildGitAttentionSidecar(projectStates), null, 2)
+    );
 
     // Write per-project state files.
     // Section ownership (watchtower-contracts.md §Project State Section
@@ -1080,9 +1423,26 @@ function main() {
   atomicWrite(healthPath, JSON.stringify(health, null, 2));
 }
 
-try {
-  main();
-} catch (e) {
-  logError(`fatal: ${e.message}`);
-  process.exit(1);
+// Exports for hermetic tests (and re-use by the context builder). These are
+// pure given an injectable `exec` — the inline call sites bind safeExec to a
+// cwd; the tests bind a runner against a temp git repo (act:6f36cbe2,
+// act:a136b362).
+export { resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine };
+
+// Entry guard so tests (and other modules) can import this file's pure
+// helpers without executing main(). realpathSync matters: node
+// realpath-resolves the main module for import.meta.url while argv[1]
+// keeps the given path — a symlinked cron invocation would otherwise
+// make main() silently never run. Matches watchtower-ring2.mjs. (act:141a1c2b)
+const isMain = (() => {
+  try { return process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href; }
+  catch { return false; }
+})();
+if (isMain) {
+  try {
+    main();
+  } catch (e) {
+    logError(`fatal: ${e.message}`);
+    process.exit(1);
+  }
 }

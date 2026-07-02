@@ -17,6 +17,12 @@
 //   2h: (removed 2026-06-12, act:6c3a4763 — feedback delivery is Ring 1's
 //       flushFeedbackOutbox in watchtower-lib.mjs; see tombstone below)
 //   2m: Session advisor pass — re-homed standing advisors, transcript-fed
+//   2n: Raised-but-unhandled lens — loose ends (promises/side-issues/
+//       open-questions) neither done nor filed → inbox (act:4ff2cfb3)
+//   2o: Skill-candidate lens — repeated manual procedure → "make a skill?"
+//       inbox item (act:4ff2cfb3)
+//   2p: Checklist-catch detection — a surfaced check that caught a real bug
+//       → checklist-stats.json (act:4ff2cfb3)
 //   2i: Session auto-naming — generate descriptive session name
 //   2j: Consumer hooks — ring3-close-post hooks
 //   2k: Signal Ring 2 — write fast-trigger lock
@@ -37,7 +43,10 @@ import {
   atomicWrite, loadConfig, slugify,
   log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
-  updateThreadFile, currentCursor, resolveProjectIdentity,
+  updateThreadFile, currentCursor, resolveProjectIdentity, VERIFY_UI_PATHS,
+  projectThreadCursorLines, authoredClaudeDirs, claudeChurnIsDisposable,
+  buildLastSessionBlock, upsertLastSessionSection, recordSuppression,
+  recentSlice,
 } from './watchtower-lib.mjs';
 // Direct queue import (precedent: ring2 imports expireItem this way) —
 // watchtower-lib deliberately not extended for this (lane separation).
@@ -52,16 +61,50 @@ const CLAUDE_HOME = join(homedir(), '.claude');
 const CONSUMER_HOOK_TIMEOUT_MS = 120_000;
 const MODEL = 'claude-sonnet-4-6';
 
+// --- Transcript-budget constants (M2 recall fix, act:edd79e15) ---
+// The single-call input budget for the knowledge-critical passes (extraction
+// 2d, advisor 2m, lenses 2n/2o/2p). preprocessTranscript caps the compressed
+// transcript at ~100K tokens (~400K chars); feeding the most-recent
+// SINGLE_CALL_TRANSCRIPT_BUDGET chars through recentSlice covers essentially
+// every real session in one sonnet call (200K-token context). The old
+// `slice(0, 50000)` read the OLDEST ~12.5K tokens and dropped late-session
+// lessons — the M2 bug. Sessions whose compressed transcript exceeds this
+// budget are the only ones Phase B's bounded chunk-and-merge (act:edd79e15
+// pt2) handles; preprocessing's pre-truncation means that is the largest
+// untruncated sessions only.
+const SINGLE_CALL_TRANSCRIPT_BUDGET = 300_000;
+// Completion detection (Phase 2c) stays deliberately recency-biased: a missed
+// completion is recoverable next session, a missed lesson is not. It routes
+// through recentSlice too — the recency bias is now an explicit CHOICE, not
+// an accidental front-slice.
+const COMPLETION_TRANSCRIPT_BUDGET = 50_000;
+// M2 Phase B (act:edd79e15 pt2): when a compressed transcript exceeds the
+// single-call budget, extraction chunks it into OVERLAPPING windows so a lesson
+// straddling a boundary survives in at least one chunk. Bounded fallback only —
+// preprocessTranscript already caps `compressed` at ~100K tokens (~400K chars),
+// so with a 300K budget this fires only for the largest untruncated sessions
+// (2 windows); MAX_EXTRACTION_CHUNKS is a defensive cap (a future preprocessing
+// change can't make this unbounded). When the cap WOULD truncate, the most-
+// recent windows are kept and a notice is logged (no silent truncation). Note:
+// a >100K-token raw session already lost its FRONT to preprocessing before
+// chunking — "full transcript" is false there; the cap is honest about it.
+const PHASE_B_OVERLAP = 30_000;        // chars carried between adjacent windows
+const MAX_EXTRACTION_CHUNKS = 4;
+
 // --- Dedup tuning constants (Phase 2c/2d noise reduction) ---
 // How far back resolved/dismissed inbox items count as a dedup corpus.
 // Older dismissals no longer suppress — re-surfacing once a quarter is
 // acceptable; the friction loop this kills is week-scale re-filing.
 const RESOLUTION_CORPUS_DAYS = 90;
-// Token-overlap threshold against resolved-item titles (same as pending).
-const RESOLVED_OVERLAP_TOKENS = 3;
-// Stricter threshold against dismissed-item titles — the user explicitly
-// said "not worth keeping", so suppress on less overlap.
-const DISMISSED_OVERLAP_TOKENS = 2;
+// Meaningful-token overlap required to suppress an extraction against ANY
+// corpus (M1a parity, act:f8e7bd0a). One threshold for all four passes —
+// memory, thread-cursor, pending, resolved, dismissed — so no pass can drift
+// into being the weakest link. The dismissed pass used to suppress on 2-token
+// overlap (boundary-man's #2 over-suppression risk); parity raised it to 3.
+// "Meaningful" = post-stopword (the type-word prefix every title carries does
+// not count). The short-title floor in isDuplicate guarantees a candidate has
+// >=3 meaningful tokens before any pass can fire.
+const OVERLAP_THRESHOLD = 3;
 // A completion-review item resolved/dismissed within this window suppresses
 // re-filing for the same fid (a dismissed "is this done?" must not re-file
 // next session while the action is still open).
@@ -150,16 +193,20 @@ function worktreeCheck(cwd, project) {
   const aheadLog = safeExec(`git log --oneline ${mergeBase}..HEAD`, { cwd });
   const aheadCount = aheadLog ? aheadLog.split('\n').filter(l => l.trim()).length : 0;
 
-  // Exclude CC/mux session artifacts (.claude/, .mcp.json) and
+  // Exclude CC/mux session artifacts (.claude/ infra, .mcp.json) and
   // node_modules — untracked in every mux worktree; counting it
   // produced false "unmerged work" alarms for fully-merged branches.
+  // Authored .claude/ subtrees (plans, methodology, rules, …) ARE real work
+  // and are re-included per the canonical exclusion contract (act:e91fdfcf,
+  // claudeChurnIsDisposable in watchtower-lib).
   // safeExec trims output, which can shift porcelain column offsets —
   // match artifact patterns anywhere in the line instead
   const uncommitted = safeExec('git status --porcelain', { cwd });
+  const authoredDirs = authoredClaudeDirs(cwd, safeExec);
   const uncommittedCount = uncommitted
     ? uncommitted.split('\n').filter(l => {
         if (!l.trim()) return false;
-        if (/\s\.claude$/.test(l) || /\s\.claude\//.test(l)) return false;
+        if (claudeChurnIsDisposable(l, authoredDirs)) return false;
         if (/\s\.mcp\.json$/.test(l)) return false;
         if (/\snode_modules$/.test(l) || /\snode_modules\//.test(l)) return false;
         return true;
@@ -363,6 +410,11 @@ async function sessionSummary(compressed, projectSlug, sessionId) {
   const systemPrompt = `You are a session summarizer. Given a Claude Code session transcript, produce exactly 3-5 bullet points summarizing what was accomplished. Be specific about file changes, decisions made, and problems solved. Output ONLY the bullet points, one per line, starting with "- ".`;
 
   const response = await claudeCall(systemPrompt, compressed);
+  // The COMPLETE model bullet set — the single source for BOTH the per-session
+  // record and the inline "## Last Session" block. Never sliced or truncated
+  // for the inline section (act:ac119994): the inline block was historically a
+  // lossy subset of the per-session file, so both now derive from this one
+  // string via buildLastSessionBlock.
   const bullets = response.trim();
 
   // Write per-session file to state/projects/<slug>/sessions/<date>-<session-id>.md
@@ -374,23 +426,22 @@ async function sessionSummary(compressed, projectSlug, sessionId) {
   const content = `# Session ${sessionId}\n\nDate: ${new Date().toISOString()}\n\n${bullets}\n`;
   atomicWrite(sessionFile, content);
 
-  // Also update the project-level state file with the latest session pointer
+  // Update the project-level state file's "## Last Session" with the SAME
+  // complete bullet set. Written UNCONDITIONALLY — the old `existsSync` gate
+  // silently dropped the inline section whenever the project-state file didn't
+  // exist yet (a fresh project, or before Ring 1's first rebuild), leaving the
+  // per-session file current while the inline block stayed empty/stale and
+  // readers rendered a truncated summary (act:ac119994). buildLastSessionBlock
+  // is the single source of the block format; upsertLastSessionSection reuses
+  // the line-anchored splice preserveRing3LastSession reads with, and the
+  // attribution line it emits is the ownership marker Ring 1's rebuild keys on
+  // (preserveRing3LastSession carries this section forward verbatim).
   const projectStatePath = join(WATCHTOWER_DIR, 'state', 'projects', `${projectSlug}.md`);
-  if (existsSync(projectStatePath)) {
-    let stateContent = readFileSync(projectStatePath, 'utf8');
-    const sessionHeader = '## Last Session';
-    const headerIdx = stateContent.indexOf(sessionHeader);
-    const replacement = `${sessionHeader}\n_${date} (${sessionId})_\n${bullets}\n`;
-
-    if (headerIdx >= 0) {
-      const afterHeader = stateContent.indexOf('\n## ', headerIdx + sessionHeader.length);
-      const endIdx = afterHeader > 0 ? afterHeader : stateContent.length;
-      stateContent = stateContent.slice(0, headerIdx) + replacement + stateContent.slice(endIdx);
-    } else {
-      stateContent = stateContent.trimEnd() + `\n\n${replacement}`;
-    }
-    atomicWrite(projectStatePath, stateContent);
-  }
+  const existingState = existsSync(projectStatePath)
+    ? readFileSync(projectStatePath, 'utf8')
+    : '';
+  const block = buildLastSessionBlock({ date, sessionId, bullets });
+  atomicWrite(projectStatePath, upsertLastSessionSection(existingState, block));
 
   log(`Phase 2b: Summary written to ${projectSlug}/sessions/${date}-${sessionId}.md`);
   return bullets;
@@ -585,7 +636,7 @@ async function workItemClosure(compressed, project, threadIds = []) {
 Output JSON array: [{"fid":"act:XXXXXXXX","confidence":"high|medium|low|none","evidence":"brief reason"}]
 Output ONLY the JSON array, no other text.`;
 
-  const userMessage = `Open actions:\n${actionList}\n\nSession transcript:\n${compressed.slice(0, 50000)}`;
+  const userMessage = `Open actions:\n${actionList}\n\nSession transcript:\n${recentSlice(compressed, COMPLETION_TRANSCRIPT_BUDGET)}`;
 
   let evaluations = [];
   try {
@@ -689,85 +740,260 @@ Output ONLY the JSON array, no other text.`;
 // Dedup helpers — check memory index and pending inbox before filing
 // ---------------------------------------------------------------------------
 
-function loadMemoryIndex(projectPath) {
+// parseMemoryTitles — extract the dedup corpus from MEMORY.md content.
+//
+// The M1a fix (act:f8e7bd0a). The old `loadMemoryIndex` returned each whole
+// `- ` index line lowercased, and isDuplicate ran substring containment over
+// it — so the median-133-char (max 755) em-dash DESCRIPTION TAIL on every line
+// was the suppression sponge: a novel lesson sharing 3 generic words with some
+// entry's prose tail got killed. The fix is to match only the TITLE segment.
+//
+// Per `- ` line: pull every `[Title](target)` markdown link (multi-link lines
+// are common — "2026-06-16 sessions: [A](a.md), [B](b.md)" — take ALL, not the
+// first). Lines with NO link are scaffolding, not entries — topic-file headers
+// (`- **decisions.md** (56), ...`) and region/glob pointers (`- region
+// \`session_summary_*.md\` → ...`) — and are DROPPED, never prose-matched
+// (fail-direction: an unparsed entry is invisible to dedup ⇒ re-proposal
+// noise, the SAFE direction, never an over-match).
+function parseMemoryTitles(content) {
+  const titles = [];
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    if (!line.startsWith('- ')) continue;
+    const body = line.slice(2).trim();
+    // Region/glob pointer line — a backtick-glob standing for a class of
+    // files, not an entry. Explicitly excluded (it carries no link anyway).
+    if (/^region\b/i.test(body)) continue;
+    // Capture title AND target; only a link to a memory FILE (`.md`) counts as
+    // an entry. An inline `[text](https://…)` link inside a description tail is
+    // NOT an entry — accepting it would re-inject the tail-as-suppression-
+    // sponge bug M1a removes (boundary-man: latent until a tail adds a link).
+    const linkRe = /\[([^\]]+)\]\(([^)]*)\)/g;
+    let m;
+    while ((m = linkRe.exec(body)) !== null) {
+      if (!/\.md$/i.test((m[2] || '').trim())) continue;
+      const t = m[1].trim().toLowerCase();
+      if (t) titles.push(t);
+    }
+    // No memory-file link ⇒ header/bare scaffolding ⇒ dropped (never prose-
+    // fallback; an unparsed entry is invisible to dedup, the SAFE direction).
+  }
+  return titles;
+}
+
+function loadMemoryTitles(projectPath) {
   const encoded = projectPath.replace(/\//g, '-');
   const memDir = join(homedir(), '.claude', 'projects', encoded, 'memory');
   const indexPath = join(memDir, 'MEMORY.md');
   if (!existsSync(indexPath)) return [];
   try {
-    const content = readFileSync(indexPath, 'utf8');
-    return content.split('\n')
-      .filter(line => line.startsWith('- '))
-      .map(line => line.toLowerCase());
+    return parseMemoryTitles(readFileSync(indexPath, 'utf8'));
   } catch { return []; }
 }
 
 function tokenize(text) {
+  // Coerce non-strings to no-tokens. This is the single choke point for every
+  // token operation — a null/number corpus entry (a title-less inbox item is
+  // storable) must contribute ZERO overlap, never throw. Before this guard a
+  // single malformed pending title threw out of isDuplicate (outside the
+  // per-item try) and swallowed the WHOLE extraction batch — the exact
+  // invisible knowledge-drop this program exists to prevent (boundary-man).
+  if (typeof text !== 'string') return [];
   return text.toLowerCase()
     .replace(/[^a-z0-9 ]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length > 3);
 }
 
-// isDuplicate — token-overlap dedup across all corpora.
-//
-// `memoryLines` is the PROSE corpus (substring containment): memory-index
-// lines AND thread-cursor lines, lowercased, merged by the caller.
-// `pendingTitles` are already-pending inbox item titles.
-//
-// The trailing options object is the DESIGNATED GROWTH POINT for all future
-// corpora — add new corpus arrays there, never as positional parameters, so
-// the next corpus doesn't invent a third convention.
-//
-// Returns false when not a duplicate, or a truthy { corpus, match } naming
-// which corpus matched and the matching title/line — callers must log one
-// line per suppression (the 2-token dismissed matcher is the loosest in the
-// system; silent over-suppression would be invisible in a cron context).
-function isDuplicate(title, content, memoryLines, pendingTitles,
-  { resolvedTitles = [], dismissedTitles = [] } = {}) {
-  const titleTokens = tokenize(title);
-  const contentTokens = tokenize(content).slice(0, 10);
-  const allTokens = [...new Set([...titleTokens, ...contentTokens])];
-  if (allTokens.length === 0) return false;
+// STOPWORDS — tokens that donate guaranteed overlap and must NOT count toward
+// suppression (M1a, applied IDENTICALLY to both sides of every overlap and
+// across all passes). Two classes: (1) the CC extraction TYPE/category words —
+// every title is `${type}: ${title}` (line ~995), and lens titles are prefixed
+// `unhandled:`/`skill-candidate:`/`methodology:` — so the prefix is a 100%
+// donor; (2) high-frequency English fillers (the tokenizer already drops
+// len<=3, so only longer fillers need listing). Domain/action words are
+// deliberately NOT here — they are the meaningful signal. (`tokenize` lowercases
+// and strips punctuation, so `skill-candidate` arrives as `skill`+`candidate`.)
+const STOPWORDS = new Set([
+  // type / category prefixes (every extraction title is `${type}: ...`;
+  // lens titles are `unhandled:`/`skill-candidate:`/`methodology:`)
+  'lesson', 'lessons', 'decision', 'decisions', 'constraint', 'constraints',
+  'preference', 'preferences', 'feedback', 'pattern', 'patterns',
+  'methodology', 'candidate', 'skill', 'unhandled', 'advisor', 'finding',
+  'session', 'sessions', 'summary', 'summaries', 'memory',
+  // session-advisor member-name fragments (Phase 2m titles are
+  // `${shortName}: ...` — system-advocate/user-advocate/anthropic-insider/
+  // historian; `advocate` is shared by two members, the worst donor)
+  'advocate', 'historian', 'insider', 'anthropic',
+  // generic English fillers (len>3)
+  'with', 'that', 'this', 'from', 'into', 'when', 'what', 'which', 'their',
+  'there', 'these', 'those', 'then', 'than', 'they', 'them', 'have', 'will',
+  'would', 'should', 'could', 'about', 'after', 'before', 'being', 'been',
+  'were', 'your', 'yours', 'over', 'under', 'also', 'just', 'like', 'does',
+  'must', 'only', 'every', 'some', 'more', 'most', 'much', 'such', 'very',
+  'onto', 'upon', 'each', 'both', 'here', 'where', 'while', 'because',
+  'against', 'through', 'still', 'into', 'them',
+]);
 
-  const titleOverlap = (otherTitle) => {
-    const otherTokens = tokenize(otherTitle);
+function meaningfulTokens(text) {
+  return tokenize(text).filter(t => !STOPWORDS.has(t));
+}
+
+// isDuplicate — meaningful-token overlap dedup across all corpora (M1a).
+//
+// FIVE title/prose corpora, all matched the SAME way — whole-token overlap of
+// post-stopword "meaningful" tokens, threshold OVERLAP_THRESHOLD:
+//   memoryTitles    — parsed MEMORY.md titles (NO description tail; the M1a fix)
+//   threadCursorLines — active thread-cursor prose ("what the system already
+//                       knows you're working on"); a restatement is noise. Now
+//                       whole-token overlap, NOT substring — leaving it on
+//                       `line.includes` would re-introduce the exact
+//                       over-suppression bug M1a kills. CALIBRATION NOTE: each
+//                       cursor line is long prose (~9-19 meaningful tokens), so
+//                       3-token overlap is structurally looser here than over
+//                       short titles. This is strictly tighter than the old
+//                       substring pass, and a DELIBERATE choice the M5
+//                       suppression-ledger canary is built to measure — if the
+//                       ledger shows thread-cursor over-suppression, raise its
+//                       threshold then, with data (don't pre-tune blind).
+//   pendingTitles / resolvedTitles / dismissedTitles — inbox-item titles.
+//
+// SHORT-TITLE FLOOR (boundary-man #1): a candidate whose title+content cannot
+// muster >=3 meaningful tokens is NEVER suppressed — terseness must not lower
+// the bar so a high-value 2-word constraint dies on one shared token. The flat
+// OVERLAP_THRESHOLD (no Math.min lowering) enforces it. NOTE the floor is on
+// title ∪ content[:10]: production passes `item.content`, so a terse title
+// with rich content can clear the floor (and its content tokens then
+// participate in overlap) — by design (the ITEM, not just the title, is what
+// must be novel); the floor's hard guarantee is for genuinely contentless
+// terse items.
+//
+// The trailing options object is the DESIGNATED GROWTH POINT for new corpora.
+// Returns false, or a truthy { corpus, match } — callers log one line per
+// suppression AND append a structured ledger record (recordSuppression).
+function isDuplicate(title, content, memoryTitles, pendingTitles,
+  { resolvedTitles = [], dismissedTitles = [], threadCursorLines = [] } = {}) {
+  const titleTokens = meaningfulTokens(title);
+  const contentTokens = meaningfulTokens(content).slice(0, 10);
+  const allTokens = [...new Set([...titleTokens, ...contentTokens])];
+  // Short-title floor: never suppress an item that can't muster 3 meaningful
+  // tokens. (Also the empty-token guard.)
+  if (allTokens.length < OVERLAP_THRESHOLD) return false;
+
+  const overlap = (other) => {
+    const otherTokens = meaningfulTokens(other);
     return allTokens.filter(t => otherTokens.includes(t)).length;
   };
 
-  // Check against prose lines (memory index + thread cursors)
-  for (const line of memoryLines) {
-    const matchCount = allTokens.filter(t => line.includes(t)).length;
-    if (matchCount >= Math.min(3, allTokens.length)) {
-      return { corpus: 'memory', match: line };
+  const passes = [
+    ['memory', memoryTitles],
+    ['thread-cursor', threadCursorLines],
+    ['pending', pendingTitles],
+    ['resolved', resolvedTitles],
+    ['dismissed', dismissedTitles],
+  ];
+  for (const [corpus, entries] of passes) {
+    for (const entry of (entries || [])) {
+      if (overlap(entry) >= OVERLAP_THRESHOLD) {
+        return { corpus, match: entry };
+      }
     }
   }
-
-  // Check against already-pending inbox items
-  for (const pending of pendingTitles) {
-    if (titleOverlap(pending) >= Math.min(3, allTokens.length)) {
-      return { corpus: 'pending', match: pending };
-    }
-  }
-
-  // Resolved items — same threshold as pending. Resolved-as-routed-to-memory
-  // items are usually caught by the memory corpus too; this is the
-  // belt-and-suspenders title check.
-  for (const t of resolvedTitles) {
-    if (titleOverlap(t) >= Math.min(RESOLVED_OVERLAP_TOKENS, allTokens.length)) {
-      return { corpus: 'resolved', match: t };
-    }
-  }
-
-  // Dismissed items — STRICTER suppression: the user explicitly said
-  // "not worth keeping".
-  for (const t of dismissedTitles) {
-    if (titleOverlap(t) >= Math.min(DISMISSED_OVERLAP_TOKENS, allTokens.length)) {
-      return { corpus: 'dismissed', match: t };
-    }
-  }
-
   return false;
+}
+
+// selectNearbyMemoryTitles — the M1b prefilter (act:16904ffc). Pick the
+// existing memory titles most relevant to THIS session so the extraction call
+// can be shown "here is what's already saved" and self-filter dupes IN ONE
+// pass (zero new model calls; embeddings stay rejected). Score each title by
+// how many of its meaningful tokens appear in the (recent) transcript; take the
+// top `limit`. Reuses the M1a tokenizer — this is context selection, not a
+// similarity oracle (the extraction model itself is the semantic engine).
+function selectNearbyMemoryTitles(memoryTitles, transcript, limit = 15) {
+  if (!Array.isArray(memoryTitles) || memoryTitles.length === 0) return [];
+  const tx = new Set(meaningfulTokens(transcript));
+  if (tx.size === 0) return [];
+  const scored = [];
+  for (const title of memoryTitles) {
+    const score = [...new Set(meaningfulTokens(title))].filter(t => tx.has(t)).length;
+    if (score > 0) scored.push({ title, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(s => s.title);
+}
+
+// modelRescues — the M1b rescue gate (DEFAULT-KEEP). The extraction model is
+// shown the nearby saved titles and asked, per proposed item, which saved title
+// covers it (`covered_by`) — "none" if genuinely novel. When isDuplicate
+// LEXICALLY flags an item the model AFFIRMATIVELY judged novel, the model's
+// semantic read RESCUES it (file anyway). The model may ONLY rescue, NEVER
+// suppress: a missing/garbage/empty covered_by is NOT an affirmative novelty
+// claim, so isDuplicate's deterministic decision stands. (The historian
+// landmine, act:3975348f — a silent fuzzy SUPPRESSOR was deleted once; this
+// gate can only ADD recall, never remove it.)
+function modelRescues(item) {
+  const cb = item && item.covered_by;
+  if (typeof cb !== 'string') return false;
+  return /^\s*(none|null|n\/?a|nothing|no\b)/i.test(cb.trim());
+}
+
+// chunkWithOverlap — the M2 Phase B windowing (act:edd79e15 pt2). Split `text`
+// into windows of `size` chars that OVERLAP by `overlap` chars (so a lesson
+// straddling a boundary appears whole in at least one window). Covers the full
+// text front-to-back; if more than `maxChunks` windows are needed, the
+// MOST-RECENT `maxChunks` are kept (recency — a missed late lesson is the bug
+// this program fights) and `dropped` counts the front windows skipped. Returns
+// { windows, capped, dropped }.
+function chunkWithOverlap(text, size, overlap, maxChunks) {
+  if (typeof text !== 'string' || text.length === 0) return { windows: [], capped: false, dropped: 0 };
+  if (text.length <= size) return { windows: [text], capped: false, dropped: 0 };
+  const step = Math.max(1, size - overlap);
+  const windows = [];
+  for (let start = 0; start < text.length; start += step) {
+    windows.push(text.slice(start, start + size));
+    if (start + size >= text.length) break;
+  }
+  if (windows.length <= maxChunks) return { windows, capped: false, dropped: 0 };
+  const dropped = windows.length - maxChunks;
+  return { windows: windows.slice(dropped), capped: true, dropped };
+}
+
+// mergeChunkExtractions — flatten per-chunk extraction arrays and dedup the
+// merge with a STRICTER-than-corpus matcher (act:edd79e15 pt2). Intra-session
+// titles are fresh and specific, so the overlap windows produce the SAME lesson
+// twice — merge those (normalized-equal title, or >=80% of the shorter title's
+// meaningful tokens shared and >=3) but NEVER merge two genuinely distinct
+// lessons that merely share a few words (don't reuse the loose 3-token corpus
+// bar). covered_by and all fields ride through from the first copy kept.
+function mergeChunkExtractions(perChunk) {
+  const norm = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
+  const merged = [];
+  for (const arr of perChunk) {
+    for (const item of (arr || [])) {
+      if (!item || typeof item.title !== 'string') continue;
+      const itemTokens = new Set(meaningfulTokens(item.title));
+      const dup = merged.some(m => {
+        if (norm(m.title) === norm(item.title)) return true;
+        const mTokens = meaningfulTokens(m.title);
+        if (itemTokens.size === 0 || mTokens.length === 0) return false;
+        const shared = mTokens.filter(t => itemTokens.has(t)).length;
+        const smaller = Math.min(itemTokens.size, mTokens.length);
+        return shared >= 3 && shared >= Math.ceil(0.8 * smaller);
+      });
+      if (!dup) merged.push(item);
+    }
+  }
+  return merged;
+}
+
+// runExtractionCall — one model call → parsed JSON array (or [] on no-match).
+// Shared by the Phase A single call and each Phase B chunk. Throws on a call or
+// JSON error so the caller decides the fail-direction (Phase A returns nothing;
+// Phase B isolates per chunk so one bad window doesn't lose the others).
+async function runExtractionCall(callFn, systemPrompt, userMessage) {
+  const response = await callFn(systemPrompt, userMessage);
+  const jsonMatch = response.match(/\[[\s\S]*\]/);
+  return jsonMatch ? JSON.parse(jsonMatch[0]) : [];
 }
 
 // resolutionCorpus — titles of recently resolved/dismissed/superseded inbox
@@ -796,36 +1022,55 @@ function resolutionCorpus(projectName) {
 // threadCursorLines — prose corpus from active thread cursors. Thread cursors
 // (what / where_left_off / open_questions) are exactly "what the system
 // already knows the user is working on"; an extraction that restates them is
-// noise. Returned lines are lowercased, ready for the memoryLines containment
-// pass in isDuplicate.
+// noise. Returned lines are lowercased; isDuplicate consumes them as the
+// `threadCursorLines` corpus — whole-token overlap (M1a), not substring.
+//
+// Delegates to projectThreadCursorLines in watchtower-lib.mjs — the SINGLE
+// thread-file reader (the same one Ring 2's enrichment uses). The former local
+// copy carried a slug-substring membership FALLBACK (slugify(thread).includes(
+// projectSlug)) that over-matched: a short slug like "flow" pulled in any
+// "…workflow…" thread's cursor prose, silently suppressing legitimate new
+// extractions. The shared reader matches ONLY by exact sessions[].project
+// equality (or explicit thread_ids) — that fallback is gone (act:3975348f).
 function threadCursorLines(threadsDir, projectSlug) {
-  if (!projectSlug || !existsSync(threadsDir)) return [];
-  const lines = [];
-  const push = (v) => {
-    if (typeof v === 'string' && v.trim()) lines.push(v.toLowerCase());
-  };
-  for (const f of readdirSync(threadsDir)) {
-    if (!f.endsWith('.json')) continue;
-    let thread;
-    try {
-      thread = JSON.parse(readFileSync(join(threadsDir, f), 'utf8'));
-    } catch { continue; } // skip unparseable thread files
-    if (thread.status !== 'active') continue;
-    // Primary membership key: the sessions[].project entries Ring 3 itself
-    // writes; slug-match on the thread name is the fallback.
-    const sessions = Array.isArray(thread.sessions) ? thread.sessions : [];
-    const memberOfProject = sessions.some(s => s && s.project === projectSlug);
-    const slugMatches =
-      (typeof thread.thread === 'string' && slugify(thread.thread).includes(projectSlug))
-      || (typeof thread.display_name === 'string' && slugify(thread.display_name).includes(projectSlug));
-    if (!memberOfProject && !slugMatches) continue;
-    const cursor = currentCursor(thread);
-    push(thread.display_name);
-    push(cursor.what);
-    push(cursor.where_left_off);
-    if (Array.isArray(cursor.open_questions)) cursor.open_questions.forEach(push);
+  return projectThreadCursorLines(threadsDir, projectSlug);
+}
+
+// buildExtractionCorpora — assemble the dedup corpora isDuplicate consumes,
+// the SAME machinery Phase 2d and Phase 2m build inline. Extracted so the
+// close lenses (Phase 2n/2o) don't fork a third copy of the corpus-building
+// idiom. Every builder fails OPEN — a corpus hiccup degrades dedup, never
+// aborts the lens (a finding re-filing once beats losing the pass). `phase`
+// labels the warning lines.
+//
+// M1a split: `memoryTitles` (parsed MEMORY.md titles, NO description tail) and
+// `threadCursorLines` (active-thread cursor prose) are now SEPARATE named
+// corpora — they used to be smuggled into one `memoryLines` array and substring
+// -matched together. They are both whole-token-matched by isDuplicate now.
+function buildExtractionCorpora(project, { phase } = {}) {
+  const tag = phase || 'lens';
+  const memoryTitles = loadMemoryTitles(project.path);
+  let cursorLines = [];
+  try {
+    cursorLines = threadCursorLines(
+      join(WATCHTOWER_DIR, 'state', 'threads'), project.slug);
+  } catch (e) {
+    logError(`${tag}: thread-cursor corpus failed (${e.message}) — continuing without it`);
   }
-  return lines;
+  let pendingTitles = [];
+  try {
+    pendingTitles = listPending({ project: project.name })
+      .map(p => p.title).filter(t => typeof t === 'string' && t.trim());
+  } catch (e) {
+    logError(`${tag}: pending corpus failed (${e.message}) — continuing without it`);
+  }
+  let resolutionTitles = { resolvedTitles: [], dismissedTitles: [] };
+  try {
+    resolutionTitles = resolutionCorpus(project.name);
+  } catch (e) {
+    logError(`${tag}: resolution corpus failed (${e.message}) — continuing without it`);
+  }
+  return { memoryTitles, threadCursorLines: cursorLines, pendingTitles, resolutionTitles };
 }
 
 // completionReviewEmitGuard — emit-time guards for Phase 2c (one call per
@@ -871,9 +1116,25 @@ function completionReviewEmitGuard(fid, { statusStmt, existingItems = [] } = {})
 // Phase 2d: Knowledge extraction → inbox
 // ---------------------------------------------------------------------------
 
-async function decisionExtraction(compressed, project, sessionId, transcriptPath, threadIds = []) {
+async function decisionExtraction(compressed, project, sessionId, transcriptPath,
+  threadIds = [], { callFn = claudeCall } = {}) {
   const projectPath = project.path;
   log('Phase 2d: Knowledge extraction');
+
+  // Dedup corpora — built FIRST (before the extraction call) so M1b can inject
+  // the nearest saved titles into the prompt AND back the result with the
+  // deterministic isDuplicate pass after. The SAME builder the close lenses use
+  // (one corpus-building idiom). M1a: memory is title-matched (no description
+  // tail), thread cursors are their own whole-token corpus; every builder fails
+  // open. Queried by the resolved project NAME (the old basename query looked
+  // up a phantom project, so dedup never matched and dups re-filed).
+  const { memoryTitles, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
+    buildExtractionCorpora(project, { phase: 'Phase 2d' });
+
+  const transcript = recentSlice(compressed, SINGLE_CALL_TRANSCRIPT_BUDGET);
+  // M1b prefilter: the saved titles most relevant to THIS session (scored over
+  // the full compressed transcript, not just the recent slice).
+  const nearbyTitles = selectNearbyMemoryTitles(memoryTitles, compressed);
 
   const systemPrompt = `You are extracting decisions, constraints, lessons, and user preferences from a Claude Code session transcript. For each item found, classify its home:
 
@@ -886,6 +1147,8 @@ Only extract items that represent NEW durable knowledge — things learned or de
 
 Do NOT extract transient operational state: project completion status ("X has 0 open actions"), branch merge status ("branch Y was merged"), install success confirmations ("all rings working"), or other point-in-time observations that will be stale within days. These belong in state files, not the inbox.
 
+NOVELTY: an "ALREADY SAVED TO MEMORY" list may appear at the very end of the input. Use it as novelty context: OMIT an item ONLY when a saved title clearly and substantially covers the SAME specific knowledge. DEFAULT TO INCLUDING — when in doubt whether a saved title covers it, INCLUDE the item (re-proposing a near-duplicate is cheap; losing a novel lesson is not). For every item you DO output, set "covered_by" to the exact saved title that most covers it, or "none" if no saved title covers it.
+
 For each item, assess how time-sensitive routing is. Urgency means HOW FAST THE VALUE DECAYS if not routed — it is NOT importance:
 - "urgent" = the value evaporates within days if not routed (a trigger condition about to fire, a constraint someone will trip over THIS WEEK, a decision another active session needs right now). Apply the time-decay test: "if this sits in the inbox for a week, is most of its value gone?" If no, it is not urgent.
 - "normal" = worth routing but the value keeps (most decisions and constraints)
@@ -893,15 +1156,41 @@ For each item, assess how time-sensitive routing is. Urgency means HOW FAST THE 
 
 Lessons and preferences are durable knowledge — their value does not decay. They are almost NEVER urgent, no matter how important they are. An important-but-durable item is "normal".
 
-Output JSON array: [{"type":"decision|constraint|lesson|preference","home":"memory|claude-md|pib-db-trigger|upstream-feedback","urgency":"urgent|normal|low","title":"short title","content":"detailed description"}]
+Output JSON array: [{"type":"decision|constraint|lesson|preference","home":"memory|claude-md|pib-db-trigger|upstream-feedback","urgency":"urgent|normal|low","title":"short title","content":"detailed description","covered_by":"exact already-saved title that covers this, or \\"none\\""}]
 Output ONLY the JSON array, no other text. If nothing found, output [].`;
+
+  // M1b injection: show the model what's already saved so it self-filters dupes
+  // in this one pass. DEFAULT-KEEP — the wording leans toward inclusion. Empty
+  // nearby set ⇒ no block ⇒ the prompt degrades to blind extraction (fail-open).
+  const savedBlock = nearbyTitles.length
+    ? `\n\nALREADY SAVED TO MEMORY (do NOT re-propose anything one of these substantially and specifically covers; when unsure, INCLUDE the item):\n${nearbyTitles.map(t => `- ${t}`).join('\n')}`
+    : '';
 
   let extractions = [];
   try {
-    const response = await claudeCall(systemPrompt, compressed.slice(0, 50000));
-    const jsonMatch = response.match(/\[[\s\S]*\]/);
-    if (jsonMatch) {
-      extractions = JSON.parse(jsonMatch[0]);
+    if (compressed.length > SINGLE_CALL_TRANSCRIPT_BUDGET) {
+      // M2 Phase B: the compressed transcript exceeds one call — chunk it into
+      // overlapping windows so nothing in the middle is dropped, extract each,
+      // merge with a strict intra-session matcher. Per-chunk isolation: a bad
+      // window logs and contributes nothing; the others still file (fail-open).
+      const { windows, capped, dropped } = chunkWithOverlap(
+        compressed, SINGLE_CALL_TRANSCRIPT_BUDGET, PHASE_B_OVERLAP, MAX_EXTRACTION_CHUNKS);
+      log(`Phase 2d: M2-B — compressed ${compressed.length} chars > budget; chunk-and-merge over ${windows.length} overlapping window(s)`);
+      if (capped) {
+        log(`Phase 2d: M2-B — MAX_CHUNKS cap hit; oldest ${dropped} window(s) NOT extracted (most-recent kept)`);
+      }
+      const perChunk = [];
+      for (const window of windows) {
+        try {
+          perChunk.push(await runExtractionCall(callFn, systemPrompt, `${window}${savedBlock}`));
+        } catch (e) {
+          logError(`Phase 2d: M2-B chunk extraction failed (${e.message}) — continuing with the other windows`);
+          perChunk.push([]);
+        }
+      }
+      extractions = mergeChunkExtractions(perChunk);
+    } else {
+      extractions = await runExtractionCall(callFn, systemPrompt, `${transcript}${savedBlock}`);
     }
   } catch (e) {
     logError(`Phase 2d: Claude extraction failed: ${e.message}`);
@@ -912,48 +1201,39 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
     log('Phase 2d: No knowledge extracted');
     return { autoWritten: 0, queued: 0 };
   }
-
-  // Load existing context for dedup — query by the resolved name, the same
-  // key the items are filed under (the old basename query looked up a
-  // phantom project, so dedup never matched and duplicates re-filed).
-  //
-  // memoryLines is the PROSE corpus: memory-index lines AND thread-cursor
-  // lines (what the system already knows the user is working on), both
-  // checked with the same >=3-token containment pass. Corpus builders fail
-  // open (logError + empty) — a corpus hiccup must never abort extraction.
-  const memoryLines = loadMemoryIndex(projectPath);
-  try {
-    memoryLines.push(
-      ...threadCursorLines(join(WATCHTOWER_DIR, 'state', 'threads'), project.slug));
-  } catch (e) {
-    logError(`Phase 2d: thread-cursor corpus failed (${e.message}) — continuing without it`);
-  }
-  const pending = listPending({ project: project.name });
-  const pendingTitles = pending.map(p => p.title);
-  // Resolution corpora: titles the user already resolved or explicitly
-  // dismissed within RESOLUTION_CORPUS_DAYS — a dismissed lesson must not
-  // re-file the next time a session touches the same area.
-  let resolutionTitles = { resolvedTitles: [], dismissedTitles: [] };
-  try {
-    resolutionTitles = resolutionCorpus(project.name);
-  } catch (e) {
-    logError(`Phase 2d: resolution corpus failed (${e.message}) — continuing without it`);
+  if (nearbyTitles.length) {
+    log(`Phase 2d: M1b — injected ${nearbyTitles.length} nearby saved title(s) for novelty context`);
   }
 
   let queued = 0;
   let deduped = 0;
+  let rescued = 0;
 
   for (const item of extractions) {
     const fullTitle = `${item.type}: ${item.title}`;
 
     const dup = isDuplicate(
-      fullTitle, item.content || '', memoryLines, pendingTitles, resolutionTitles);
+      fullTitle, item.content || '', memoryTitles, pendingTitles,
+      { ...resolutionTitles, threadCursorLines: cursorLines });
     if (dup) {
-      deduped++;
-      // One line per suppression — the dismissed matcher is the loosest in
-      // the system; over-suppression must be visible and tunable.
-      log(`Phase 2d: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
-      continue;
+      // M1b rescue gate: a lexical flag the model AFFIRMATIVELY judged novel is
+      // RESCUED (filed). The model can only rescue, never independently suppress
+      // — a missing/non-"none" covered_by leaves isDuplicate's decision intact.
+      if (modelRescues(item)) {
+        rescued++;
+        log(`Phase 2d: rescued "${fullTitle}" — ${dup.corpus} lexical match "${dup.match}" but model judged novel (covered_by: ${item.covered_by})`);
+      } else {
+        deduped++;
+        // One line per suppression — the dismissed matcher is the loosest in
+        // the system; over-suppression must be visible and tunable.
+        log(`Phase 2d: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
+        recordSuppression({
+          project: project.name, corpus: dup.corpus,
+          suppressed_title: fullTitle, matched_against: dup.match,
+          session_id: sessionId,
+        });
+        continue;
+      }
     }
 
     try {
@@ -994,6 +1274,7 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
   }
 
   if (deduped > 0) log(`Phase 2d: ${deduped} extractions skipped (already in memory or inbox)`);
+  if (rescued > 0) log(`Phase 2d: ${rescued} extraction(s) rescued from a lexical match (model judged novel)`);
   log(`Phase 2d: ${queued} extractions queued for review`);
   return { autoWritten: 0, queued };
 }
@@ -1019,8 +1300,8 @@ async function qualityPatternCapture(compressed, projectPath) {
   const systemPrompt = `You are analyzing a Claude Code session transcript for recurring quality patterns — issues, gaps, friction, or anti-patterns that surface during any kind of work (coding, debugging, planning, auditing, reviewing). Identify patterns worth learning from: things that keep going wrong, systematic gaps, workflow friction, or quality issues that a team member should watch for in future sessions. Output as markdown with ## headers for each pattern found. Include **Evidence:** (what you observed) and **Gap:** (what's missing or broken) for each. If no meaningful patterns, output "No recurring patterns detected."`;
 
   const userMessage = triageHistory
-    ? `Session transcript:\n${compressed.slice(0, 30000)}\n\nAudit triage history:\n${triageHistory.slice(0, 10000)}`
-    : `Session transcript:\n${compressed.slice(0, 30000)}`;
+    ? `Session transcript:\n${recentSlice(compressed, 30000)}\n\nAudit triage history:\n${triageHistory.slice(0, 10000)}`
+    : `Session transcript:\n${recentSlice(compressed, 30000)}`;
 
   try {
     const response = await claudeCall(systemPrompt, userMessage);
@@ -1061,7 +1342,7 @@ VERIFICATION REQUIREMENT: a methodology only counts if the session produced a du
 If a new methodology was established, output JSON: {"found": true, "title": "short description", "content": "what the methodology is and how to apply it", "artifact_path": "relative/path/to/the/file"}
 If nothing new was established, output JSON: {"found": false}
 Output ONLY the JSON object.`,
-      compressed.slice(0, 30000),
+      recentSlice(compressed, 30000),
     );
 
     const jsonMatch = response.match(/\{[\s\S]*\}/);
@@ -1124,7 +1405,7 @@ If NO friction found, output exactly: []
 Be conservative. False positives waste time. Output ONLY the JSON array.`;
 
   try {
-    const response = await claudeCall(systemPrompt, compressed.slice(0, 40000));
+    const response = await claudeCall(systemPrompt, recentSlice(compressed, 40000));
     const jsonMatch = response.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
       log('Phase 2g: No upstream friction (parse failure)');
@@ -1179,7 +1460,7 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
 // process; silence is the expected common case.
 
 const ADVISOR_MAX_FINDINGS = 2;          // per member per session
-const ADVISOR_TRANSCRIPT_SLICE = 40_000; // chars, same scale as Phase 2g
+const ADVISOR_TRANSCRIPT_SLICE = SINGLE_CALL_TRANSCRIPT_BUDGET; // M2: full recent transcript (was 40_000 front-slice)
 const ADVISOR_SKILL_SLICE = 8_000;       // chars of member identity
 
 function discoverSessionAdvisors(projectPath) {
@@ -1247,7 +1528,8 @@ async function advisorPass(compressed, project, sessionId, threadIds = [],
   // open (an advisor finding re-filing once beats losing the whole pass).
   let pendingTitles = [];
   try {
-    pendingTitles = listPending({ project: project.name }).map(p => p.title);
+    pendingTitles = listPending({ project: project.name })
+      .map(p => p.title).filter(t => typeof t === 'string' && t.trim());
   } catch (e) {
     logError(`Phase 2m: pending corpus failed (${e.message}) — continuing without it`);
   }
@@ -1258,7 +1540,7 @@ async function advisorPass(compressed, project, sessionId, threadIds = [],
     logError(`Phase 2m: resolution corpus failed (${e.message}) — continuing without it`);
   }
 
-  const transcriptSlice = compressed.slice(0, ADVISOR_TRANSCRIPT_SLICE);
+  const transcriptSlice = recentSlice(compressed, ADVISOR_TRANSCRIPT_SLICE);
 
   const results = await Promise.all(advisors.map(async (advisor) => {
     try {
@@ -1296,6 +1578,11 @@ Output ONLY the JSON array, no other text.`;
       if (dup) {
         suppressed++;
         log(`Phase 2m: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
+        recordSuppression({
+          project: project.name, corpus: dup.corpus,
+          suppressed_title: fullTitle, matched_against: dup.match,
+          session_id: sessionId,
+        });
         continue;
       }
       try {
@@ -1325,6 +1612,414 @@ Output ONLY the JSON array, no other text.`;
 
   log(`Phase 2m: ${filed} advisor finding(s) filed${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
   return { filed };
+}
+
+// ---------------------------------------------------------------------------
+// Session-close extraction lenses (act:4ff2cfb3) — three additions to the
+// transcript pass, decided in the 2026-06-12 ledger walkthrough. Each is the
+// SAME shape as the existing lenses (Phase 2d / Phase 2m): one pinned-sonnet
+// call, structured-JSON output, the shared dedup corpora, a per-lens cap, and
+// one log line per suppression. callFn is injectable for hermetic tests
+// (production omits it → this run's claudeCall).
+//
+//   2n: Raised-but-unhandled — anything the session RAISED but neither did
+//       nor filed (passing promises, side-issues, hanging questions) → inbox.
+//   2o: Skill-candidate — a manual procedure repeated by hand that a skill
+//       would automate → inbox. The skill-discovery extension of the
+//       knowledge-extraction concern (Phase 2d's sibling).
+//   2p: Checklist-catch — a surfaced change-impact check that caught a real
+//       bug → recorded to checklist-stats.json (the catch-recording side of
+//       /debrief's checklist-feedback phase, which dies with debrief; feeds
+//       the audit pruning loop).
+// ---------------------------------------------------------------------------
+
+const RAISED_UNHANDLED_MAX = 5;   // loose-end items filed per session
+const SKILL_CANDIDATE_MAX = 3;    // skill candidates filed per session
+const CHECKLIST_CATCH_MAX = 5;    // catches recorded per session
+const LENS_TRANSCRIPT_SLICE = SINGLE_CALL_TRANSCRIPT_BUDGET; // M2: full recent transcript (was 50_000 front-slice)
+
+// parseLensFindings — shared structured-output parser for the inbox lenses.
+// Extracts the first JSON array from the model text, keeps only entries with
+// a non-empty title, normalizes urgency, caps the count. `extraKeys` carries
+// through lens-specific string fields (e.g. kind, repetition) onto evidence.
+function parseLensFindings(text, { cap, extraKeys = [] } = {}) {
+  const jsonMatch = String(text || '').match(/\[[\s\S]*\]/);
+  if (!jsonMatch) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonMatch[0]);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter(f => f && typeof f.title === 'string' && f.title.trim())
+    .slice(0, cap)
+    .map(f => {
+      const out = {
+        title: f.title.trim(),
+        summary: typeof f.summary === 'string' ? f.summary : '',
+        urgency: ['urgent', 'normal', 'low'].includes(f.urgency) ? f.urgency : 'normal',
+      };
+      for (const k of extraKeys) {
+        if (typeof f[k] === 'string' && f[k].trim()) out[k] = f[k].trim();
+      }
+      return out;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2n: Raised-but-unhandled lens
+// ---------------------------------------------------------------------------
+//
+// Operator framing (2026-06-12): "anything that came up that's unhandled,"
+// NOT just other-project strays. A promise made in passing ("I'll also wire
+// X"), a side-issue noticed and set down, a question asked and never answered
+// — if the session ends with it neither done nor filed, it evaporates. This
+// lens catches it as a low-ceremony inbox item the operator can promote to an
+// action or dismiss. It runs AFTER Phase 2c/2d/2m so its pending corpus
+// already contains this session's completion candidates, extractions, and
+// advisor findings — a loose end one of those already captured is suppressed.
+async function raisedUnhandledLens(compressed, project, sessionId, transcriptPath,
+  threadIds = [], { callFn = claudeCall } = {}) {
+  log('Phase 2n: Raised-but-unhandled lens');
+
+  const systemPrompt = `You are scanning a finished Claude Code session transcript for loose ends: things that were RAISED during the session but were neither completed nor recorded anywhere before it ended. Three kinds:
+
+- "promise" — something the assistant or operator said would be done ("I'll also...", "we should later...", "next we need to...") that never happened this session.
+- "side-issue" — a problem or risk noticed in passing and set aside without being fixed or filed.
+- "open-question" — a question raised that was never answered or resolved.
+
+ONLY surface items that would be LOST if not captured — there is no action, no inbox item, no commit, and no note recording them. Do NOT surface:
+- work that WAS completed (that is not a loose end),
+- durable lessons/decisions/constraints (a separate lens already captures those),
+- "is this action done?" candidates (a separate lens already captures those),
+- routine next-steps that are obvious from the work itself.
+
+Be conservative. SILENCE IS FINE and is the expected common case — most sessions tie off their own loose ends.
+
+Output a JSON array, at most ${RAISED_UNHANDLED_MAX} items: [{"title":"short imperative title","summary":"what was raised and why it would be lost","kind":"promise|side-issue|open-question","urgency":"urgent|normal|low"}]
+Urgency is value-decay speed, not importance: "urgent" only if the loose end loses its value within days. Output ONLY the JSON array. If nothing qualifies, output exactly: [].`;
+
+  let findings = [];
+  try {
+    const response = await callFn(systemPrompt, recentSlice(compressed, LENS_TRANSCRIPT_SLICE));
+    findings = parseLensFindings(response, { cap: RAISED_UNHANDLED_MAX, extraKeys: ['kind'] });
+  } catch (e) {
+    logError(`Phase 2n: Claude scan failed: ${e.message}`);
+    return { queued: 0 };
+  }
+  if (findings.length === 0) {
+    log('Phase 2n: No unhandled items raised');
+    return { queued: 0 };
+  }
+
+  const { memoryTitles, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
+    buildExtractionCorpora(project, { phase: 'Phase 2n' });
+
+  let queued = 0;
+  let suppressed = 0;
+  for (const f of findings) {
+    const fullTitle = `unhandled: ${f.title}`;
+    const dup = isDuplicate(fullTitle, f.summary, memoryTitles, pendingTitles,
+      { ...resolutionTitles, threadCursorLines: cursorLines });
+    if (dup) {
+      suppressed++;
+      log(`Phase 2n: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
+      recordSuppression({
+        project: project.name, corpus: dup.corpus,
+        suppressed_title: fullTitle, matched_against: dup.match,
+        session_id: sessionId,
+      });
+      continue;
+    }
+    try {
+      createItem({
+        project: project.name,
+        project_path: project.path,
+        ...(project.unresolved ? { project_unresolved: true } : {}),
+        category: 'raised-unhandled',
+        urgency: f.urgency,
+        title: fullTitle,
+        summary: f.summary,
+        context_anchor: `session ${sessionId}`,
+        evidence: {
+          kind: f.kind || 'side-issue',
+          session_id: sessionId,
+        },
+        options: [
+          { key: 'create-action', label: 'Create an action to handle it' },
+          { key: 'keep', label: 'Keep as a reminder' },
+          { key: 'dismiss', label: 'Dismiss (already handled or not worth it)' },
+        ],
+        filed_by: 'ring3-close',
+        transcript_ref: { path: transcriptPath, line_range: null },
+        thread_ids: threadIds,
+      });
+      queued++;
+    } catch (e) {
+      logError(`Phase 2n: Failed to queue loose end: ${e.message}`);
+    }
+  }
+
+  log(`Phase 2n: ${queued} loose end(s) queued${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
+  return { queued };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2o: Skill-candidate lens
+// ---------------------------------------------------------------------------
+//
+// The skill-discovery extension of the knowledge-extraction concern (Phase
+// 2d's sibling): when the session shows the operator performing the SAME
+// multi-step manual procedure more than once by hand, a Claude Code skill or
+// slash-command would have automated it. Surface it as a "should this become
+// a skill?" inbox item. Same dedup discipline as every other lens.
+async function skillCandidateLens(compressed, project, sessionId, transcriptPath,
+  threadIds = [], { callFn = claudeCall } = {}) {
+  log('Phase 2o: Skill-candidate lens');
+
+  const systemPrompt = `You are scanning a finished Claude Code session transcript for REPEATED MANUAL PROCEDURES that should become a reusable Claude Code skill (slash-command). Look for a multi-step sequence the operator or assistant performed BY HAND two or more times, or an ad-hoc procedure clearly done routinely, where a skill would have automated it.
+
+A real candidate has:
+- a repeated, multi-step shape (not a one-off, not a single command),
+- a clear name for what the procedure accomplishes,
+- evidence in THIS transcript that it recurred or is recurring manual toil.
+
+Do NOT surface:
+- procedures already covered by an existing skill (if a skill was invoked, it is not a candidate),
+- one-time sequences with no sign of repetition,
+- generic advice ("you could write a script") with no concrete repeated procedure observed.
+
+Be conservative. SILENCE IS FINE and is the expected common case.
+
+Output a JSON array, at most ${SKILL_CANDIDATE_MAX} items: [{"title":"the procedure as a skill name","summary":"what the procedure does and why a skill fits","repetition":"the evidence it recurred this session","urgency":"urgent|normal|low"}]
+Skill candidates are durable — they are almost never urgent. Output ONLY the JSON array. If nothing qualifies, output exactly: [].`;
+
+  let findings = [];
+  try {
+    const response = await callFn(systemPrompt, recentSlice(compressed, LENS_TRANSCRIPT_SLICE));
+    findings = parseLensFindings(response, { cap: SKILL_CANDIDATE_MAX, extraKeys: ['repetition'] });
+  } catch (e) {
+    logError(`Phase 2o: Claude scan failed: ${e.message}`);
+    return { queued: 0 };
+  }
+  if (findings.length === 0) {
+    log('Phase 2o: No skill candidates detected');
+    return { queued: 0 };
+  }
+
+  const { memoryTitles, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
+    buildExtractionCorpora(project, { phase: 'Phase 2o' });
+
+  let queued = 0;
+  let suppressed = 0;
+  for (const f of findings) {
+    const fullTitle = `skill-candidate: ${f.title}`;
+    const dup = isDuplicate(fullTitle, f.summary, memoryTitles, pendingTitles,
+      { ...resolutionTitles, threadCursorLines: cursorLines });
+    if (dup) {
+      suppressed++;
+      log(`Phase 2o: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
+      recordSuppression({
+        project: project.name, corpus: dup.corpus,
+        suppressed_title: fullTitle, matched_against: dup.match,
+        session_id: sessionId,
+      });
+      continue;
+    }
+    try {
+      createItem({
+        project: project.name,
+        project_path: project.path,
+        ...(project.unresolved ? { project_unresolved: true } : {}),
+        category: 'skill-candidate',
+        urgency: f.urgency,
+        title: fullTitle,
+        summary: f.repetition ? `${f.summary}\n\nObserved repetition: ${f.repetition}` : f.summary,
+        context_anchor: `session ${sessionId}`,
+        evidence: {
+          repetition: f.repetition || '',
+          session_id: sessionId,
+        },
+        options: [
+          { key: 'draft-skill', label: 'Draft a skill for it' },
+          { key: 'dismiss', label: 'Dismiss (not worth a skill)' },
+        ],
+        filed_by: 'ring3-close',
+        transcript_ref: { path: transcriptPath, line_range: null },
+        thread_ids: threadIds,
+      });
+      queued++;
+    } catch (e) {
+      logError(`Phase 2o: Failed to queue skill candidate: ${e.message}`);
+    }
+  }
+
+  log(`Phase 2o: ${queued} skill candidate(s) queued${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
+  return { queued };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2p: Checklist-catch detection
+// ---------------------------------------------------------------------------
+//
+// The catch-recording side of /debrief's checklist-feedback phase, re-homed
+// to the background close pass (the interactive sharpening side cannot move
+// to a ring — it needs operator approval — but the automatic catch tally can,
+// and must, since debrief is being retired). When the transcript shows a
+// surfaced change-impact check actually caught a real bug, append it to the
+// dimension's `catches` in checklist-stats.json. Those catches are the
+// evidence the audit checklist-pruning phase weighs to keep a dimension alive.
+//
+// Gating: silent no-op unless the project opted into the checklist
+// (qa-dimensions.yaml present). Fail-open everywhere — losing a data point is
+// fine; blocking the close pass over bookkeeping is not.
+
+// extractDimensionNames — pull the top-level dimension keys out of
+// qa-dimensions.yaml WITHOUT a YAML dependency (the close pass runs in a bare
+// Node process; minimal-dependency footprint is intentional). The keys are
+// the 2-space-indented `name:` lines under the top-level `dimensions:` map.
+// Comments and deeper-nested keys (paths/severity/checks and list entries)
+// are excluded. Returns [] if the file has no parseable dimensions block.
+function extractDimensionNames(yamlText) {
+  const lines = String(yamlText || '').split('\n');
+  let inDimensions = false;
+  const names = [];
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, '');
+    const noComment = line.replace(/\s+#.*$/, '');
+    if (!noComment.trim()) continue;
+    // Top-level key (no leading indent).
+    const topLevel = /^(\S[^:]*):\s*$/.exec(noComment);
+    if (topLevel) {
+      inDimensions = topLevel[1].trim() === 'dimensions';
+      continue;
+    }
+    if (!inDimensions) continue;
+    // A dimension name is a key indented exactly two spaces with nothing but
+    // the colon after it (its paths/severity/checks nest four spaces deeper).
+    const dim = /^ {2}([A-Za-z0-9][\w.-]*):\s*$/.exec(noComment);
+    if (dim) names.push(dim[1]);
+  }
+  return names;
+}
+
+// recordChecklistCatches — write the catches into checklist-stats.json per the
+// schema's write protocol (bootstrap-if-absent, move-aside-if-corrupt, atomic
+// temp+rename). Catches are append-only evidence; we dedup only same-day
+// identical entries (dimension+check+note+date) so a re-run can't double-count
+// — the schema is explicit that counts are honest, not precise, so no heavier
+// dedup. Returns the number of catches actually appended.
+function recordChecklistCatches(projectPath, catches, { date } = {}) {
+  const today = date || new Date().toISOString().slice(0, 10);
+  const statsPath = join(projectPath, '.claude', 'cabinet', 'checklist-stats.json');
+
+  let stats;
+  if (existsSync(statsPath)) {
+    try {
+      stats = JSON.parse(readFileSync(statsPath, 'utf8'));
+    } catch {
+      // Unparseable — move aside (never delete), bootstrap fresh.
+      try {
+        renameSync(statsPath, `${statsPath}.corrupt-${today}`);
+        logError(`Phase 2p: checklist-stats.json unparseable — moved aside to checklist-stats.json.corrupt-${today}`);
+      } catch (e) {
+        logError(`Phase 2p: checklist-stats.json unparseable and could not be moved aside (${e.message}) — skipping`);
+        return 0;
+      }
+      stats = null;
+    }
+  }
+  if (!stats || typeof stats !== 'object') {
+    stats = { schema_version: 1, runs: 0, dimensions: {}, pruning_reviews: [] };
+  }
+  if (!stats.dimensions || typeof stats.dimensions !== 'object') stats.dimensions = {};
+
+  let appended = 0;
+  for (const c of catches) {
+    const dim = stats.dimensions[c.dimension]
+      || (stats.dimensions[c.dimension] = { fires: 0, last_fired: null, catches: [] });
+    if (!Array.isArray(dim.catches)) dim.catches = [];
+    const already = dim.catches.some(
+      e => e && e.date === today && e.check === c.check && e.note === c.note);
+    if (already) continue;
+    dim.catches.push({ date: today, check: c.check, note: c.note });
+    appended++;
+  }
+
+  if (appended === 0) return 0;
+  try {
+    atomicWrite(statsPath, stats);
+  } catch (e) {
+    logError(`Phase 2p: checklist-stats.json write failed (${e.message}) — catch evidence lost, continuing`);
+    return 0;
+  }
+  return appended;
+}
+
+async function checklistCatchLens(compressed, project, sessionId, { callFn = claudeCall, date } = {}) {
+  log('Phase 2p: Checklist-catch detection');
+
+  const yamlPath = join(project.path, '.claude', 'cabinet', 'qa-dimensions.yaml');
+  if (!existsSync(yamlPath)) {
+    log('Phase 2p: No qa-dimensions.yaml (checklist not opted in), skipping');
+    return { recorded: 0 };
+  }
+  let dimensionNames = [];
+  try {
+    dimensionNames = extractDimensionNames(readFileSync(yamlPath, 'utf8'));
+  } catch (e) {
+    logError(`Phase 2p: could not read qa-dimensions.yaml (${e.message}) — skipping`);
+    return { recorded: 0 };
+  }
+  if (dimensionNames.length === 0) {
+    logError('Phase 2p: qa-dimensions.yaml has no parseable dimensions — skipping (fail-open)');
+    return { recorded: 0 };
+  }
+
+  const systemPrompt = `You are inspecting a finished Claude Code session transcript for CHANGE-IMPACT CHECKLIST CATCHES. The project has a change-impact checklist organized into these dimensions:
+
+${dimensionNames.map(n => `- ${n}`).join('\n')}
+
+During the session, the checklist may have surfaced targeted checks (a "## Change-Impact Checklist" section, with [run] / [review] items grouped by dimension). A CATCH is when one of those SURFACED checks led to a real bug being found and fixed this session — the check did its job.
+
+Report ONLY genuine catches: a surfaced check, a real problem it pointed at, and a fix. Do NOT report:
+- bugs that slipped through (the check did NOT catch them),
+- checks that were surfaced but found nothing,
+- general good practices not tied to a surfaced checklist check.
+
+Each catch must name one of the dimensions listed above EXACTLY. SILENCE IS FINE and is the expected common case — most sessions record no catch.
+
+Output a JSON array, at most ${CHECKLIST_CATCH_MAX} catches: [{"dimension":"exact dimension name","check":"the surfaced check text, quoted","note":"what real problem it caught"}]
+Output ONLY the JSON array. If there were no catches, output exactly: [].`;
+
+  let raw = [];
+  try {
+    const response = await callFn(systemPrompt, recentSlice(compressed, LENS_TRANSCRIPT_SLICE));
+    const jsonMatch = String(response || '').match(/\[[\s\S]*\]/);
+    if (jsonMatch) raw = JSON.parse(jsonMatch[0]);
+  } catch (e) {
+    logError(`Phase 2p: Claude scan failed: ${e.message}`);
+    return { recorded: 0 };
+  }
+  if (!Array.isArray(raw)) return { recorded: 0 };
+
+  const known = new Set(dimensionNames);
+  const catches = raw
+    .filter(c => c && typeof c.dimension === 'string' && typeof c.check === 'string' && typeof c.note === 'string')
+    .map(c => ({ dimension: c.dimension.trim(), check: c.check.trim(), note: c.note.trim() }))
+    .filter(c => c.dimension && c.check && c.note && known.has(c.dimension))
+    .slice(0, CHECKLIST_CATCH_MAX);
+
+  if (catches.length === 0) {
+    log('Phase 2p: No checklist catches detected');
+    return { recorded: 0 };
+  }
+
+  const recorded = recordChecklistCatches(project.path, catches, { date });
+  log(`Phase 2p: ${recorded} checklist catch(es) recorded to checklist-stats.json`);
+  return { recorded };
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,6 +2208,90 @@ function resolveProject(cwd, config) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2q: verify-coverage lens — warns when the session shipped UI changes
+// with no matching .feature edit (drift: the product changed, the walkthrough
+// scenarios didn't). Diff-based (no API call); ports debrief's verify-coverage
+// phase to session close so coverage pressure survives debrief's retirement.
+// /verify update stays the executor; the lens is only the trigger. (act:1be47d42)
+// ---------------------------------------------------------------------------
+
+// Pure: from the session's changed paths, is it UI-touching but scenario-silent?
+export function detectUncoveredUi(changedPaths, uiPaths = VERIFY_UI_PATHS) {
+  const list = Array.isArray(changedPaths) ? changedPaths : [];
+  const touchedUi = list.filter(
+    (p) => typeof p === 'string' && uiPaths.some((u) => p.includes(u)));
+  const touchedFeature = list.some(
+    (p) => typeof p === 'string' && p.endsWith('.feature'));
+  return { uncovered: touchedUi.length > 0 && !touchedFeature, uiPaths: touchedUi };
+}
+
+// Best-effort: first ISO timestamp in the transcript = session start. Returns
+// null if the transcript has no parseable timestamp (the lens then no-ops).
+function sessionStartFromTranscript(transcriptPath) {
+  try {
+    const raw = readFileSync(transcriptPath, 'utf8');
+    for (const line of raw.split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      let o;
+      try { o = JSON.parse(t); } catch { continue; }
+      const ts = o.timestamp || o.time || o.ts;
+      if (typeof ts === 'string' && ts) return ts;
+    }
+  } catch { /* unreadable transcript — no window */ }
+  return null;
+}
+
+// Deps injectable for hermetic tests; production callers omit them. Runs against
+// the RESOLVED project path (a worktree resolves to its main repo), so "shipped"
+// means landed on the integration branch — un-merged worktree work isn't warned
+// on until it merges, which is the correct moment.
+export function verifyCoverageLens(project, sessionStartIso, sessionId, deps = {}) {
+  const runGit = deps.runGit || ((cmd) => safeExec(cmd, { cwd: project.path }));
+  const file = deps.file || createItem;
+  const listPendingItems = deps.listPendingItems || listPending;
+  const hasFeatures = deps.hasFeatures
+    || ((p) => existsSync(join(p, 'e2e', 'features')));
+
+  if (!project?.path || !hasFeatures(project.path)) return { filed: 0 };
+  if (!sessionStartIso) return { filed: 0 };
+
+  const out = runGit(
+    `git log --since=${JSON.stringify(sessionStartIso)} --name-only --pretty=format: --no-renames`) || '';
+  const changed = [...new Set(out.split('\n').map((s) => s.trim()).filter(Boolean))];
+  const { uncovered, uiPaths } = detectUncoveredUi(changed);
+  if (!uncovered) return { filed: 0 };
+
+  // Dedup: one coverage-warning per session.
+  const dup = listPendingItems({ project: project.name, category: 'coverage-warning' })
+    .some((i) => i.evidence?.session_id === sessionId);
+  if (dup) return { filed: 0 };
+
+  const shown = uiPaths.slice(0, 3).join(', ')
+    + (uiPaths.length > 3 ? `, +${uiPaths.length - 3} more` : '');
+  file({
+    project: project.name,
+    project_path: project.path,
+    filed_by: 'ring3-close',
+    category: 'coverage-warning',
+    urgency: 'low',
+    title: 'UI shipped this session without a scenario update',
+    summary: `This session changed UI (${shown}) but touched no .feature file — `
+      + `drift risk: the product changed, the walkthrough scenarios didn't. Run `
+      + `/verify update to propose the matching scenario edits, or accept the drift `
+      + `if the change isn't user-visible.`,
+    context_anchor: `git log --since session start (${sessionId})`,
+    evidence: { session_id: sessionId, ui_paths: uiPaths, session_start: sessionStartIso },
+    options: [
+      { value: 'update', label: 'Update scenarios', description: '/verify update' },
+      { value: 'accept-drift', label: 'Accept drift', description: 'Not user-visible' },
+      { value: 'dismiss', label: 'Dismiss', description: 'Not worth capturing' },
+    ],
+  });
+  return { filed: 1 };
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1663,6 +2442,54 @@ async function main() {
     }
   }
 
+  // Phase 2n: Raised-but-unhandled lens (feature-flagged). Runs after the
+  // filing phases (2c/2d/2m) so its pending corpus already holds this
+  // session's completion candidates, extractions, and advisor findings — a
+  // loose end one of those already captured is suppressed.
+  if (config.defaults?.raised_unhandled_lens !== false) {
+    try {
+      const result = await raisedUnhandledLens(
+        compressed, project, args.sessionId, args.transcriptPath, threadIds);
+      stats.itemsFiled += result.queued;
+    } catch (e) {
+      logError(`Phase 2n failed: ${e.message}`);
+    }
+  }
+
+  // Phase 2o: Skill-candidate lens (feature-flagged).
+  if (config.defaults?.skill_candidate_lens !== false) {
+    try {
+      const result = await skillCandidateLens(
+        compressed, project, args.sessionId, args.transcriptPath, threadIds);
+      stats.itemsFiled += result.queued;
+    } catch (e) {
+      logError(`Phase 2o failed: ${e.message}`);
+    }
+  }
+
+  // Phase 2p: Checklist-catch detection (feature-flagged). Records to the
+  // project-local checklist-stats.json — no inbox item — and silently no-ops
+  // unless the project opted into qa-dimensions.yaml.
+  if (config.defaults?.checklist_catch_lens !== false) {
+    try {
+      await checklistCatchLens(compressed, project, args.sessionId);
+    } catch (e) {
+      logError(`Phase 2p failed: ${e.message}`);
+    }
+  }
+
+  // Phase 2q: verify-coverage lens (feature-flagged; per-project verify gate).
+  // Diff-based — warns when the session shipped UI with no .feature edit.
+  if (config.defaults?.verify_coverage !== false) {
+    try {
+      const r = verifyCoverageLens(
+        project, sessionStartFromTranscript(args.transcriptPath), args.sessionId);
+      stats.itemsFiled += r.filed;
+    } catch (e) {
+      logError(`Phase 2q failed: ${e.message}`);
+    }
+  }
+
   // Phase 2i: Session auto-naming (feature-flagged)
   if (config.defaults?.session_auto_naming !== false) {
     try {
@@ -1758,10 +2585,24 @@ if (isMain) {
 export {
   tokenize,
   isDuplicate,
+  parseMemoryTitles,
+  selectNearbyMemoryTitles,
+  modelRescues,
+  chunkWithOverlap,
+  mergeChunkExtractions,
+  decisionExtraction,
   resolutionCorpus,
   threadCursorLines,
+  buildExtractionCorpora,
   completionReviewEmitGuard,
   discoverSessionAdvisors,
   parseAdvisorFindings,
   advisorPass,
+  // Session-close extraction lenses (act:4ff2cfb3)
+  parseLensFindings,
+  raisedUnhandledLens,
+  skillCandidateLens,
+  extractDimensionNames,
+  recordChecklistCatches,
+  checklistCatchLens,
 };

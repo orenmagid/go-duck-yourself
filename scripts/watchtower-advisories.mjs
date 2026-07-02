@@ -140,10 +140,14 @@ function buildAdvisories(ctx) {
       action: 'This project has an enforcement pipeline but hookify is not installed — it generates hooks from natural language. Install: /plugin install hookify' });
   }
 
-  // Briefing file presence — surface only when ABSENT.
-  if (!has(projectPath, join('.claude', 'briefing', '_briefing.md'))) {
+  // Briefing file presence — surface only when ABSENT. Canonical location is
+  // .claude/cabinet/ (cabinet-member `briefing:` frontmatter + onboard's
+  // generate-briefing.md resolve here); .claude/briefing/ is only where the
+  // installer seeds TEMPLATES, NOT where members read — probing it false-passed
+  // projects whose briefings were stranded there (field-feedback 2026-06-15).
+  if (!has(projectPath, join('.claude', 'cabinet', '_briefing.md'))) {
     list.push({ id: 'briefing-file', kind: 'no-probe', needle: null, signal: 'missing',
-      action: 'No project briefing at .claude/briefing/_briefing.md — cabinet members bootstrap from it. Run /onboard to create one.' });
+      action: 'No project briefing at .claude/cabinet/_briefing.md — cabinet members bootstrap from it. Run /onboard to create one.' });
   }
 
   // Registry orphans — registry entries whose path no longer exists.

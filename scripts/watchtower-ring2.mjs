@@ -15,6 +15,8 @@
 //   - Cross-project memory synthesis (cap 3 evals/run)
 //   - Stale work detection (14d → stale-project, all-done → project-completion)
 //   - Quality pattern detection — routes Ring 3 patterns to cabinet members via inbox
+//   - Cabinet-roster review (occasional, weekly slot): uncovered tech,
+//     dormant skills (reuses scripts/skill-usage.mjs), briefing staleness
 //   - Consumer hooks (subshell, 60s timeout)
 //   - Writes state/memory-health.md, state/work-items.md
 //   - Triggers Ring 1 re-eval (lock/ring1-trigger)
@@ -32,9 +34,16 @@ import {
   atomicWrite, loadConfig, slugify,
   log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
-  currentCursor,
+  currentCursor, VERIFY_UI_PATHS,
+  loadActiveThreads, threadsForItem, suppressionLedgerPath,
 } from './watchtower-lib.mjs';
-import { expireItem } from './watchtower-queue.mjs';
+import { expireItem, listItems } from './watchtower-queue.mjs';
+
+// Shared thread-file reader (single source of truth in watchtower-lib.mjs).
+// Re-exported so ring2's existing tests (ring2-thread-context.test.mjs) keep
+// importing them from this module — the consolidation moved the definitions,
+// not the public surface.
+export { loadActiveThreads, threadsForItem };
 
 const require = createRequire(import.meta.url);
 
@@ -63,22 +72,6 @@ const SLOW_PATTERN_SCAN_CAP = 3;
 
 function log(msg) { _log('ring2', msg); }
 function logError(msg) { _logError('ring2', msg); }
-
-/** Read all queue items (any status) — used for enrichment context lookup. */
-function readAllQueueItems() {
-  const queueDir = join(WATCHTOWER_DIR, 'queue', 'items');
-  if (!existsSync(queueDir)) return [];
-  const items = [];
-  try {
-    for (const entry of readdirSync(queueDir, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-      try {
-        items.push(JSON.parse(readFileSync(join(queueDir, entry.name), 'utf8')));
-      } catch { /* skip */ }
-    }
-  } catch { /* skip */ }
-  return items;
-}
 
 // ---------------------------------------------------------------------------
 // Claude API helper
@@ -338,48 +331,13 @@ async function enrichQueueItems() {
   }
 }
 
-// --- Thread-aware enrichment helpers (pure, exported for tests) ---
+// --- Thread-aware enrichment helpers ---
+// loadActiveThreads + threadsForItem now live in watchtower-lib.mjs (single
+// source of truth, imported + re-exported above). formatThreadContext is
+// ring2-specific prompt rendering, not part of the forked file-reader, so it
+// stays here.
 
-const THREAD_MATCH_CAP = 3;
 const THREAD_FIELD_MAX = 300;
-
-/** Read all active thread files from threadsDir. Corrupt JSON and dormant
- *  threads are skipped; a missing/empty dir yields []. */
-export function loadActiveThreads(threadsDir) {
-  if (!existsSync(threadsDir)) return [];
-  const threads = [];
-  try {
-    for (const entry of readdirSync(threadsDir, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-      try {
-        const thread = JSON.parse(readFileSync(join(threadsDir, entry.name), 'utf8'));
-        if (thread && thread.status === 'active') threads.push(thread);
-      } catch { /* skip corrupt */ }
-    }
-  } catch { /* skip */ }
-  return threads;
-}
-
-/** Match threads to a queue item: explicit item.thread_ids membership OR any
- *  thread session whose project equals slugify(item.project). Explicit matches
- *  rank first, then most recent last_updated; capped at THREAD_MATCH_CAP. */
-export function threadsForItem(item, threads) {
-  const explicitIds = Array.isArray(item.thread_ids) ? item.thread_ids : [];
-  const projectSlug = item.project ? slugify(item.project) : '';
-  const matches = [];
-  for (const thread of threads) {
-    const explicit = explicitIds.includes(thread.thread);
-    const byProject = !!projectSlug &&
-      Array.isArray(thread.sessions) &&
-      thread.sessions.some(s => s && s.project === projectSlug);
-    if (explicit || byProject) matches.push({ thread, explicit });
-  }
-  matches.sort((a, b) => {
-    if (a.explicit !== b.explicit) return a.explicit ? -1 : 1;
-    return new Date(b.thread.last_updated || 0) - new Date(a.thread.last_updated || 0);
-  });
-  return matches.slice(0, THREAD_MATCH_CAP).map(m => m.thread);
-}
 
 /** Render matched threads as prompt context: display_name + current cursor
  *  (what / where_left_off / open_questions), each field truncated to
@@ -429,12 +387,13 @@ async function enrichSingleItem(item) {
 
   // Read project state if available
   if (item.project_path && existsSync(item.project_path)) {
-    // Check for recent resolved decisions in the same project
-    const relatedDecisions = readAllQueueItems().filter(qi =>
-      qi.project === item.project &&
-      qi.status === 'resolved' &&
-      qi.id !== item.id
-    ).slice(0, 5);
+    // Check for recent resolved decisions in the same project. listItems is
+    // the single "read non-pending items" helper in watchtower-queue.mjs;
+    // filtering by project + resolved status here (its filters do the rest).
+    const relatedDecisions = listItems({
+      project: item.project,
+      statuses: ['resolved'],
+    }).filter(qi => qi.id !== item.id).slice(0, 5);
 
     if (relatedDecisions.length > 0) {
       projectContext += '\nRelated resolved decisions:\n';
@@ -1343,7 +1302,471 @@ async function scanAuditPatterns(config) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Consumer hooks (renumbered from 5 — audit pattern detection inserted)
+// 6. Cabinet-roster review (occasional cadence)
+// ---------------------------------------------------------------------------
+// Ledger walkthrough decision 2026-06-12 (act:28fca44e): the slow tier
+// occasionally — a weekly rotation slot, NOT every 30-min run — reviews
+// advisor-roster fitness across the portfolio and files findings as
+// `advisor-finding` inbox items. Three signals:
+//   1. Uncovered tech — technology in a project that no cabinet member covers
+//      (reuses collectCabinetMembers + a bounded tech-signal scan → Claude).
+//   2. Dormant skills — reuses the dead-skill reader (scripts/skill-usage.mjs)
+//      rather than re-deriving the telemetry parse. NOTE: cabinet members are
+//      spawned via the Agent tool (subagent_type), not the Skill tool, so they
+//      do NOT write `skill-invoke` telemetry — the reader excludes them by
+//      design to avoid false "dead member" calls. This signal therefore covers
+//      the operator-invocable skill ecosystem (the part telemetry can measure
+//      reliably); member fitness is judged by coverage + briefing staleness.
+//   3. Briefing staleness — cabinet briefing files left behind while the
+//      project's CLAUDE.md moved on.
+// Bounded: a weekly cadence gate plus a per-project rotation cap keep the
+// Claude cost proportionate. Dedup is vs pending advisor-finding items
+// (one finding per kind per project at a time), matching the sibling
+// stale-project/pattern-promotion convention in this file.
+
+export const ROSTER_REVIEW_INTERVAL_DAYS = 7;   // occasional cadence: weekly slot
+const ROSTER_PROJECT_CAP = 3;                    // ≤3 coverage evals per run
+export const ROSTER_BRIEFING_STALE_DAYS = 45;    // briefing this far behind the project
+const ROSTER_DEP_CAP = 60;                       // cap the tech-signal list sent to Claude
+const ROSTER_DORMANT_LIST_CAP = 12;              // cap dead/stale skills enumerated
+
+// Marker files → human-readable tech label. Markers always survive the
+// ROSTER_DEP_CAP truncation (they are the most coverage-relevant signal).
+const TECH_MARKERS = [
+  ['tsconfig.json', 'typescript'],
+  ['Dockerfile', 'docker'],
+  ['requirements.txt', 'python'],
+  ['pyproject.toml', 'python'],
+  ['Cargo.toml', 'rust'],
+  ['go.mod', 'go'],
+  ['Gemfile', 'ruby'],
+  ['pom.xml', 'java'],
+  ['build.gradle', 'java'],
+  ['composer.json', 'php'],
+  ['railway.toml', 'railway'],
+  ['fly.toml', 'fly.io'],
+  ['next.config.js', 'next.js'],
+  ['svelte.config.js', 'svelte'],
+  ['vite.config.js', 'vite'],
+];
+
+// Static roster-coverage system prompt — exported so tests can assert the
+// COVERAGE OK / GAP output contract stays parseable.
+export const ROSTER_REVIEW_SYSTEM_PROMPT = `You assess whether a project's cabinet of advisor members covers its technology surface. You are given the cabinet roster (each member's name and domain) and the project's detected technology signals (dependencies, frameworks, languages).
+
+Identify technology areas of real significance to the project that NO current member meaningfully covers. Ignore minor utilities, build tooling, and anything a generalist member already implies. A gap must be substantial enough to justify a new advisor seat or an explicit decision not to have one.
+
+Respond in this exact format:
+- If every significant area is covered, respond with a single line: COVERAGE OK
+- Otherwise, one line per gap: GAP: <technology or domain> — <why it matters and which member, if any, comes closest>
+
+Be conservative: prefer COVERAGE OK over speculative gaps. The roster is a small personal cabinet, not an enterprise org chart.`;
+
+/** Cadence gate: true when the roster review is due (never run, unparseable
+ *  timestamp, or last run older than intervalDays). Pure for tests. */
+export function shouldRunRosterReview(state, nowMs, intervalDays = ROSTER_REVIEW_INTERVAL_DAYS) {
+  if (!state || !state.last_run) return true;
+  const last = Date.parse(state.last_run);
+  if (Number.isNaN(last)) return true;
+  return (nowMs - last) >= intervalDays * 86400000;
+}
+
+/** Rotate projects least-recently-reviewed first, capped. Pure for tests. */
+export function selectRosterProjects(projectNames, checkedMap = {}, cap = ROSTER_PROJECT_CAP) {
+  return [...projectNames]
+    .sort((a, b) => (checkedMap[a] || 0) - (checkedMap[b] || 0))
+    .slice(0, cap);
+}
+
+/** Bounded tech-signal scan: package.json deps + marker files → sorted list,
+ *  markers first so they survive the cap. Reads fs; pure given a dir. */
+export function collectTechSignals(projectPath, opts = {}) {
+  const depCap = opts.depCap ?? ROSTER_DEP_CAP;
+  const markers = [];
+  for (const [file, label] of TECH_MARKERS) {
+    if (existsSync(join(projectPath, file))) markers.push(`tech:${label}`);
+  }
+  const deps = [];
+  const pkgPath = join(projectPath, 'package.json');
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+      const all = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+      for (const name of Object.keys(all)) deps.push(`dep:${name}`);
+    } catch { /* unreadable package.json — skip deps */ }
+  }
+  const uniqMarkers = [...new Set(markers)].sort();
+  const uniqDeps = [...new Set(deps)].sort();
+  return [...uniqMarkers, ...uniqDeps].slice(0, depCap);
+}
+
+/** Render the roster + tech signals into the coverage user prompt. */
+export function buildRosterCoveragePrompt(members, techSignals) {
+  const roster = (members || [])
+    .map(m => `- ${m.name}: ${(m.description || '').replace(/\s+/g, ' ').trim().slice(0, 160)}`)
+    .join('\n');
+  const tech = (techSignals || []).join(', ');
+  return `Cabinet roster:\n${roster || '(no members)'}\n\nProject technology signals:\n${tech || '(none detected)'}\n\nWhich significant technology areas does no member cover?`;
+}
+
+/** Parse the model's coverage reply into [{tech, reason}]. COVERAGE OK and any
+ *  non-GAP line yield no entries. Splits tech/reason on the em-dash (or spaced
+ *  hyphen). Pure for tests. */
+export function parseCoverageGaps(text) {
+  const gaps = [];
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    const m = line.match(/^GAP:\s*(.+)/i);
+    if (!m) continue;
+    const parts = m[1].split(/\s+—\s+|\s+-\s+/);
+    const tech = parts[0].trim();
+    if (tech) gaps.push({ tech, reason: (parts.slice(1).join(' — ') || '').trim() });
+  }
+  return gaps;
+}
+
+/** Stale = briefing mtime more than staleDays BEHIND the project reference
+ *  (its CLAUDE.md mtime). Pure over [{name, mtimeMs}]; sorted most-behind
+ *  first. */
+export function detectStaleBriefings(briefingFiles, referenceMtimeMs, staleDays = ROSTER_BRIEFING_STALE_DAYS) {
+  if (!Array.isArray(briefingFiles)) return [];
+  const cutoff = referenceMtimeMs - staleDays * 86400000;
+  return briefingFiles
+    .filter(f => f && typeof f.mtimeMs === 'number' && f.mtimeMs < cutoff)
+    .map(f => ({ name: f.name, ageDaysBehind: Math.floor((referenceMtimeMs - f.mtimeMs) / 86400000) }))
+    .sort((a, b) => b.ageDaysBehind - a.ageDaysBehind);
+}
+
+/** Normalize the dead-skill reader's --json into the dormant-skill finding
+ *  shape: dead names + stale {skill, ageDays}, each capped. Pure for tests. */
+export function parseDormantSkills(readerJson, opts = {}) {
+  const cap = opts.cap ?? ROSTER_DORMANT_LIST_CAP;
+  const obj = readerJson && typeof readerJson === 'object' ? readerJson : {};
+  const dead = (Array.isArray(obj.dead) ? obj.dead : [])
+    .map(d => (d && d.skill) || (typeof d === 'string' ? d : null))
+    .filter(Boolean);
+  const stale = (Array.isArray(obj.stale) ? obj.stale : [])
+    .map(s => (s && s.skill ? { skill: s.skill, ageDays: s.ageDays } : null))
+    .filter(Boolean);
+  return {
+    dead: dead.slice(0, cap),
+    stale: stale.slice(0, cap),
+    days: obj.days || 30,
+    hasFindings: dead.length > 0 || stale.length > 0,
+  };
+}
+
+function groupMembersByProject(members) {
+  const byProject = new Map();
+  for (const m of members) {
+    if (!byProject.has(m.project)) {
+      byProject.set(m.project, { project: m.project, project_path: m.project_path, members: [] });
+    }
+    byProject.get(m.project).members.push(m);
+  }
+  return byProject;
+}
+
+/** One pending advisor-finding of this roster kind for this project already
+ *  exists → don't re-file (reference, not duplicate). */
+function rosterFindingPending(projectName, kind) {
+  return listPending({ project: projectName, category: 'advisor-finding' })
+    .some(qi => qi.evidence?.roster_kind === kind);
+}
+
+function fileRosterFinding({ projectName, projectPath, kind, title, summary, evidence }) {
+  if (rosterFindingPending(projectName, kind)) {
+    log(`Slow: roster ${kind} finding already pending for ${projectName} — not re-filing`);
+    return false;
+  }
+  createItem({
+    project: projectName,
+    project_path: projectPath,
+    filed_by: 'ring2-slow',
+    category: 'advisor-finding',
+    urgency: 'low',
+    title,
+    summary,
+    context_anchor: 'Ring 2 cabinet-roster review',
+    evidence: { roster_kind: kind, ...evidence },
+  });
+  log(`Slow: filed roster ${kind} finding for ${projectName}`);
+  return true;
+}
+
+function collectBriefingFiles(projectPath) {
+  const cabinetDir = join(projectPath, '.claude', 'cabinet');
+  if (!existsSync(cabinetDir)) return [];
+  const files = [];
+  try {
+    for (const entry of readdirSync(cabinetDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^_briefing.*\.md$/.test(entry.name)) continue;
+      try {
+        files.push({ name: entry.name, mtimeMs: statSync(join(cabinetDir, entry.name)).mtimeMs });
+      } catch { /* skip unreadable */ }
+    }
+  } catch { /* skip */ }
+  return files;
+}
+
+function projectReferenceMtime(projectPath, now) {
+  const claudeMd = join(projectPath, 'CLAUDE.md');
+  if (existsSync(claudeMd)) {
+    try { return statSync(claudeMd).mtimeMs; } catch { /* fall through */ }
+  }
+  return now;
+}
+
+/** Default dead-skill reader runner: shells the project's own
+ *  scripts/skill-usage.mjs (CC installs scripts/ at project root). Telemetry
+ *  is global; skills-dir is project-local. Returns parsed JSON or null. */
+function defaultRunSkillUsage(projectPath) {
+  const script = join(projectPath, 'scripts', 'skill-usage.mjs');
+  if (!existsSync(script)) return null;
+  try {
+    const out = execSync(
+      `node "${script}" --json --skills-dir "${join(projectPath, '.claude', 'skills')}"`,
+      { cwd: projectPath, encoding: 'utf8', timeout: 15_000, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    return JSON.parse(out);
+  } catch {
+    return null; // reader missing/failed — dormant signal silently absent this run
+  }
+}
+
+async function reviewOneProjectRoster({ projectName, projectPath, members, ask, runSkillUsage, now }) {
+  if (!projectPath || !existsSync(projectPath)) return;
+
+  // 1. Uncovered tech
+  try {
+    if (!rosterFindingPending(projectName, 'uncovered-tech')) {
+      const techSignals = collectTechSignals(projectPath);
+      if (techSignals.length > 0) {
+        const text = await ask(ROSTER_REVIEW_SYSTEM_PROMPT, buildRosterCoveragePrompt(members, techSignals), 512);
+        const gaps = parseCoverageGaps(text);
+        if (gaps.length > 0) {
+          const summary = `The cabinet may not cover some of this project's technology surface:\n${gaps.map(g => `- ${g.tech}${g.reason ? ` — ${g.reason}` : ''}`).join('\n')}\n\nConsider adding an advisor seat, broadening an existing member, or explicitly deciding the gap is acceptable.`;
+          fileRosterFinding({
+            projectName, projectPath, kind: 'uncovered-tech',
+            title: `Roster coverage gap: ${projectName} (${gaps.length})`,
+            summary,
+            evidence: { gaps, member_count: members.length, signal_count: techSignals.length },
+          });
+        }
+      }
+    }
+  } catch (e) {
+    logError(`Roster coverage check failed for ${projectName}: ${e.message}`);
+  }
+
+  // 2. Stale briefings
+  try {
+    if (!rosterFindingPending(projectName, 'stale-briefing')) {
+      const briefingFiles = collectBriefingFiles(projectPath);
+      const stale = detectStaleBriefings(briefingFiles, projectReferenceMtime(projectPath, now));
+      if (stale.length > 0) {
+        const summary = `Cabinet briefing file(s) haven't been refreshed while the project moved on:\n${stale.map(s => `- ${s.name} (~${s.ageDaysBehind}d behind the project)`).join('\n')}\n\nConsider re-running /onboard or updating the briefings so members reason from current context.`;
+        fileRosterFinding({
+          projectName, projectPath, kind: 'stale-briefing',
+          title: `Stale cabinet briefings: ${projectName} (${stale.length})`,
+          summary,
+          evidence: { stale_briefings: stale },
+        });
+      }
+    }
+  } catch (e) {
+    logError(`Roster briefing check failed for ${projectName}: ${e.message}`);
+  }
+
+  // 3. Dormant skills (reuses the dead-skill reader — see section header note)
+  try {
+    if (!rosterFindingPending(projectName, 'dormant-skill')) {
+      const readerJson = await runSkillUsage(projectPath);
+      if (readerJson) {
+        const dormant = parseDormantSkills(readerJson);
+        if (dormant.hasFindings) {
+          const deadLine = dormant.dead.length ? `Never invoked: ${dormant.dead.join(', ')}` : '';
+          const staleLine = dormant.stale.length
+            ? `Stale (>${dormant.days}d): ${dormant.stale.map(s => `${s.skill} (${s.ageDays}d)`).join(', ')}`
+            : '';
+          const summary = [
+            'The dead-skill reader flags operator-invocable skills that are dormant:',
+            deadLine, staleLine, '',
+            'Consider retiring, consolidating, or adding triggers. (Cabinet members are spawned as agents and do not write skill-invoke telemetry, so this signal is the skill ecosystem, not advisor members.)',
+          ].filter(Boolean).join('\n');
+          fileRosterFinding({
+            projectName, projectPath, kind: 'dormant-skill',
+            title: `Dormant skills: ${projectName} (${dormant.dead.length} dead, ${dormant.stale.length} stale)`,
+            summary,
+            evidence: { dead: dormant.dead, stale: dormant.stale },
+          });
+        }
+      }
+    }
+  } catch (e) {
+    logError(`Roster dormant-skill check failed for ${projectName}: ${e.message}`);
+  }
+}
+
+/** Orchestrator. deps.{ask, runSkillUsage, now} are injectable so tests stay
+ *  hermetic (no Anthropic call, no subprocess). */
+export async function reviewCabinetRoster(config, deps = {}) {
+  const now = deps.now || Date.now();
+  const ask = deps.ask || askClaude;
+  const runSkillUsage = deps.runSkillUsage || defaultRunSkillUsage;
+
+  const statePath = join(WATCHTOWER_DIR, 'state', 'roster-review.json');
+  let state = {};
+  if (existsSync(statePath)) {
+    try { state = JSON.parse(readFileSync(statePath, 'utf8')); } catch { state = {}; }
+  }
+
+  if (!shouldRunRosterReview(state, now)) {
+    log('Slow: cabinet-roster review not due (occasional cadence)');
+    return;
+  }
+
+  const byProject = groupMembersByProject(collectCabinetMembers(config));
+  // Stamp last_run regardless of whether there is work, so the cadence gate
+  // holds even on portfolios with no cabinet-bearing project (no re-scan every
+  // slow run).
+  if (byProject.size === 0) {
+    log('Slow: cabinet-roster review — no cabinet-bearing projects');
+    state.last_run = new Date(now).toISOString();
+    atomicWrite(statePath, JSON.stringify(state, null, 2));
+    return;
+  }
+
+  const checked = state.projects_checked || {};
+  const selected = selectRosterProjects([...byProject.keys()], checked);
+  log(`Slow: cabinet-roster review — ${selected.length} of ${byProject.size} project(s)`);
+
+  for (const projectName of selected) {
+    const { project_path: projectPath, members } = byProject.get(projectName);
+    try {
+      await reviewOneProjectRoster({ projectName, projectPath, members, ask, runSkillUsage, now });
+    } catch (e) {
+      logError(`Roster review failed for ${projectName}: ${e.message}`);
+    }
+    checked[projectName] = now;
+  }
+
+  state.projects_checked = checked;
+  state.last_run = new Date(now).toISOString();
+  atomicWrite(statePath, JSON.stringify(state, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// 7. Verify-plan backfill scan (feature-flagged; gated per-project on verify
+//    being installed = an e2e/features/ dir). Ports orient's verify-backfill
+//    phase to the background: pending plans that touch UI but carry no
+//    `## Verify Plan` section are surfaced as inbox items, so coverage-growth
+//    pressure survives orient's retirement. `/verify backfill` stays the
+//    executor — the ring is only the trigger orient used to be. (act:1be47d42)
+// ---------------------------------------------------------------------------
+
+const VERIFY_BACKFILL_CAP = 5;
+
+// A notes blob is UI-touching when it mentions any UI path. Over-matches by
+// design (a passing comment counts); the operator dispositions false hits.
+export function isUiTouchingNotes(notes, uiPaths = VERIFY_UI_PATHS) {
+  if (typeof notes !== 'string') return false;
+  return uiPaths.some((p) => notes.includes(p));
+}
+
+export function hasVerifyPlan(notes) {
+  return typeof notes === 'string' && notes.includes('## Verify Plan');
+}
+
+// Per-act opt-out: a "## Verify Coverage" section whose first content line is
+// "Skip:" marks the act deliberately backend-only (same convention the orient
+// and debrief phases read).
+export function isVerifyOptedOut(notes) {
+  if (typeof notes !== 'string') return false;
+  return /##\s*Verify Coverage\s*\n\s*Skip:/i.test(notes);
+}
+
+// Pure selector: pending UI-touching rows lacking a Verify Plan and not opted
+// out, oldest-first (rows arrive ORDER BY created ASC), capped.
+export function selectBackfillCandidates(rows, { cap = VERIFY_BACKFILL_CAP, uiPaths } = {}) {
+  return (rows || [])
+    .filter((r) => isUiTouchingNotes(r.notes, uiPaths)
+      && !hasVerifyPlan(r.notes)
+      && !isVerifyOptedOut(r.notes))
+    .slice(0, cap);
+}
+
+const BACKFILL_SQL = `SELECT fid, text, notes FROM actions
+  WHERE completed = 0 AND deleted_at IS NULL
+    AND (notes LIKE '%webapp/frontend/%' OR notes LIKE '%components/%'
+         OR notes LIKE '%pages/%' OR notes LIKE '%app/%')
+    AND notes NOT LIKE '%## Verify Plan%'
+  ORDER BY created ASC`;
+
+// Deps injectable for hermetic tests; production callers omit them.
+export function verifyBackfillScan(config, deps = {}) {
+  const openDb = deps.openDb || openPibDb;
+  const file = deps.file || createItem;
+  const listPendingItems = deps.listPendingItems || listPending;
+  const hasFeatures = deps.hasFeatures
+    || ((p) => existsSync(join(p, 'e2e', 'features')));
+
+  const projects = config.projects || {};
+  let filed = 0;
+  for (const name of Object.keys(projects)) {
+    const projectPath = projects[name].path || projects[name];
+    if (!projectPath || typeof projectPath !== 'string') continue;
+    // Gate: verify installed in this project — nothing to be out of sync with
+    // otherwise. Mirrors the orient phase's first no-op guard.
+    if (!hasFeatures(projectPath)) continue;
+
+    const db = openDb(projectPath);
+    if (!db) continue;
+    let candidates;
+    try {
+      candidates = selectBackfillCandidates(db.prepare(BACKFILL_SQL).all());
+    } catch (e) {
+      logError(`Verify-backfill: query failed for ${name} (${e.message})`);
+      try { db.close(); } catch { /* ignore */ }
+      continue;
+    }
+    try { db.close(); } catch { /* ignore */ }
+    if (candidates.length === 0) continue;
+
+    // Dedup: one pending verify-backfill item per action fid per project.
+    const pendingFids = new Set(
+      listPendingItems({ project: name, category: 'verify-backfill' })
+        .map((i) => i.evidence?.action_fid)
+        .filter(Boolean));
+
+    for (const c of candidates) {
+      if (pendingFids.has(c.fid)) continue;
+      file({
+        project: name,
+        project_path: projectPath,
+        filed_by: 'ring2-slow',
+        category: 'verify-backfill',
+        urgency: 'low',
+        title: `Verify-plan backfill: ${(c.text || c.fid).slice(0, 56)}`,
+        summary: `Pending plan ${c.fid} touches UI but has no "## Verify Plan" section. `
+          + `Run /verify backfill ${c.fid} to draft it interactively, or accept the drift.`,
+        context_anchor: `pib-db action ${c.fid}`,
+        evidence: { action_fid: c.fid, action_text: c.text, project_path: projectPath },
+        options: [
+          { value: 'backfill', label: 'Backfill', description: `/verify backfill ${c.fid}` },
+          { value: 'accept-drift', label: 'Accept drift', description: 'Backend-only / not user-visible' },
+          { value: 'dismiss', label: 'Dismiss', description: 'Not worth capturing' },
+        ],
+      });
+      filed += 1;
+    }
+  }
+  if (filed > 0) log(`Slow: verify-backfill filed ${filed} candidate(s)`);
+  return { filed };
+}
+
+// ---------------------------------------------------------------------------
+// 8. Consumer hooks (renumbered: roster review at 6, verify-backfill at 7)
 // ---------------------------------------------------------------------------
 
 function runSlowConsumerHooks(config, slowState) {
@@ -1378,7 +1801,7 @@ function runSlowConsumerHooks(config, slowState) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Trigger Ring 1 re-eval
+// 8. Trigger Ring 1 re-eval
 // ---------------------------------------------------------------------------
 
 function triggerRing1Reeval() {
@@ -1395,6 +1818,196 @@ function triggerRing1Reeval() {
 // ---------------------------------------------------------------------------
 // Slow tier main
 // ---------------------------------------------------------------------------
+
+// ===================================================================
+// Recall over-suppression canary (M5, act:6354a9db pt2)
+// ===================================================================
+//
+// Reads the STRUCTURED suppression-ledger sidecar (never the human prose
+// logs — format-coupling = silent failure) and surfaces whether Ring 3's
+// knowledge-capture dedup is OVER-suppressing. Over-suppression ONLY: it is
+// blind to M2 under-extraction (the ledger sees what dedup KILLED, not what
+// extraction never proposed); that blindness is stated in its own output and
+// guarded structurally upstream (M2). Names its reader — writes
+// state/recall-canary.json, which Ring 1 renders into the per-project Standing
+// Issues, which /briefing's State-file-flags reader surfaces (no write-only
+// telemetry). Guards (boundary-man): total===0 ⇒ no alert; a minimum
+// denominator before a rate can fire; window by record timestamp; baseline =
+// the FIRST captured (post-M1a) rate, else it would alert on its own fix.
+
+const CANARY_WINDOW_DAYS = 14;       // rate computed over this trailing window
+const CANARY_RETENTION_DAYS = 60;    // ledger pruned to this on each run
+const CANARY_MIN_DENOMINATOR = 10;   // suppressed+filed below this ⇒ no rate
+const CANARY_MARGIN_RATE = 0.15;     // rate must exceed baseline by this to alert
+const CANARY_MIN_ALERT_RATE = 0.30;  // and be at least this in absolute terms
+const CANARY_SAMPLE_CAP = 5;         // suppressed titles shown for human eyeball
+
+export function readLedgerRecords(watchtowerDir) {
+  const path = suppressionLedgerPath(watchtowerDir);
+  if (!existsSync(path)) return [];
+  let raw;
+  try { raw = readFileSync(path, 'utf8'); } catch { return []; }
+  const out = [];
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    try { out.push(JSON.parse(t)); } catch { /* skip a corrupt line */ }
+  }
+  return out;
+}
+
+export function withinDays(ts, nowMs, days) {
+  const t = Date.parse(ts);
+  if (Number.isNaN(t)) return false;   // undated records drop out (safe direction)
+  return (nowMs - t) <= days * 24 * 60 * 60 * 1000;
+}
+
+// buildRecallCanary — PURE. Given windowed-or-full ledger records + pre-gathered
+// per-project inbox stats / corpus sizes / prior baselines, compute the canary
+// state. The alert is conservative by construction (guards above); a human
+// eyeballs the content sample to judge whether suppressions look WRONG — rate
+// alone can't tell "more correct dups" from "more wrongly-killed".
+export function buildRecallCanary(records, opts = {}) {
+  const {
+    nowMs, windowDays = CANARY_WINDOW_DAYS,
+    inboxStats = {}, corpusSizes = {}, priorBaselines = {},
+    minDenominator = CANARY_MIN_DENOMINATOR,
+    marginRate = CANARY_MARGIN_RATE, minAlertRate = CANARY_MIN_ALERT_RATE,
+    sampleCap = CANARY_SAMPLE_CAP,
+  } = opts;
+  const round = (n) => Math.round(n * 1000) / 1000;
+  const windowed = records.filter(r => withinDays(r.ts, nowMs, windowDays));
+  const byProject = {};
+  for (const r of windowed) {
+    const p = r.project || '(unresolved)';
+    (byProject[p] = byProject[p] || []).push(r);
+  }
+  const projects = {};
+  for (const [name, recs] of Object.entries(byProject)) {
+    const suppressed = recs.length;
+    const byCorpus = {};
+    for (const r of recs) {
+      const c = r.corpus || 'unknown';
+      byCorpus[c] = (byCorpus[c] || 0) + 1;
+    }
+    const stats = inboxStats[name] || { filed: 0, approved: 0, dismissed: 0 };
+    const filed = stats.filed || 0;
+    const denominator = suppressed + filed;
+    const rate = denominator > 0 ? suppressed / denominator : 0;
+    const decided = (stats.approved || 0) + (stats.dismissed || 0);
+    const approvalRate = decided > 0 ? stats.approved / decided : null;
+    const netDurablySaved = approvalRate != null ? Math.round(filed * approvalRate) : null;
+    const baseline = priorBaselines[name];
+    let alert = false;
+    if (suppressed > 0 && denominator >= minDenominator && baseline != null) {
+      alert = rate > baseline + marginRate && rate >= minAlertRate;
+    }
+    projects[name] = {
+      suppressed, filed,
+      rate: round(rate),
+      // First run captures the post-fix baseline; later runs carry it forward
+      // (a drift from the post-M1a steady state is what fires, not the fix).
+      baseline: baseline != null ? baseline : round(rate),
+      by_corpus: byCorpus,
+      corpus_size: corpusSizes[name] != null ? corpusSizes[name] : null,
+      approval_rate: approvalRate != null ? round(approvalRate) : null,
+      net_durably_saved: netDurablySaved,
+      sample: recs.slice(0, sampleCap).map(r => ({
+        title: r.suppressed_title, matched: r.matched_against, corpus: r.corpus,
+      })),
+      alert,
+    };
+  }
+  return {
+    generated_at: new Date(nowMs).toISOString(),
+    window_days: windowDays,
+    note: 'over-suppression detector only — blind to M2 under-extraction',
+    projects,
+  };
+}
+
+// memoryIndexSize — approximate count of memory-index entries (lines linking a
+// .md file). Contextualizes the suppression rate (rising rate with flat corpus
+// = real over-suppression; rising rate with rising corpus = expected). Mirrors
+// loadMemoryTitles' path encoding; best-effort, never throws.
+function memoryIndexSize(projectPath) {
+  try {
+    const encoded = projectPath.replace(/\//g, '-');
+    const indexPath = join(homedir(), '.claude', 'projects', encoded, 'memory', 'MEMORY.md');
+    if (!existsSync(indexPath)) return null;
+    const content = readFileSync(indexPath, 'utf8');
+    return (content.match(/^- .*\]\([^)]*\.md\)/gm) || []).length;
+  } catch { return null; }
+}
+
+// recallCanary — the Ring 2 slow I/O wrapper. Reads + prunes the ledger,
+// gathers per-project inbox stats and corpus sizes, carries baselines forward,
+// writes state/recall-canary.json. Feature-flagged (opt-out).
+export function recallCanary(config, { nowMs = Date.now() } = {}) {
+  const records = readLedgerRecords(WATCHTOWER_DIR);
+  if (records.length === 0) {
+    log('recall canary: ledger empty, nothing to sample');
+    return;
+  }
+
+  // Prune the ledger to the retention window (bounded growth — NOT on the
+  // suppression hot path; the canary cadence is the prune cadence). Atomic.
+  const retained = records.filter(r => withinDays(r.ts, nowMs, CANARY_RETENTION_DAYS));
+  if (retained.length !== records.length) {
+    const body = retained.map(r => JSON.stringify(r)).join('\n');
+    atomicWrite(suppressionLedgerPath(WATCHTOWER_DIR), retained.length ? body + '\n' : '');
+  }
+
+  // Prior baselines from the existing canary file (post-M1a steady state).
+  const canaryPath = join(WATCHTOWER_DIR, 'state', 'recall-canary.json');
+  const priorBaselines = {};
+  if (existsSync(canaryPath)) {
+    try {
+      const prev = JSON.parse(readFileSync(canaryPath, 'utf8'));
+      for (const [name, p] of Object.entries(prev.projects || {})) {
+        if (p && typeof p.baseline === 'number') priorBaselines[name] = p.baseline;
+      }
+    } catch { /* a corrupt prior file just means fresh baselines */ }
+  }
+
+  // Per-project inbox stats + corpus sizes for projects active in the window.
+  const since = new Date(nowMs - CANARY_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const windowProjects = new Set(
+    retained.filter(r => withinDays(r.ts, nowMs, CANARY_WINDOW_DAYS))
+      .map(r => r.project).filter(Boolean));
+  const projCfg = config?.projects || {};
+  const inboxStats = {};
+  const corpusSizes = {};
+  for (const name of windowProjects) {
+    try {
+      const items = listItems({ project: name, category: 'knowledge-extraction', since });
+      let approved = 0, dismissed = 0;
+      for (const it of items) {
+        if (it.status === 'resolved') approved++;
+        else if (it.status === 'dismissed') dismissed++;
+      }
+      inboxStats[name] = { filed: items.length, approved, dismissed };
+    } catch (e) {
+      logError(`recall canary: inbox stats for ${name} failed (${e.message})`);
+      inboxStats[name] = { filed: 0, approved: 0, dismissed: 0 };
+    }
+    const path = projCfg[name] && (projCfg[name].path || projCfg[name]);
+    if (path) {
+      const size = memoryIndexSize(path);
+      if (size != null) corpusSizes[name] = size;
+    }
+  }
+
+  const canary = buildRecallCanary(retained, { nowMs, inboxStats, corpusSizes, priorBaselines });
+  atomicWrite(canaryPath, JSON.stringify(canary, null, 2) + '\n');
+
+  const alerts = Object.entries(canary.projects).filter(([, p]) => p.alert);
+  if (alerts.length) {
+    log(`recall canary: ${alerts.length} over-suppression alert(s) — ${alerts.map(([n]) => n).join(', ')}`);
+  } else {
+    log(`recall canary: ${Object.keys(canary.projects).length} project(s) sampled, no alert`);
+  }
+}
 
 async function runSlow() {
   log('Ring 2 slow tier starting');
@@ -1444,7 +2057,36 @@ async function runSlow() {
     }
   }
 
-  // 6. Consumer hooks
+  // 6. Cabinet-roster review (occasional cadence, feature-flagged). Its own
+  // weekly gate keeps it from firing every slow run; gating here only lets the
+  // operator disable it entirely.
+  if (config.defaults?.roster_review !== false) {
+    try {
+      await reviewCabinetRoster(config);
+    } catch (e) {
+      logError(`Cabinet-roster review failed: ${e.message}`);
+    }
+  }
+
+  // 7. Verify-plan backfill scan (feature-flagged; per-project verify gate).
+  if (config.defaults?.verify_backfill !== false) {
+    try {
+      verifyBackfillScan(config);
+    } catch (e) {
+      logError(`Verify-backfill scan failed: ${e.message}`);
+    }
+  }
+
+  // 8. Recall over-suppression canary (M5, feature-flagged)
+  if (config.defaults?.recall_canary !== false) {
+    try {
+      recallCanary(config);
+    } catch (e) {
+      logError(`Recall canary failed: ${e.message}`);
+    }
+  }
+
+  // 9. Consumer hooks
   try {
     const hookResults = runSlowConsumerHooks(config, slowState);
     slowState.hook_results = hookResults;
@@ -1452,7 +2094,7 @@ async function runSlow() {
     logError(`Consumer hooks failed: ${e.message}`);
   }
 
-  // 7. Trigger Ring 1 re-eval
+  // 8. Trigger Ring 1 re-eval
   triggerRing1Reeval();
 
   slowState.completed_at = new Date().toISOString();

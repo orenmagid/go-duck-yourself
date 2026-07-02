@@ -14,14 +14,17 @@
 //   2. Filesystem — scan reviews/*/triage.json files
 //
 // Environment:
-//   PIB_DB_PATH   — path to SQLite file (default: ./pib.db)
+//   PIB_DB_PATH   — path to SQLite file. Overrides everything; otherwise the
+//                   shared resolver (pib-db-path.mjs) picks main's pib.db in a
+//                   linked worktree, else cwd/pib.db.
 //   REVIEWS_DIR   — path to reviews directory (default: ./reviews)
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
+import { resolvePibDbPath } from './pib-db-path.mjs';
 
-const DB_PATH = process.env.PIB_DB_PATH || join(process.cwd(), 'pib.db');
+const DB_PATH = resolvePibDbPath();
 const REVIEWS_DIR = process.env.REVIEWS_DIR || join(process.cwd(), 'reviews');
 const args = process.argv.slice(2);
 const dbOnly = args.includes('--db-only');

@@ -24,15 +24,18 @@
 //   node scripts/pib-db.mjs triage-history              # Suppression list JSON
 //
 // Environment:
-//   PIB_DB_PATH  — path to SQLite file (default: ./pib.db)
+//   PIB_DB_PATH  — path to SQLite file. Overrides everything. Otherwise the
+//                  path resolver (pib-db-path.mjs) picks main's pib.db when in
+//                  a linked worktree, else cwd/pib.db.
 
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import * as lib from './pib-db-lib.mjs';
+import { resolvePibDbPath } from './pib-db-path.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = process.env.PIB_DB_PATH || join(process.cwd(), 'pib.db');
+const DB_PATH = resolvePibDbPath();
 
 // ---------------------------------------------------------------------------
 // SQLite setup — try better-sqlite3

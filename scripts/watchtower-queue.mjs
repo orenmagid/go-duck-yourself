@@ -4,9 +4,10 @@
 // All writes use atomic temp+rename per watchtower-contracts.md.
 // Queue uses directory listing, not index files (no-index convention).
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, renameSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, renameSync, unlinkSync, realpathSync } from 'fs';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
+import { pathToFileURL } from 'url';
 
 const WATCHTOWER_DIR = process.env.WATCHTOWER_DIR
   || join(process.env.HOME, '.claude-cabinet', 'watchtower');
@@ -93,6 +94,15 @@ const URGENCY_ORDER = { urgent: 0, normal: 1, low: 2 };
 // sin, a silent stamp with no coverage look, is impossible rather than
 // discouraged. Keep all qa-handoff domain knowledge fenced here; the CRUD
 // functions below only call into it.
+//
+// merge_state (evidence.merge_state): a handoff is normally filed AFTER the
+// worktree branch merged ('merged' — the original and default contract). A
+// handoff filed BEFORE the merge (the operator is gating the merge on an
+// in-flight staging deploy) carries 'merge-pending': the skill defers stage-2
+// dispatch and the pickup prompt says "merge then QA" instead of asserting a
+// merge — no more hand-flagging merged_into: "PENDING". The recipient gate is
+// unchanged: a merge-pending handoff still resolves only through a stamped
+// qa_verdict, cited against the post-merge commit once the merge has happened.
 
 const QA_CATEGORY = 'qa-handoff';
 
@@ -126,6 +136,28 @@ export function normalizeQaVerdictToken(raw) {
     const n = parseInt(m[1], 10);
     if (Number.isSafeInteger(n) && n >= 1) return `verified · ${n} gaps filed`;
   }
+  return null;
+}
+
+// The two legal merge states for a qa-handoff item.
+export const QA_MERGE_STATES = ['merged', 'merge-pending'];
+
+/**
+ * Normalize a qa-handoff merge_state token to canonical form.
+ * Absent (null/undefined) defaults to 'merged' — the original contract, where
+ * a handoff was always filed AFTER the worktree branch merged. A handoff filed
+ * before the merge carries 'merge-pending'. Tolerates separator/case drift
+ * (merge_pending, "merge pending", pending, unmerged); returns null only for a
+ * present-but-illegal token, so a typo cannot silently read as 'merged'.
+ * @param {*} raw
+ * @returns {'merged'|'merge-pending'|null}
+ */
+export function normalizeMergeState(raw) {
+  if (raw == null) return 'merged';
+  if (typeof raw !== 'string') return null;
+  const t = raw.normalize('NFKC').trim().toLowerCase().replace(/[\s_]+/g, '-');
+  if (t === 'merged') return 'merged';
+  if (['merge-pending', 'mergepending', 'pending', 'unmerged'].includes(t)) return 'merge-pending';
   return null;
 }
 
@@ -285,6 +317,82 @@ export function emitPatternPromotion({
   });
 }
 
+// --- High-confidence sign-off predicate (bulk-triage batching) ---
+//
+// Most pending items are knowledge-extraction items the rings already DRAFTED
+// (Ring 3 mints a memory `draft_artifact` from the session transcript). These
+// aren't judgment calls — they're SIGN-OFFS on work the system already did.
+// Because each is uniquely titled, title-grouping degrades bulk triage to a
+// per-item walk, burning the same decision fuel on a sign-off as on a hard
+// choice. The predicate below isolates that class so bulk triage can offer it
+// as ONE explicit batch sign-off (still human-confirmed — never auto-resolved;
+// the frozen-at-propose invariant holds because the operator approves the
+// whole batch before any applyBatch write).
+//
+// The signal reuses the SAME "drafts ready" cue the SessionStart context
+// builder already counts (watchtower-build-context.mjs: knowledge-extraction +
+// non-empty draft_artifact) — single source for "the system pre-authored this".
+// An item is held back for individual attention (NOT signed off in a batch)
+// when it is urgent, low-confidence, or carries no pre-drafted artifact —
+// those are the ones that actually want a human look. Gated categories
+// (qa-handoff) are never high-confidence sign-off by construction: they exit
+// only through their own recipient gate.
+
+// Categories whose pre-drafted, normal-priority items are sign-off-shaped.
+// Today only knowledge-extraction (Ring 3's memory drafts). A future
+// pre-drafted category joins here and inherits batch sign-off for free.
+const SIGNOFF_CATEGORIES = new Set(['knowledge-extraction']);
+
+/**
+ * True when an item is a high-confidence SIGN-OFF — pre-drafted work the
+ * system already did, safe to approve as part of an explicit one-shot batch
+ * rather than as its own micro-decision. False for anything that wants an
+ * individual human look (urgent, low-confidence, or no pre-drafted artifact)
+ * and for any gated-category item (those leave only through their own gate).
+ *
+ * Conservative by design: when in doubt the item is surfaced individually.
+ * The operator still confirms the whole batch before any write — this only
+ * decides WHICH items are eligible to ride in a batch sign-off.
+ * @param {object} item
+ * @returns {boolean}
+ */
+export function isHighConfidenceSignoff(item) {
+  if (!item || typeof item !== 'object') return false;
+  if (item.status && item.status !== 'pending') return false;
+  if (GATED_CATEGORIES.has(item.category)) return false;
+  if (!SIGNOFF_CATEGORIES.has(item.category)) return false;
+  // The system must have actually drafted something — a non-empty artifact is
+  // the proof the work is done and only needs a sign-off.
+  if (typeof item.draft_artifact !== 'string' || !item.draft_artifact.trim()) return false;
+  // Urgent items want eyes, not a batch nod.
+  if (item.urgency === 'urgent') return false;
+  // An explicit low-confidence stamp means "look at this one".
+  if (item.confidence === 'low') return false;
+  return true;
+}
+
+/**
+ * Partition pending items into the high-confidence sign-off set (eligible for
+ * a one-shot batch approval) and the individual set (everything that wants a
+ * human look — unusual / low-confidence items AND every gated item). Gated
+ * items are ALWAYS individual: the predicate excludes them, so they can never
+ * leak into the batch, and applyBatch would reject them anyway.
+ *
+ * Pure read helper — no writes, no I/O. Bulk triage uses it to decide what to
+ * offer as a batch vs. one by one; the operator still approves the batch.
+ * @param {Array} items - pending inbox items (e.g. from listPending())
+ * @returns {{signoff: Array, individual: Array}}
+ */
+export function partitionForBatchSignoff(items) {
+  const signoff = [];
+  const individual = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    if (isHighConfidenceSignoff(item)) signoff.push(item);
+    else individual.push(item);
+  }
+  return { signoff, individual };
+}
+
 // --- Exports ---
 
 /**
@@ -312,6 +420,38 @@ export function createItem({
   desk = null,
 }) {
   ensureDir(QUEUE_DIR);
+  // qa-handoff merge_state is structural: a present-but-illegal token is
+  // rejected at the boundary (it can't silently read as 'merged'), and a legal
+  // one is canonicalized. Absent stays absent — readers default to 'merged'
+  // via normalizeMergeState (additive-field discipline, like desk/project_
+  // unresolved). Only qa-handoff items carry it; other categories are untouched.
+  if (category === QA_CATEGORY && evidence && evidence.merge_state !== undefined) {
+    const ms = normalizeMergeState(evidence.merge_state);
+    if (!ms) {
+      throw new Error(`createItem: illegal qa-handoff merge_state ${JSON.stringify(evidence.merge_state)} — must be one of: ${QA_MERGE_STATES.join(' | ')}`);
+    }
+    evidence = { ...evidence, merge_state: ms };
+  }
+  // A 'merged' handoff must reference work actually on main. merge_state
+  // replaced the old hand-flagged `merged_into: "PENDING — not yet merged"`
+  // antipattern, but a producer can still free-text a not-yet-merged marker
+  // into merged_into/merged_commit while leaving merge_state at its 'merged'
+  // default — handing off UNMERGED work the drain is then told to merge
+  // (field incident 2026-06-17). Reject it at the boundary: a pending marker
+  // means the merge has not happened, so the honest state is
+  // merge_state:'merge-pending' (which defers stage-2 dispatch), never a
+  // 'merged' handoff. Pure string check; the drain's Step 0 does the
+  // git-ancestry verification of merged_commit. (act:e859b3a3)
+  if (category === QA_CATEGORY && evidence
+      && normalizeMergeState(evidence.merge_state) === 'merged') {
+    const NOT_YET_MERGED = /\b(pending|unmerged|not[\s-]*yet[\s-]*merged|to[\s-]*be[\s-]*merged|will[\s-]*merge)\b/i;
+    for (const k of ['merged_into', 'merged_commit']) {
+      const v = evidence[k];
+      if (typeof v === 'string' && NOT_YET_MERGED.test(v)) {
+        throw new Error(`createItem: qa-handoff filed as 'merged' but evidence.${k} flags the merge as not yet done (${JSON.stringify(v.slice(0, 60))}) — merge the branch first, or file with merge_state:'merge-pending' (which defers stage-2 dispatch). A 'merged' handoff must reference work actually on main.`);
+      }
+    }
+  }
   const id = generateId();
   const item = {
     schema_version: 1,
@@ -532,8 +672,9 @@ export function listPending({ project, category, urgency, maxAge } = {}) {
 
 /**
  * List inbox items across ALL statuses with optional filters — the single
- * source for "read non-pending items". (Ring 2's private readAllQueueItems
- * fork predates this helper; consolidating it is a separate-lane follow-up.)
+ * source for "read non-pending items". Ring 2's private readAllQueueItems
+ * fork (which predated this helper) was deleted and now reads through this
+ * helper (act:3975348f).
  * @param {object} filters
  * @param {string} [filters.project] - exact match on item.project
  * @param {string} [filters.category] - exact match on item.category
@@ -642,4 +783,201 @@ export function runExpiry({ warnDays = 14, expireDays = 30 } = {}) {
   }
 
   return { warned, expired };
+}
+
+// --- CLI ---
+//
+// watchtower-queue.mjs is primarily a LIBRARY (every other caller `import`s it).
+// It also exposes ONE operator-invoked subcommand — `resolve` — so a qa-handoff
+// verdict can be stamped from a JSON file instead of an inline
+// `node -e '<...>'` whose single-quoted string the shell breaks on apostrophes
+// in justification text (that hazard hit the drain station EVERY time;
+// act:00030e1d). The verdict file is the FULL resolveItem params object
+// {resolution, resolution_type, resolution_notes, qa_verdict} — apostrophes
+// live in resolution_notes AND qa_verdict.confessed_gap.deferred[].justification,
+// so a verdict-only file would leave notes inline and the hazard would survive.
+// The qa_verdict SHAPE itself is single-sourced in the qa-handoff skill's
+// "The recipient gate"; this CLI adds no validation — it reuses resolveItem
+// (and its validateQaVerdict gate) verbatim.
+//
+// Exit policy (operator-invoked → fail LOUD; the INVERSE of the hook-invoked
+// watchtower-snapshot.mjs, which swallows everything with exit 0):
+//   0  resolved (or resolved-but-could-not-read-back-to-confirm)
+//   1  well-formed call could not proceed: item not found, item not pending,
+//      or the recipient gate rejected the verdict (item left pending)
+//   2  malformed INVOCATION: bad args, missing/unreadable/non-JSON/non-object
+//      verdict file, or an unknown top-level key
+// NOTE: this 1/2 mapping is the OPPOSITE of the sibling watchtower-lib.mjs CLI
+// (there 1=usage, 2=operational). The taxonomy here follows the sysexits /
+// argparse convention — 2 means the invocation itself is malformed — and the
+// divergence from watchtower-lib is deliberate, not an oversight.
+
+const RESOLVE_PARAM_KEYS = ['resolution', 'resolution_type', 'resolution_notes', 'qa_verdict'];
+
+class UsageError extends Error {}
+
+/**
+ * Parse `resolve <id> --verdict-file <path>` argv into {id, verdictFile}.
+ * Pure (no I/O) so it is unit-testable. Throws UsageError on any malformed
+ * form — a missing value, an id that looks like a flag, a repeated or unknown
+ * flag, or an extra positional — so the CLI maps every one to exit 2 rather
+ * than silently consuming it and failing later. Accepts both
+ * `--verdict-file <path>` and `--verdict-file=<path>`.
+ * @param {string[]} argv  full process.argv ([node, script, 'resolve', ...])
+ * @returns {{id: string, verdictFile: string}}
+ */
+export function parseResolveArgs(argv) {
+  const args = argv.slice(3); // drop [node, script, 'resolve']
+  let id = null;
+  let verdictFile = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--verdict-file' || a.startsWith('--verdict-file=')) {
+      if (verdictFile !== null) throw new UsageError('--verdict-file given more than once');
+      if (a.startsWith('--verdict-file=')) {
+        verdictFile = a.slice('--verdict-file='.length);
+      } else {
+        verdictFile = args[i + 1];
+        i++;
+      }
+      if (typeof verdictFile !== 'string' || verdictFile === '' || verdictFile.startsWith('-')) {
+        throw new UsageError('--verdict-file requires a path argument');
+      }
+    } else if (a.startsWith('-')) {
+      throw new UsageError(`unknown flag: ${a}`);
+    } else if (id === null) {
+      id = a;
+    } else {
+      throw new UsageError(`unexpected extra argument: ${a}`);
+    }
+  }
+  if (id === null || id.trim() === '') throw new UsageError('missing <id> (the inbox item id, e.g. dec-abcd1234)');
+  if (verdictFile === null) throw new UsageError('missing --verdict-file <path>');
+  return { id, verdictFile };
+}
+
+/**
+ * Run the `resolve` subcommand: read the verdict-params JSON file, call
+ * resolveItem, then read the item back from disk to confirm the stamp. Returns
+ * the process exit code per the policy above; never throws (each failure mode
+ * is mapped to a code with a distinct, non-misleading message).
+ * @param {string[]} argv  full process.argv
+ * @returns {number} exit code
+ */
+export function runResolveCli(argv) {
+  let id;
+  let verdictFile;
+  try {
+    ({ id, verdictFile } = parseResolveArgs(argv));
+  } catch (err) {
+    process.stderr.write(`resolve: ${err.message}\n`);
+    process.stderr.write('usage: watchtower-queue.mjs resolve <id> --verdict-file <path.json>\n');
+    return 2;
+  }
+
+  let raw;
+  try {
+    raw = readFileSync(verdictFile, 'utf8');
+  } catch (err) {
+    process.stderr.write(err.code === 'ENOENT'
+      ? `resolve: verdict file not found: ${verdictFile}\n`
+      : `resolve: cannot read verdict file ${verdictFile}: ${err.message}\n`);
+    return 2;
+  }
+
+  let params;
+  try {
+    params = JSON.parse(raw);
+  } catch (err) {
+    process.stderr.write(`resolve: invalid JSON in ${verdictFile}: ${err.message}\n`);
+    return 2;
+  }
+
+  // typeof null === 'object' AND typeof [] === 'object' — guard both explicitly,
+  // or an array/null file would reach resolveItem and mis-resolve (exit 1)
+  // instead of being caught here as a malformed invocation (exit 2).
+  if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+    process.stderr.write(`resolve: ${verdictFile} must be a JSON object of resolve params {${RESOLVE_PARAM_KEYS.join(', ')}}\n`);
+    return 2;
+  }
+
+  // resolveItem destructures exactly the 4 RESOLVE_PARAM_KEYS and JSON.stringify
+  // drops undefined — so a typo'd key (e.g. resolution_note) would be SILENTLY
+  // dropped, leaving the item resolved with a missing note and no warning. The
+  // non-qa path has no gate at all. Reject unknown keys here so a typo fails
+  // loud instead of vanishing.
+  const unknown = Object.keys(params).filter((k) => !RESOLVE_PARAM_KEYS.includes(k));
+  if (unknown.length > 0) {
+    process.stderr.write(`resolve: unknown key(s) in ${verdictFile}: ${unknown.join(', ')} — allowed: ${RESOLVE_PARAM_KEYS.join(', ')} (an unrecognized key is silently dropped, so this is rejected)\n`);
+    return 2;
+  }
+
+  let item;
+  try {
+    item = resolveItem(id, params);
+  } catch (err) {
+    // Three distinct throw sources, and only the gate's message is safe to echo:
+    if (err.code === 'ENOENT') {
+      // missing item file — friendly, and never leak the absolute queue path.
+      process.stderr.write(`resolve: item ${id} not found\n`);
+    } else if (typeof err.message === 'string' && err.message.startsWith('qa-handoff gate:')) {
+      // recipient-gate rejection (gateError) — names the offending field and
+      // embeds NO item content or path, so surface it verbatim. The item is
+      // left pending (validateQaVerdict throws before the atomicWrite).
+      process.stderr.write(`resolve: ${err.message}\n`);
+    } else {
+      // anything else — a corrupt/wrong-schema item file (readItem) or a write
+      // failure (atomicWrite) — embeds the ABSOLUTE queue path in err.message.
+      // Do NOT echo it; name only the id and the error code.
+      process.stderr.write(`resolve: could not resolve item ${id} (${err.code || 'unexpected error'})\n`);
+    }
+    return 1;
+  }
+
+  if (item === null) {
+    let status = 'not pending';
+    try {
+      const cur = getItem(id);
+      if (cur && cur.status) status = cur.status;
+    } catch { /* best-effort status lookup for the message only */ }
+    process.stderr.write(`resolve: ${id} is not pending (status: ${status}) — an earlier stamp is intact, nothing to do\n`);
+    return 1;
+  }
+
+  // Verify the write by re-reading from disk, not trusting the in-memory return
+  // (verify-your-own-writes). A read-back failure must NOT read as a resolve
+  // failure — the stamp already landed (resolveItem's atomicWrite returned).
+  try {
+    const stored = getItem(id);
+    const token = stored && stored.qa_verdict && stored.qa_verdict.verdict
+      ? stored.qa_verdict.verdict
+      : (stored && stored.resolution) || '(resolved)';
+    const notes = stored && stored.resolution_notes ? 'present' : 'absent';
+    process.stdout.write(`resolved ${id} — verdict: ${token}; resolution_notes: ${notes}\n`);
+  } catch (err) {
+    process.stdout.write(`resolved ${id}, but could not read it back to confirm: ${err.message}\n`);
+  }
+  return 0;
+}
+
+// Entry guard — importing this module must NOT run the CLI (mirrors the ring
+// scripts and watchtower-snapshot.mjs so tests can import the pure functions).
+const isMain = (() => {
+  try {
+    return process.argv[1]
+      && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+})();
+
+if (isMain) {
+  const sub = process.argv[2];
+  if (sub === 'resolve') {
+    process.exit(runResolveCli(process.argv));
+  } else {
+    process.stderr.write(`watchtower-queue.mjs: unknown command ${sub ? `'${sub}'` : '(none)'}\n`);
+    process.stderr.write('usage: watchtower-queue.mjs resolve <id> --verdict-file <path.json>\n');
+    process.exit(2);
+  }
 }
