@@ -104,9 +104,23 @@ const FILED_WINDOW_STATUSES = ['superseded', 'expired'];
 
 // resolution_type buckets. The field is unvalidated free text defaulting to
 // null, so anything outside the documented enum lands in untyped_or_other —
-// counted in the summary, never silently dropped.
-const ENGAGED_TYPES = ['acted-on', 'captured-to-memory', 'deferred'];
-const DISCARDED_TYPES = ['stale', 'noise'];
+// counted in the summary, never silently dropped. Exported so a sibling reader
+// (watchtower-inbox-assessment.mjs) classifies against the SAME vocabulary
+// instead of re-deriving the enum — one classifier, one source.
+export const ENGAGED_TYPES = ['acted-on', 'captured-to-memory', 'deferred'];
+export const DISCARDED_TYPES = ['stale', 'noise'];
+
+// bucketResolution — THE single resolution_type → bucket classifier. Returns
+// 'engaged' | 'discarded' | 'other' ('other' = null/untyped or an
+// out-of-enum value). readInboxView's resolution_mix and the sibling
+// inbox-assessment reader both call this so the trust-ladder buckets are
+// defined once. Pure; null/undefined-safe.
+export function bucketResolution(resolution_type) {
+  const rt = resolution_type || null;
+  if (rt && ENGAGED_TYPES.includes(rt)) return 'engaged';
+  if (rt && DISCARDED_TYPES.includes(rt)) return 'discarded';
+  return 'other';
+}
 
 function safeReadJSON(filePath) {
   try {
@@ -346,9 +360,9 @@ function readInboxView(name, sinceIso) {
       resolution_type: item.resolution_type || null,
       date: item.resolved_at || item.filed_at || null,
     });
-    const rt = item.resolution_type || null;
-    if (rt && ENGAGED_TYPES.includes(rt)) view.resolution_mix.engaged++;
-    else if (rt && DISCARDED_TYPES.includes(rt)) view.resolution_mix.discarded++;
+    const bucket = bucketResolution(item.resolution_type);
+    if (bucket === 'engaged') view.resolution_mix.engaged++;
+    else if (bucket === 'discarded') view.resolution_mix.discarded++;
     else view.resolution_mix.untyped_or_other++;
     view.resolution_mix.total++;
   }

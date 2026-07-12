@@ -192,6 +192,23 @@ else
   printf "  %-22s  —  not yet run\n" "Session capture"
 fi
 
+# Ring 4 — truth reconciliation (doc-drift). Stage-1 is BUILT but its launchd
+# job was never registered (a post-soak follow-up, act:9dbabf14). A built ring
+# must ALWAYS appear in the status surface, or its dormancy is invisible
+# (workflow-cop-0002 / organized-mind-0001). Ring 4 is scheduled iff
+# config.ring_frequencies.ring4 exists (what `/watchtower install` writes
+# alongside the launchd job) — so a stale ring4-health.json from a one-off
+# manual run does NOT read as merely "overdue".
+r4_file="$WATCHTOWER_DIR/state/ring4-health.json"
+r4_freq=$(json_field "$config" ".ring_frequencies?.ring4")
+if [ -z "$r4_freq" ] || [ "$r4_freq" = "undefined" ]; then
+  printf "  %-22s  ⚠  NOT SCHEDULED (built, no launchd job — run \`/watchtower install\`)\n" "Reconciliation"
+elif [ -f "$r4_file" ]; then
+  ring_line "Reconciliation" "$r4_file" "$r4_freq" "$(( r4_freq / 86400 ))d"
+else
+  printf "  %-22s  —  not yet run\n" "Reconciliation"
+fi
+
 # --- Projects ---
 
 echo ""

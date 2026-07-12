@@ -173,13 +173,29 @@ export function migrateClientCopy(db) {
 // Query — run arbitrary SQL
 // ---------------------------------------------------------------------------
 export function query(db, { sql }) {
-  if (sql.trim().toUpperCase().startsWith('SELECT')) {
-    const rows = db.prepare(sql).all();
-    return { rows };
-  } else {
-    db.exec(sql);
-    return { message: 'Done.' };
+  let stmt;
+  try {
+    stmt = db.prepare(sql);
+  } catch (e) {
+    return { error: { message: e.message } };
   }
+  // SECURITY (security-0002): pib_query is READ-ONLY. better-sqlite3's
+  // stmt.reader is the authoritative "does this statement return rows?" gate —
+  // true for SELECT / WITH…SELECT / read PRAGMA / EXPLAIN, false for
+  // INSERT/UPDATE/DELETE/DDL/write-PRAGMA. A non-reader is rejected WITHOUT
+  // executing (prepare compiles but never runs it), so arbitrary writes can no
+  // longer bypass the work-tracker guard and the surface-area/completion gates.
+  // The old `else { db.exec(sql) }` branch was exactly that bypass — the guard's
+  // own recommended escape hatch let you UPDATE/DELETE the actions table freely.
+  if (!stmt.reader) {
+    return {
+      error: {
+        message:
+          'pib_query is read-only — only SELECT statements are allowed. To change data use pib_update_action / pib_complete_action / pib_create_action (they enforce the surface-area and completion gates).',
+      },
+    };
+  }
+  return { rows: stmt.all() };
 }
 
 // ---------------------------------------------------------------------------
@@ -298,10 +314,14 @@ export function updateAction(db, { fid, status, text, tags, notes, due, flagged,
   if (client_generated_at !== undefined) { sets.push('client_generated_at = ?'); params.push(client_generated_at || null); }
   if (client_generated_status !== undefined) { sets.push('client_generated_status = ?'); params.push(client_generated_status || null); }
 
-  // If marking done, also set completed fields
+  // If marking done, also set completed fields; conversely, reopening a done
+  // action to any non-done status must CLEAR the completed flag/timestamp, or
+  // the row is left half-completed (completed=1 with an active status).
   if (status === 'done') {
     sets.push('completed = 1', 'completed_at = ?');
     params.push(new Date().toISOString());
+  } else if (status !== undefined) {
+    sets.push('completed = 0', 'completed_at = NULL');
   }
 
   if (sets.length === 0) {
@@ -309,7 +329,13 @@ export function updateAction(db, { fid, status, text, tags, notes, due, flagged,
   }
 
   params.push(fid);
-  db.prepare(`UPDATE actions SET ${sets.join(', ')} WHERE fid = ?`).run(...params);
+  // Guard the write: a nonexistent/typo'd fid — or a soft-deleted row — touches
+  // zero rows, and a write announced from call success is not a confirmed write
+  // (verify-your-writes). deleted_at IS NULL keeps updates off tombstoned rows.
+  const result = db.prepare(`UPDATE actions SET ${sets.join(', ')} WHERE fid = ? AND deleted_at IS NULL`).run(...params);
+  if (result.changes === 0) {
+    return { error: { message: `Action ${fid} not found (no row updated)` } };
+  }
   return { fid, message: `Updated ${fid}` };
 }
 
@@ -368,6 +394,15 @@ export function updateProject(db, { fid, tags, name, status, notes, client_title
   if (client_body !== undefined) { sets.push('client_body = ?'); params.push(client_body || null); }
   if (client_generated_at !== undefined) { sets.push('client_generated_at = ?'); params.push(client_generated_at || null); }
   if (client_generated_status !== undefined) { sets.push('client_generated_status = ?'); params.push(client_generated_status || null); }
+  // Mirror updateAction: a project moving to done stamps completed_at; any move
+  // OFF done clears it, so a reopened project isn't left with a stale
+  // completion timestamp (data-integrity-0005 — 23 done projects had NULL).
+  if (status === 'done') {
+    sets.push('completed_at = ?');
+    params.push(new Date().toISOString());
+  } else if (status !== undefined) {
+    sets.push('completed_at = NULL');
+  }
   if (sets.length === 0) {
     return { error: { message: 'No fields to update. Use tags, name, status, notes, client_title, client_body, client_generated_at, or client_generated_status.' } };
   }
@@ -455,11 +490,16 @@ export function ingestFindings(db, { runDir }) {
 // Triage
 // ---------------------------------------------------------------------------
 export function triage(db, { findingId, status, notes }) {
-  db.prepare(`
+  const result = db.prepare(`
     UPDATE audit_findings
     SET triage_status = ?, triage_notes = ?, triaged_at = ?
     WHERE id = ?
   `).run(status, notes || null, new Date().toISOString(), findingId);
+  // A typo'd/nonexistent findingId touches zero rows; do not announce a false
+  // 'Triaged' (verify-your-writes — same class as updateAction above).
+  if (result.changes === 0) {
+    return { error: { message: `No audit finding with id ${findingId} (no row triaged)` } };
+  }
   return { findingId, status, message: `Triaged ${findingId} → ${status}` };
 }
 

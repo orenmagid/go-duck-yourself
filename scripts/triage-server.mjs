@@ -50,20 +50,19 @@ function withDrafts(findings) {
 }
 
 function json(res, data, status = 200) {
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  // SECURITY (security-0001): no wildcard CORS — same-origin UI needs none, and
+  // omitting it blocks a cross-origin site from reading responses.
+  res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(data));
 }
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
-  // CORS preflight
+  // No cross-origin support (security-0001): same-origin requests don't
+  // preflight; a cross-origin preflight gets no allow headers back.
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    });
+    res.writeHead(204);
     return res.end();
   }
 
@@ -161,7 +160,7 @@ const server = createServer(async (req, res) => {
 });
 
 await loadDrafts();
-server.listen(PORT, () => {
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`Triage server running at http://localhost:${PORT}`);
   const draftCount = Object.keys(drafts).length;
   if (draftCount) console.log(`Restored ${draftCount} in-progress draft verdict(s) from ${DRAFT_PATH}`);

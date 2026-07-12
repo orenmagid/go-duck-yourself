@@ -80,7 +80,10 @@ function parseFlags(args) {
   for (let i = 0; i < args.length; i++) {
     if (args[i].startsWith('--')) {
       const key = args[i].slice(2);
-      flags[key] = args[i + 1] || true;
+      // `|| true` would coerce an explicit empty value (--tags "") to boolean
+      // true, which better-sqlite3 refuses to bind. Empty string is a valid
+      // value (e.g. stripping all tags); only a MISSING value means boolean flag.
+      flags[key] = args[i + 1] !== undefined ? args[i + 1] : true;
       i++;
     } else {
       positional.push(args[i]);

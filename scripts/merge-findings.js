@@ -18,7 +18,10 @@ import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const SKIP_FILES = new Set(['run-summary.json', 'day-summary.json', 'layer1-results.json', 'triage.json']);
+// deliberation-report.json is written by the deliberative-audit workflow
+// itself (act:faf23e4c) — it is the ranked+annotated salvage artifact, not a
+// per-member finding file; skip it here so it is not re-read as a member.
+const SKIP_FILES = new Set(['run-summary.json', 'day-summary.json', 'layer1-results.json', 'triage.json', 'deliberation-report.json']);
 
 // ---------------------------------------------------------------------------
 // Args

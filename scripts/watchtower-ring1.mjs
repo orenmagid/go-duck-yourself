@@ -32,7 +32,7 @@ import {
   atomicWrite, loadConfig, slugify, log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, resolveItem, loadBetterSqlite3,
   writeProjectStatePreservingRing3, flushFeedbackOutbox, resolveCcSourceRepo,
-  authoredClaudeDirs, claudeChurnIsDisposable,
+  authoredClaudeDirs, claudeChurnIsDisposable, checkMemoryReachability,
 } from './watchtower-lib.mjs';
 import { runRoutinePass } from './watchtower-routines.mjs';
 import { analyze, resolveRoots } from './watchtower-sync.mjs';
@@ -245,6 +245,10 @@ function collectPibState(projectPath) {
 
   const Database = loadBetterSqlite3(projectPath);
   if (!Database) {
+    // No silent failures: this error also renders in the state file and
+    // aggregates into summary attention — a portfolio-wide "No pib-db
+    // data" hid a broken loader for weeks (act:b9414039).
+    logError(`collectPibState ${projectPath}: better-sqlite3 not available from any candidate`);
     return { error: 'better-sqlite3 not available' };
   }
 
@@ -252,13 +256,24 @@ function collectPibState(projectPath) {
   try {
     db = new Database(dbPath, { readonly: true });
   } catch (e) {
-    return { error: `Cannot open pib.db: ${e.message}` };
+    const msg = String(e.message).split('\n')[0];
+    logError(`collectPibState ${projectPath}: cannot open pib.db: ${msg}`);
+    return { error: `Cannot open pib.db: ${msg}` };
   }
 
   try {
-    // Open action count
+    // Non-fatal per-query warnings (surfaced in the state file + logged) — a
+    // bare catch used to swallow a genuinely-broken query (the dead updated_at
+    // stale predicate) for weeks (data-integrity-0001).
+    const pibWarnings = [];
+
+    // Open action count. Use pib-db-lib's CANONICAL predicate
+    // (deleted_at IS NULL AND completed = 0 — see listActions) so Ring 1's
+    // count matches orient/work-tracker exactly. The old status-only filter
+    // counted soft-deleted rows and undercounted deferred, drifting 197 vs the
+    // canonical 186 (data-integrity-0001).
     const openActions = db.prepare(
-      "SELECT COUNT(*) as count FROM actions WHERE status IN ('open', 'in-progress', 'blocked')"
+      'SELECT COUNT(*) as count FROM actions WHERE deleted_at IS NULL AND completed = 0'
     ).get();
 
     // Flagged actions (user-prioritized, still-open work). The LIST — not
@@ -289,22 +304,37 @@ function collectPibState(projectPath) {
       // trigger_condition column may not exist in older schemas
     }
 
-    // Stale projects (no action updated in 14 days)
+    // Stale projects: an active project that still has OPEN work but has
+    // COMPLETED nothing in STALE_DAYS. Mirrors orient's canonical definition
+    // (MAX(completed_at) older than the threshold, or none) using columns that
+    // actually exist. The prior predicate filtered on `a.updated_at`, a column
+    // absent from every schema version and the live DB — so db.prepare() threw
+    // every single tick, the bare catch swallowed it, and staleProjects stayed
+    // [] permanently (data-integrity-0001: the /briefing backlog-hygiene nudge
+    // could never fire).
     const staleThreshold = new Date(Date.now() - STALE_DAYS * 86400000).toISOString().slice(0, 10);
     let staleProjects = [];
     try {
       staleProjects = db.prepare(
-        `SELECT DISTINCT p.fid, p.name FROM projects p
+        `SELECT p.fid, p.name FROM projects p
          WHERE p.status = 'active' AND p.deleted_at IS NULL
-         AND NOT EXISTS (
-           SELECT 1 FROM actions a
-           WHERE a.project_fid = p.fid
-           AND a.updated_at > ?
-           AND a.status IN ('open', 'in-progress')
-         )`
+           AND EXISTS (
+             SELECT 1 FROM actions a
+             WHERE a.project_fid = p.fid AND a.deleted_at IS NULL AND a.completed = 0
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM actions a
+             WHERE a.project_fid = p.fid AND a.deleted_at IS NULL
+               AND a.completed_at IS NOT NULL AND a.completed_at > ?
+           )`
       ).all(staleThreshold);
-    } catch {
-      // best-effort
+    } catch (e) {
+      // SURFACE it — the swallowed error here masked a dead query for weeks
+      // (data-integrity-0001). Now that the predicate uses only stable columns,
+      // a throw means the query is genuinely broken, not a known-absent column.
+      const m = String(e && e.message).split('\n')[0];
+      logError(`collectPibState ${projectPath}: stale-project query failed: ${m}`);
+      pibWarnings.push(`stale-project query failed: ${m}`);
     }
 
     // Completion candidates (all actions done)
@@ -328,12 +358,16 @@ function collectPibState(projectPath) {
     // Per-project breakdown for portfolio pulse
     let projectBreakdown = [];
     try {
+      // open_count uses the same canonical predicate as the total (completed = 0)
+      // so per-project counts sum consistently with it; the JOIN filters
+      // soft-deleted rows so tombstoned actions never inflate the pulse
+      // (data-integrity-0001).
       projectBreakdown = db.prepare(
         `SELECT p.fid, p.name,
-           SUM(CASE WHEN a.status IN ('open','in-progress','blocked') THEN 1 ELSE 0 END) as open_count,
-           SUM(CASE WHEN a.status = 'blocked' THEN 1 ELSE 0 END) as blocked_count
+           SUM(CASE WHEN a.completed = 0 THEN 1 ELSE 0 END) as open_count,
+           SUM(CASE WHEN a.completed = 0 AND a.status = 'blocked' THEN 1 ELSE 0 END) as blocked_count
          FROM projects p
-         LEFT JOIN actions a ON a.project_fid = p.fid
+         LEFT JOIN actions a ON a.project_fid = p.fid AND a.deleted_at IS NULL
          GROUP BY p.fid, p.name`
       ).all();
     } catch {
@@ -368,6 +402,7 @@ function collectPibState(projectPath) {
       overdueActions,
       overdueCount: overdueActions.length,
       projectBreakdown,
+      pibWarnings,
     };
   } finally {
     db.close();
@@ -381,25 +416,13 @@ function collectPibState(projectPath) {
 function checkMemoryIntegrity(projectPath) {
   const encoded = projectPath.replace(/\//g, '-');
   const memDir = join(CLAUDE_HOME, 'projects', encoded, 'memory');
-  const indexPath = join(memDir, 'MEMORY.md');
-
-  if (!existsSync(memDir) || !existsSync(indexPath)) return null;
-
-  try {
-    const indexContent = readFileSync(indexPath, 'utf8');
-    const files = readdirSync(memDir).filter(f => f.endsWith('.md') && f !== 'MEMORY.md');
-    const orphans = files.filter(f => !indexContent.includes(f));
-    const referenced = indexContent.match(/\(([^)]+\.md)\)/g) || [];
-    const missing = referenced
-      .map(r => r.slice(1, -1))
-      .filter(f => f !== 'MEMORY.md' && !existsSync(join(memDir, f)));
-
-    if (orphans.length === 0 && missing.length === 0) return null;
-
-    return { orphans, missing };
-  } catch {
-    return null;
-  }
+  // Reachability, not substring: a file is an orphan only when neither a
+  // direct index line (MEMORY.md or MEMORY-archive.md) nor a region
+  // pointer's glob covers it — the same rule scripts/validate-memory.mjs
+  // enforces. The old filename-substring scan predated region pointers and
+  // the archive index and flagged 203 false orphans while the validator
+  // passed green (act:49cb1c27).
+  return checkMemoryReachability(memDir);
 }
 
 function detectActiveSessions(projectPath) {
@@ -983,12 +1006,19 @@ function assembleSummary(projectStates, config, extraAttention = []) {
     if (ps.memoryIntegrity) {
       const mi = ps.memoryIntegrity;
       if (mi.orphans.length > 0) {
-        attention.push(`${ps.name}: ${mi.orphans.length} orphaned memory file(s) — not indexed in MEMORY.md`);
+        attention.push(`${ps.name}: ${mi.orphans.length} orphaned memory file(s) — not reachable from MEMORY.md (no index line or region pointer)`);
       }
       if (mi.missing.length > 0) {
         attention.push(`${ps.name}: ${mi.missing.length} broken memory reference(s) — indexed but file missing`);
       }
     }
+  }
+  // pib collection errors aggregate to ONE line: they are almost always a
+  // single system-level fault (loader/ABI breakage hits every project at
+  // once), and N identical per-project lines would crowd the attention cap.
+  const pibErrored = projectStates.filter(p => p.pib && p.pib.error);
+  if (pibErrored.length > 0) {
+    attention.unshift(`⚠ pib-db collection failing for ${pibErrored.length} project(s) — ${pibErrored[0].pib.error} (see per-project state files)`);
   }
   if (attention.length === 0) {
     lines.push('Nothing urgent.');
@@ -1151,6 +1181,11 @@ function assembleProjectState(ps) {
     } else {
       lines.push('No open actions.');
     }
+  } else if (ps.pib && ps.pib.error) {
+    // A collection error is not "no data" — the two rendered identically
+    // for weeks while an ABI-poisoned better-sqlite3 broke every project's
+    // collection (act:b9414039).
+    lines.push(`pib-db error: ${ps.pib.error}`);
   } else {
     lines.push('No pib-db data.');
   }
@@ -1196,6 +1231,11 @@ function assembleProjectState(ps) {
   }
   if (ps.pib && ps.pib.completionCandidates && ps.pib.completionCandidates.length > 0) {
     issues.push(`${ps.pib.completionCandidates.length} completion candidate(s)`);
+  }
+  // Non-fatal pib-query warnings — a genuinely-broken query surfaces here
+  // instead of being swallowed by a bare catch (data-integrity-0001).
+  if (ps.pib && ps.pib.pibWarnings && ps.pib.pibWarnings.length > 0) {
+    for (const w of ps.pib.pibWarnings) issues.push(`pib-db query warning: ${w}`);
   }
   // Recall over-suppression canary (M5, act:6354a9db) — render only on alert
   // (the data feed for /briefing's State-file-flags reader). Over-suppression
@@ -1427,7 +1467,7 @@ function main() {
 // pure given an injectable `exec` — the inline call sites bind safeExec to a
 // cwd; the tests bind a runner against a temp git repo (act:6f36cbe2,
 // act:a136b362).
-export { resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine };
+export { resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState };
 
 // Entry guard so tests (and other modules) can import this file's pure
 // helpers without executing main(). realpathSync matters: node

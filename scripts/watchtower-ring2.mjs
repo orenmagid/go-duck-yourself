@@ -36,6 +36,7 @@ import {
   getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
   currentCursor, VERIFY_UI_PATHS,
   loadActiveThreads, threadsForItem, suppressionLedgerPath,
+  recordApiUsage, computeActivitySignature, shouldRunIdlePass, markIdlePassRan,
 } from './watchtower-lib.mjs';
 import { expireItem, listItems } from './watchtower-queue.mjs';
 
@@ -111,6 +112,7 @@ async function askClaude(systemPrompt, userPrompt, maxTokens = 1024) {
     messages: [{ role: 'user', content: userPrompt }],
   });
 
+  recordApiUsage({ ring: 'ring2', model: CLAUDE_MODEL, usage: response.usage }, { watchtowerDir: WATCHTOWER_DIR });
   // Extract text from response
   const textBlocks = response.content.filter(b => b.type === 'text');
   return textBlocks.map(b => b.text).join('\n');
@@ -125,11 +127,18 @@ function openPibDb(projectPath) {
   if (!existsSync(dbPath)) return null;
 
   const Database = loadBetterSqlite3(projectPath);
-  if (!Database) return null;
+  if (!Database) {
+    // Log, never silently null: a swallowed loader failure disabled
+    // deferred-trigger evaluation and stale-work detection portfolio-wide
+    // for weeks with zero trace (act:b9414039).
+    logError(`openPibDb ${projectPath}: better-sqlite3 not available from any candidate`);
+    return null;
+  }
 
   try {
     return new Database(dbPath, { readonly: true });
-  } catch {
+  } catch (e) {
+    logError(`openPibDb ${projectPath}: ${String(e.message).split('\n')[0]}`);
     return null;
   }
 }
@@ -598,11 +607,20 @@ async function runFast() {
   // Check for event-driven trigger (re-run immediately marker)
   checkFastTrigger();
 
-  // 1. Deferred trigger evaluation
-  try {
-    await evaluateDeferredTriggers(config);
-  } catch (e) {
-    logError(`Deferred trigger evaluation failed: ${e.message}`);
+  // 1. Deferred trigger evaluation — idle-gated (act:0f961349): re-evaluating
+  // standing triggers every 5 min when nothing changed was ~1400 wasted Claude
+  // calls/day. Run on session activity or the idle floor; skip otherwise.
+  const _fastSig = computeActivitySignature(WATCHTOWER_DIR);
+  const _dtGate = shouldRunIdlePass('fast-deferred-triggers', { watchtowerDir: WATCHTOWER_DIR, signature: _fastSig });
+  if (_dtGate.run) {
+    try {
+      await evaluateDeferredTriggers(config);
+    } catch (e) {
+      logError(`Deferred trigger evaluation failed: ${e.message}`);
+    }
+    markIdlePassRan('fast-deferred-triggers', { watchtowerDir: WATCHTOWER_DIR, signature: _fastSig });
+  } else {
+    log(`Fast: deferred-trigger eval skipped (${_dtGate.reason})`);
   }
 
   // 2. Queue enrichment
@@ -2025,11 +2043,19 @@ async function runSlow() {
     }
   }
 
-  // 2. Cross-project memory synthesis
-  try {
-    await crossProjectMemorySynthesis(config);
-  } catch (e) {
-    logError(`Cross-project synthesis failed: ${e.message}`);
+  // 2. Cross-project memory synthesis — idle-gated (act:0f961349): re-comparing
+  // memory pairs with no new memories is idle spend. Run on activity/idle-floor.
+  const _slowSig = computeActivitySignature(WATCHTOWER_DIR);
+  const _synGate = shouldRunIdlePass('slow-synthesis', { watchtowerDir: WATCHTOWER_DIR, signature: _slowSig });
+  if (_synGate.run) {
+    try {
+      await crossProjectMemorySynthesis(config);
+    } catch (e) {
+      logError(`Cross-project synthesis failed: ${e.message}`);
+    }
+    markIdlePassRan('slow-synthesis', { watchtowerDir: WATCHTOWER_DIR, signature: _slowSig });
+  } else {
+    log(`Slow: cross-project synthesis skipped (${_synGate.reason})`);
   }
 
   // 3. Stale work detection (feature-flagged)

@@ -3,7 +3,7 @@
     "pib-db": {
       "command": "node",
       "args": [
-        "scripts/pib-db-mcp-server.mjs"
+        "${CLAUDE_PROJECT_DIR:-.}/scripts/pib-db-mcp-server.mjs"
       ]
     }
   }

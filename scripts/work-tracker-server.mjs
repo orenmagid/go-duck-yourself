@@ -12,10 +12,15 @@ import { fileURLToPath } from 'node:url';
 import { basename, dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
 import * as lib from './pib-db-lib.mjs';
+import { resolvePibDbPath } from './pib-db-path.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PREFERRED_PORT = parseInt(process.env.PORT || process.argv.find((_, i, a) => a[i - 1] === '--port') || '3458');
-const DB_PATH = resolve(process.argv.find((_, i, a) => a[i - 1] === '--db') || 'pib.db');
+// --db is the explicit override; otherwise route through the SINGLE pib.db
+// resolver (act:5380d35b) so a linked worktree opens the main checkout's db,
+// exactly like the CLI and MCP server. PIB_DB_PATH is honored inside it.
+const dbFlag = process.argv.find((_, i, a) => a[i - 1] === '--db');
+const DB_PATH = dbFlag ? resolve(dbFlag) : resolvePibDbPath({ cwd: process.cwd(), env: process.env });
 
 if (!existsSync(DB_PATH)) {
   console.error(`Database not found: ${DB_PATH}`);
@@ -23,14 +28,12 @@ if (!existsSync(DB_PATH)) {
   process.exit(1);
 }
 
-// Derive project name from .ccrc.json, package.json, or directory name
+// Derive project name from package.json name, else the directory name.
 function getProjectName() {
-  for (const file of ['.ccrc.json', 'package.json']) {
-    try {
-      const data = JSON.parse(readFileSync(resolve(file), 'utf-8'));
-      if (file === 'package.json' && data.name) return data.name;
-    } catch {}
-  }
+  try {
+    const data = JSON.parse(readFileSync(resolve('package.json'), 'utf-8'));
+    if (data.name) return data.name;
+  } catch {}
   return basename(resolve('.'));
 }
 const PROJECT_NAME = getProjectName();
@@ -40,12 +43,12 @@ db.pragma('journal_mode = WAL');
 lib.migrate(db);
 
 function json(res, data, status = 200) {
-  res.writeHead(status, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-  });
+  // SECURITY (security-0001): no wildcard CORS. The UI is served from this same
+  // origin, so same-origin requests need no CORS headers; omitting
+  // Access-Control-Allow-Origin means a cross-origin site (any page open in the
+  // operator's browser) cannot read pib.db responses or issue a cross-origin
+  // PATCH/POST — its preflight finds no allow-origin to match.
+  res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(data));
 }
 
@@ -59,11 +62,9 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${server.address()?.port || PREFERRED_PORT}`);
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    });
+    // No cross-origin support (security-0001): same-origin requests don't
+    // preflight, and a cross-origin preflight gets no allow headers back.
+    res.writeHead(204);
     return res.end();
   }
 
@@ -227,11 +228,14 @@ const server = createServer(async (req, res) => {
     res.end('Not found');
   } catch (err) {
     console.error(err);
-    json(res, { error: err.message }, 500);
+    // SECURITY (security-0005): return a generic body — better-sqlite3/Node
+    // error messages embed SQL fragments and absolute filesystem paths. The
+    // detail stays in the server-side log above.
+    json(res, { error: 'Internal server error' }, 500);
   }
 });
 
-server.listen(PREFERRED_PORT, () => {
+server.listen(PREFERRED_PORT, '127.0.0.1', () => {
   const actualPort = server.address().port;
   console.log(`Work tracker at http://localhost:${actualPort}`);
   console.log(`Database: ${DB_PATH}`);
@@ -241,7 +245,7 @@ server.listen(PREFERRED_PORT, () => {
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
     console.log(`Port ${PREFERRED_PORT} in use, finding a free port...`);
-    server.listen(0, () => {
+    server.listen(0, '127.0.0.1', () => {
       const actualPort = server.address().port;
       console.log(`Work tracker at http://localhost:${actualPort}`);
       console.log(`Database: ${DB_PATH}`);

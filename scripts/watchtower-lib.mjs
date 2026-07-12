@@ -117,6 +117,148 @@ export function recordSuppression(record = {}, { watchtowerDir, ts } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// API usage ledger (act:df3727a9) — cost visibility for the rings' Claude calls
+// ---------------------------------------------------------------------------
+//
+// The watchtower's Ring 2 + Ring 3 Claude calls run on a separate,
+// credit-metered ANTHROPIC_API_KEY and logged ZERO usage — the blindness that
+// let the 2026-07-05 credit exhaustion go unnoticed for a week. Every SDK
+// response carries `usage`; we append one structured line per call so a rolling
+// token/$ tally is readable. Pricing is an ESTIMATE — the Anthropic Console is
+// authoritative. FAIL-OPEN: a failed append never blocks the caller.
+
+export function apiUsageLedgerPath(watchtowerDir) {
+  return join(watchtowerDir || getWatchtowerDir(), 'state', 'api-usage.jsonl');
+}
+
+// $/token estimate (Anthropic Console authoritative). Sonnet 4.6: $3/M in, $15/M out.
+export const API_PRICING = {
+  'claude-sonnet-4-6': { in: 3e-6, out: 15e-6, cache_write: 3.75e-6, cache_read: 0.3e-6 },
+};
+
+export function recordApiUsage(record = {}, { watchtowerDir, ts } = {}) {
+  try {
+    const path = apiUsageLedgerPath(watchtowerDir);
+    const dir = dirname(path);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const u = record.usage || {};
+    const line = JSON.stringify({
+      ts: ts || record.ts || new Date().toISOString(),
+      ring: record.ring ?? null,
+      model: record.model ?? null,
+      input_tokens: u.input_tokens ?? 0,
+      output_tokens: u.output_tokens ?? 0,
+      cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
+      cache_read_input_tokens: u.cache_read_input_tokens ?? 0,
+    }) + '\n';
+    appendFileSync(path, line);
+  } catch (e) {
+    // Fail-open: never throw out of a Claude call site over a ledger append.
+    try { logError('api-usage-ledger', `append failed (${e.message}) — continuing`); }
+    catch { /* logging itself must never throw the caller */ }
+  }
+}
+
+export function readApiUsageRecords(watchtowerDir) {
+  try {
+    const path = apiUsageLedgerPath(watchtowerDir);
+    if (!existsSync(path)) return [];
+    const out = [];
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      try { out.push(JSON.parse(t)); } catch { /* skip malformed line */ }
+    }
+    return out;
+  } catch { return []; }
+}
+
+// PURE: token totals + $ estimate for records within windowDays of nowMs.
+export function summarizeApiUsage(records, { nowMs = Date.now(), windowDays = 1 } = {}) {
+  const cutoff = nowMs - windowDays * 86400000;
+  let calls = 0, input = 0, output = 0, cacheWrite = 0, cacheRead = 0, cost = 0;
+  const byRing = {};
+  for (const r of records || []) {
+    const t = new Date(r.ts).getTime();
+    if (!Number.isFinite(t) || t < cutoff) continue;
+    const p = API_PRICING[r.model] || API_PRICING['claude-sonnet-4-6'];
+    const c = (r.input_tokens || 0) * p.in + (r.output_tokens || 0) * p.out
+      + (r.cache_creation_input_tokens || 0) * p.cache_write
+      + (r.cache_read_input_tokens || 0) * p.cache_read;
+    calls++; input += r.input_tokens || 0; output += r.output_tokens || 0;
+    cacheWrite += r.cache_creation_input_tokens || 0; cacheRead += r.cache_read_input_tokens || 0;
+    cost += c;
+    const ring = r.ring || 'unknown';
+    byRing[ring] = Math.round(((byRing[ring] || 0) + c) * 100) / 100;
+  }
+  return {
+    window_days: windowDays, calls,
+    input_tokens: input, output_tokens: output,
+    cache_write_tokens: cacheWrite, cache_read_tokens: cacheRead,
+    est_cost_usd: Math.round(cost * 100) / 100, by_ring: byRing,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Ring 2 idle gate (act:0f961349) — skip Claude passes when nothing changed
+// ---------------------------------------------------------------------------
+//
+// Ring 2's Claude passes (deferred-trigger eval, cross-project synthesis) gated
+// on "is there data" but not on "did anything change / is the operator active",
+// re-evaluating the same standing triggers ~1400x/day on idle days for nothing.
+// The activity signature changes ONLY on real session activity (Ring 3 close
+// writes ring3-health.json; SessionStart writes a session snapshot) — NOT on
+// Ring 1's per-tick git-attention rewrite. An idle FLOOR still re-runs each pass
+// every few hours so date/external trigger conditions are never starved.
+
+export const RING2_IDLE_FLOOR_MS = 6 * 60 * 60 * 1000;
+
+export function ring2ActivityStatePath(watchtowerDir) {
+  return join(watchtowerDir || getWatchtowerDir(), 'state', 'ring2-activity.json');
+}
+
+// A string signature of session activity: newest Ring 3 close + the set of
+// session-start snapshots. Changes only when the operator actually works.
+export function computeActivitySignature(watchtowerDir) {
+  const dir = watchtowerDir || getWatchtowerDir();
+  const parts = [];
+  try {
+    const h = join(dir, 'state', 'ring3-health.json');
+    if (existsSync(h)) {
+      const j = JSON.parse(readFileSync(h, 'utf8'));
+      parts.push(String(j.last_run || ''), String(j.session_id || ''));
+    }
+  } catch { /* ignore */ }
+  try {
+    const snapDir = join(dir, 'state', 'session-snapshots');
+    if (existsSync(snapDir)) parts.push(readdirSync(snapDir).sort().join(','));
+  } catch { /* ignore */ }
+  return parts.join('|');
+}
+
+// Returns { run, reason }. Runs when activity changed since the pass last ran,
+// OR the idle floor elapsed, OR it never ran. Read-only — call markIdlePassRan
+// after the pass actually runs.
+export function shouldRunIdlePass(passName, { watchtowerDir, signature, nowMs = Date.now(), idleFloorMs = RING2_IDLE_FLOOR_MS } = {}) {
+  const path = ring2ActivityStatePath(watchtowerDir);
+  let state = {};
+  try { if (existsSync(path)) state = JSON.parse(readFileSync(path, 'utf8')); } catch { state = {}; }
+  const prev = state[passName];
+  if (!prev || !prev.last_run_ms) return { run: true, reason: 'first-run' };
+  if (signature !== (prev.last_signature ?? '')) return { run: true, reason: 'activity' };
+  if ((nowMs - prev.last_run_ms) >= idleFloorMs) return { run: true, reason: 'idle-floor' };
+  return { run: false, reason: 'idle-skip' };
+}
+
+export function markIdlePassRan(passName, { watchtowerDir, signature, nowMs = Date.now() } = {}) {
+  const path = ring2ActivityStatePath(watchtowerDir);
+  let state = {};
+  try { if (existsSync(path)) state = JSON.parse(readFileSync(path, 'utf8')); } catch { state = {}; }
+  state[passName] = { last_run_ms: nowMs, last_signature: signature };
+  try { atomicWrite(path, JSON.stringify(state, null, 2)); } catch { /* fail-open */ }
+}
+
+// ---------------------------------------------------------------------------
 // loadConfig — read and validate config.json with schema_version check
 // ---------------------------------------------------------------------------
 
@@ -490,8 +632,42 @@ export function projectThreadCursorLines(threadsDir, projectSlug) {
 // fresh file is written; the returned outcome string reports it so the
 // caller can log loudly.
 //
+// RELATIONSHIP ENRICHMENT (act:e8793574): two additive, union-deduped fields
+// carry a thread's relationships so a cold session can trace it:
+//   related_fids — pib-db work-item fids (`act:<8hex>`) referenced by the
+//     sessions that advanced this thread (deterministically scanned from the
+//     transcript by ring3-close's extractRelatedFids — never model-authored,
+//     so no hallucinated fid can enter).
+//   lineage      — sibling threads CO-ADVANCED in the same session. When one
+//     session genuinely advances several zoom-level threads (initiative +
+//     project-area + cross-cutting), those threads ARE related; each records
+//     the others. This is the only relation cheap enough to assert
+//     deterministically (co-occurrence in one capture is ground truth, not a
+//     model guess). Entry shape: { slug, relation, session_id, date }.
+// Both are optional-additive at schema_version 2 (like related_fids before
+// them); a 7th arg absent → both default to [] and behavior is unchanged.
+function unionFids(existing, incoming) {
+  const out = Array.isArray(existing) ? existing.filter((x) => typeof x === 'string' && x) : [];
+  const seen = new Set(out);
+  for (const f of Array.isArray(incoming) ? incoming : []) {
+    if (typeof f === 'string' && f && !seen.has(f)) { seen.add(f); out.push(f); }
+  }
+  return out;
+}
+
+function mergeLineage(existing, incoming) {
+  const out = Array.isArray(existing) ? existing.filter((e) => e && typeof e.slug === 'string' && e.slug) : [];
+  const seen = new Set(out.map((e) => e.slug));
+  for (const e of Array.isArray(incoming) ? incoming : []) {
+    if (e && typeof e.slug === 'string' && e.slug && !seen.has(e.slug)) { seen.add(e.slug); out.push(e); }
+  }
+  return out;
+}
+
 // Returns an outcome string: 'created' | 'updated' | 'recovered — …'.
-export function updateThreadFile(threadPath, threadSlug, modelThread, cursorEntry, sessionRecord, now) {
+export function updateThreadFile(
+  threadPath, threadSlug, modelThread, cursorEntry, sessionRecord, now,
+  { relatedFids = [], lineage = [] } = {}) {
   let threadData = null;
   let outcome = 'created';
 
@@ -517,6 +693,9 @@ export function updateThreadFile(threadPath, threadSlug, modelThread, cursorEntr
     threadData.last_updated = now;
     if (!Array.isArray(threadData.sessions)) threadData.sessions = [];
     threadData.sessions.push(sessionRecord);
+    // Additive union-dedup — never wipes what prior sessions accumulated.
+    threadData.related_fids = unionFids(threadData.related_fids, relatedFids);
+    threadData.lineage = mergeLineage(threadData.lineage, lineage);
   } else {
     threadData = {
       schema_version: 2,
@@ -524,7 +703,8 @@ export function updateThreadFile(threadPath, threadSlug, modelThread, cursorEntr
       display_name: modelThread.display_name || threadSlug,
       cursor_history: [cursorEntry],
       sessions: [sessionRecord],
-      related_fids: [],
+      related_fids: unionFids([], relatedFids),
+      lineage: mergeLineage([], lineage),
       last_updated: now,
       status: 'active',
     };
@@ -812,7 +992,22 @@ export function resolveProjectIdentity(cwdOrPath, config, opts = {}) {
 //   2. The project's own node_modules — any project with a pib.db has
 //      better-sqlite3 installed, since pib-db depends on it
 //   3. Nested under create-claude-cabinet in each NODE_PATH entry
-// Returns the Database constructor, or null if no candidate resolves.
+// Returns a VERIFIED Database constructor, or null if no candidate resolves.
+//
+// Verification matters: better-sqlite3 loads its native addon lazily at the
+// first `new Database()`, NOT at require() — so a bare require "succeeds" on
+// a copy whose addon was compiled for a different node ABI (e.g. a stray
+// ~/node_modules install built under the default node, shadowing every
+// healthy copy in the walk-up; act:b9414039). Constructing a throwaway
+// in-memory db forces the addon load inside the per-candidate try, so a
+// poisoned candidate falls through instead of winning and blowing up later
+// in the caller.
+
+export function verifyDatabaseConstructor(Database) {
+  const db = new Database(':memory:');
+  db.close();
+  return Database;
+}
 
 export function loadBetterSqlite3(projectPath) {
   const candidates = [() => require('better-sqlite3')];
@@ -828,12 +1023,95 @@ export function loadBetterSqlite3(projectPath) {
   }
   for (const load of candidates) {
     try {
-      return load();
+      return verifyDatabaseConstructor(load());
     } catch {
       // try the next candidate
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Memory reachability — mirrors scripts/validate-memory.mjs, the
+// authoritative owner of the rule (memory module; contract in
+// cabinet/memory-lifecycle-contract.md). A memory file is reachable when a
+// direct index line references it (MEMORY.md or the linked
+// MEMORY-archive.md cold tier) OR a region pointer's glob covers it.
+// Ring 1's memory-integrity check must apply the SAME rule as the
+// validator or the two contradict each other (act:49cb1c27: the old
+// filename-substring scan flagged 203 false orphans — 172 region-covered
+// + 31 archive-indexed — while the validator passed green). The watchtower
+// runtime cannot import the validator (validate-memory.mjs is not part of
+// the runtime script set), so these helpers are a deliberate mirror, kept
+// in lockstep by the parity test in __tests__/memory-reachability.test.mjs.
+// ---------------------------------------------------------------------------
+
+// Index files are not memory entries — never counted as orphans or missing.
+const NON_MEMORY_INDEX_FILES = new Set(['MEMORY.md', 'MEMORY-archive.md', 'edges.json', '.DS_Store']);
+
+// Extract all `.md` filenames directly referenced from an index file.
+// Both index formats: `- **decisions.md** (56)` and `- [Title](file.md)`.
+export function parseMemoryIndex(indexText) {
+  const refs = new Set();
+  for (const m of indexText.matchAll(/\*\*([a-z0-9_.-]+\.md)\*\*/gi)) refs.add(m[1]);
+  for (const m of indexText.matchAll(/\]\(([a-z0-9_.-]+\.md)\)/gi)) refs.add(m[1]);
+  return refs;
+}
+
+// Parse region pointers: `- region \`lesson_*.md\` → …` lines whose
+// backtick-quoted glob makes a whole class of files reachable.
+export function parseMemoryRegionPointers(indexText) {
+  const pointers = [];
+  for (const m of indexText.matchAll(/^[\s>]*-\s*region\s+`([^`]+)`/gim)) {
+    pointers.push(m[1].trim());
+  }
+  return pointers;
+}
+
+// Convert a region-pointer glob to an anchored RegExp over a bare filename.
+export function memoryGlobToRegex(glob) {
+  const escaped = glob
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+  return new RegExp(`^${escaped}$`);
+}
+
+export function isMemoryFileReachable(name, referenced, regionRegexes) {
+  if (referenced.has(name)) return true;
+  return regionRegexes.some((re) => re.test(name));
+}
+
+// Full check over one memory dir. Returns null when healthy (or when there
+// is nothing to check / the check itself fails — fail-open, matching the
+// prior checkMemoryIntegrity contract), else { orphans, missing }.
+export function checkMemoryReachability(memDir) {
+  const indexPath = join(memDir, 'MEMORY.md');
+  if (!existsSync(memDir) || !existsSync(indexPath)) return null;
+
+  try {
+    const indexText = readFileSync(indexPath, 'utf8');
+    const archivePath = join(memDir, 'MEMORY-archive.md');
+    const archiveText = existsSync(archivePath) ? readFileSync(archivePath, 'utf8') : '';
+
+    const referenced = parseMemoryIndex(indexText);
+    for (const ref of parseMemoryIndex(archiveText)) referenced.add(ref);
+    const regionRegexes = [
+      ...parseMemoryRegionPointers(indexText),
+      ...parseMemoryRegionPointers(archiveText),
+    ].map(memoryGlobToRegex);
+
+    const files = readdirSync(memDir)
+      .filter((f) => f.endsWith('.md') && !NON_MEMORY_INDEX_FILES.has(f));
+    const orphans = files.filter((f) => !isMemoryFileReachable(f, referenced, regionRegexes));
+    const missing = [...referenced]
+      .filter((f) => !NON_MEMORY_INDEX_FILES.has(f) && !existsSync(join(memDir, f)));
+
+    if (orphans.length === 0 && missing.length === 0) return null;
+    return { orphans, missing };
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

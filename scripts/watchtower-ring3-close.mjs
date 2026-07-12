@@ -45,7 +45,7 @@ import {
   getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
   updateThreadFile, currentCursor, resolveProjectIdentity, VERIFY_UI_PATHS,
   projectThreadCursorLines, authoredClaudeDirs, claudeChurnIsDisposable,
-  buildLastSessionBlock, upsertLastSessionSection, recordSuppression,
+  buildLastSessionBlock, upsertLastSessionSection, recordSuppression, recordApiUsage,
   recentSlice,
 } from './watchtower-lib.mjs';
 // Direct queue import (precedent: ring2 imports expireItem this way) —
@@ -151,15 +151,49 @@ async function getAnthropicClient() {
   }
 }
 
+// SYSTEMIC API FAILURE (act:e8793574): when the Anthropic API rejects EVERY
+// call for an account-level reason (billing exhausted, bad key, quota), every
+// knowledge-extraction phase silently produces nothing while Ring 3 still
+// reports health "success" — the exact silent failure that let thread capture
+// die for a week unnoticed (credit balance ran out 2026-07-05; no thread
+// updated after). classifyApiError names those account-level classes so
+// writeHealth can flip to "degraded" and the operator gets a signal. A
+// one-off per-call error (a single malformed transcript) is NOT systemic and
+// returns null.
+export function classifyApiError(err) {
+  if (!err) return null;
+  const status = err.status ?? err.statusCode;
+  const msg = String(err.message || err).toLowerCase();
+  if (/credit balance is too low|billing|payment|purchase credits/.test(msg)) return 'billing';
+  if (status === 401 || status === 403 || /invalid.*api.?key|authentication|unauthorized|permission/.test(msg)) return 'auth';
+  if (status === 429 || /rate limit|quota|too many requests/.test(msg)) return 'rate-limit';
+  if (status === 529 || /overloaded/.test(msg)) return 'overloaded';
+  return null;
+}
+
+// Module-scoped latch: set by claudeCall on the first systemic API error so
+// writeHealth (called once at the end of main) can report degraded health.
+// Reset per process — each Ring 3 invocation is a fresh node process.
+let systemicApiFailure = null;
+
 async function claudeCall(systemPrompt, userMessage) {
   const client = await getAnthropicClient();
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 4096,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: userMessage }],
-  });
-  return response.content[0]?.text || '';
+  try {
+    const response = await client.messages.create({
+      model: MODEL,
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userMessage }],
+    });
+    recordApiUsage({ ring: 'ring3', model: MODEL, usage: response.usage }, { watchtowerDir: WATCHTOWER_DIR });
+    return response.content[0]?.text || '';
+  } catch (e) {
+    const cls = classifyApiError(e);
+    if (cls && !systemicApiFailure) {
+      systemicApiFailure = { type: cls, message: String(e.message || e).slice(0, 300) };
+    }
+    throw e; // phases keep their own fail-open try/catch; the latch is a side-channel
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +485,68 @@ async function sessionSummary(compressed, projectSlug, sessionId) {
 // Phase 2b2: Thread capture
 // ---------------------------------------------------------------------------
 
-async function threadCapture(compressed, projectSlug, sessionId, summary, transcriptPath) {
+// --- Thread-capture tuning (act:e8793574) ----------------------------------
+// The over-eager TAIL: a focused session was sprayed into 6-9 threads with no
+// distinct per-thread contribution. Earned membership is now enforced in code,
+// not just asked of the model:
+//   MAX_THREADS_PER_SESSION — hard ceiling on threads a single close writes.
+//   MIN_CONTRIBUTION_TOKENS — a membership needs a substantive contribution;
+//     a blank/one-word "advanced it" is not earned and is dropped.
+//   CONTRIBUTION_DISTINCT_OVERLAP — the same contribution restated across
+//     threads (spray) is not distinct; the later copy is dropped when it
+//     shares this many meaningful tokens with an already-accepted one.
+const MAX_THREADS_PER_SESSION = 5;
+const MIN_CONTRIBUTION_TOKENS = 2;
+const CONTRIBUTION_DISTINCT_OVERLAP = 3;
+
+// Deterministic, model-independent fid scan: pib-db work-item ids the session
+// referenced (`act:<8hex>`, the FID_PATTERN). Never trusts the model to name a
+// fid — a hallucinated id can't enter related_fids because it isn't parsed
+// from the actual transcript. Deduped, order-preserving.
+const FID_TOKEN_RE = /\bact:[0-9a-f]{8}\b/g;
+export function extractRelatedFids(text) {
+  if (typeof text !== 'string') return [];
+  const seen = new Set();
+  let m;
+  FID_TOKEN_RE.lastIndex = 0;
+  while ((m = FID_TOKEN_RE.exec(text)) !== null) seen.add(m[0]);
+  return [...seen];
+}
+
+// selectEarnedThreads — the tail-tamer. Given the model's proposed threads (in
+// its own order — initiative-first per the prompt), keep only genuinely earned
+// memberships: a substantive contribution (>= MIN_CONTRIBUTION_TOKENS
+// meaningful tokens) that is DISTINCT from every already-accepted contribution
+// (< CONTRIBUTION_DISTINCT_OVERLAP shared meaningful tokens), capped at
+// MAX_THREADS_PER_SESSION. Pure and order-stable so a focused session can no
+// longer be sprayed across 6-9 threads.
+export function selectEarnedThreads(threads, {
+  cap = MAX_THREADS_PER_SESSION,
+  minTokens = MIN_CONTRIBUTION_TOKENS,
+  overlap = CONTRIBUTION_DISTINCT_OVERLAP,
+} = {}) {
+  if (!Array.isArray(threads)) return [];
+  const accepted = [];
+  const acceptedTokenSets = [];
+  for (const t of threads) {
+    if (accepted.length >= cap) break;
+    if (!t || !t.thread || !t.cursor) continue;
+    const mt = meaningfulTokens(typeof t.contribution === 'string' ? t.contribution : '');
+    if (mt.length < minTokens) continue; // no substantive contribution → not earned
+    const sprays = acceptedTokenSets.some((prev) => {
+      let shared = 0;
+      for (const tok of mt) if (prev.has(tok)) shared += 1;
+      return shared >= overlap;
+    });
+    if (sprays) continue; // restatement of an already-claimed contribution
+    accepted.push(t);
+    acceptedTokenSets.push(new Set(mt));
+  }
+  return accepted;
+}
+
+async function threadCapture(compressed, projectSlug, sessionId, summary, transcriptPath,
+  { callFn = claudeCall } = {}) {
   log('Phase 2b2: Thread capture');
 
   const threadsDir = join(WATCHTOWER_DIR, 'state', 'threads');
@@ -502,7 +597,7 @@ Respond with a JSON array. Each element:
 {
   "thread": "short-stable-slug",
   "is_new": true/false,
-  "display_name": "A rich one-line ARTICULATION of what this thread is really about — this is what a human reads. Make it carry the meaning the slug cannot; never just a restatement of the slug. It evolves as understanding deepens.",
+  "display_name": "A DURABLE STORYLINE title for the whole line of work — what this thread IS across all its sessions, not what just happened in this one. 'Watchtower ring reliability and silent-failure hardening', never 'Fixed two Ring 1 bugs today'. A moment-snapshot ('shipped X', 'fixed Y') is wrong; name the ongoing arc. Rich and specific — carry the meaning the slug cannot; never a restatement of the slug. It evolves as understanding deepens, but stays a storyline, never a changelog entry.",
   "contribution": "What THIS session contributed to THIS thread — the reason it belongs here, one line",
   "cursor": {
     "what": "The work stream as you would frame it RIGHT NOW in one line — this evolves across sessions as understanding deepens, even when the work stream is the same",
@@ -516,14 +611,14 @@ Respond with a JSON array. Each element:
 Rules:
 - Return [] for sessions that only did routine operations (orient, debrief, status checks)
 - ALWAYS include the specific initiative thread for real work; add project-area and cross-cutting threads when they genuinely apply
-- Expect SEVERAL threads at different zoom levels — a session touching only one thread is the exception, not the rule
-- Every thread needs a justified "contribution" — earned membership, never a lazy copy
+- Expect a SMALL set at different zoom levels — typically 2-4, at most 5. A focused session that advanced ONE area does NOT belong to 6+ threads; if you find yourself listing that many, you are matching on topic, not contribution. Overlap is healthy ONLY when each thread got a genuinely distinct contribution.
+- Every thread needs a DISTINCT "contribution" — the specific thing THIS session did FOR THIS thread. If two threads would carry the same (or near-same) contribution sentence, you are spraying: drop the weaker membership. A copy-pasted contribution is not earned membership.
 - Before minting a new slug, reuse a near-synonym from the active list instead
 - The slug is just a stable filing key — short, reused. The display_name is what carries understanding to a human — a rich, specific articulation, never a restatement of the slug
 - Capture what you LEARNED, not what you DID
 - Output ONLY the JSON array, no markdown fences`;
 
-  const response = await claudeCall(systemPrompt, compressed);
+  const response = await callFn(systemPrompt, compressed);
 
   let threads;
   try {
@@ -534,6 +629,23 @@ Rules:
     return [];
   }
 
+  // Tame the over-eager tail in CODE, not just in the prompt: keep only earned,
+  // distinct, capped memberships (act:e8793574).
+  const beforeCount = threads.length;
+  threads = selectEarnedThreads(threads);
+  if (threads.length < beforeCount) {
+    log(`Phase 2b2: pared ${beforeCount} proposed threads to ${threads.length} earned (cap ${MAX_THREADS_PER_SESSION}, distinct contributions)`);
+  }
+
+  // Deterministic relationship enrichment (act:e8793574):
+  //   related_fids — every work-item fid the session referenced, attributed to
+  //     each thread the session advanced (union-deduped on disk over time).
+  //   lineage — the OTHER threads co-advanced in THIS session are genuine
+  //     siblings of each thread; record them so a cold session can trace the
+  //     related lines of work. Empty when the session earned only one thread.
+  const relatedFids = extractRelatedFids(compressed);
+  const acceptedSlugs = threads.map((t) => slugify(t.thread));
+
   const threadIds = [];
   const now = new Date().toISOString();
   const date = now.slice(0, 10);
@@ -542,6 +654,9 @@ Rules:
     if (!t.thread || !t.cursor) continue;
     const threadSlug = slugify(t.thread);
     const threadPath = join(threadsDir, `${threadSlug}.json`);
+    const lineage = acceptedSlugs
+      .filter((s) => s && s !== threadSlug)
+      .map((s) => ({ slug: s, relation: 'co-occurrence', session_id: sessionId, date }));
 
     // One cursor snapshot per session that advanced this thread — appended,
     // never overwritten (see updateThreadFile / cursor_history in
@@ -565,7 +680,9 @@ Rules:
     // reported, never silently replaced. Per-thread try/catch so one bad
     // thread cannot abort writes for the remaining threads.
     try {
-      const outcome = updateThreadFile(threadPath, threadSlug, t, cursorEntry, sessionRecord, now);
+      const outcome = updateThreadFile(
+        threadPath, threadSlug, t, cursorEntry, sessionRecord, now,
+        { relatedFids, lineage });
       threadIds.push(threadSlug);
       if (outcome.startsWith('recovered')) {
         logError(`Phase 2b2: Thread ${threadSlug} ${outcome}`);
@@ -2137,10 +2254,12 @@ function signalRing2() {
 // Phase 2l: Health
 // ---------------------------------------------------------------------------
 
-function writeHealth(sessionId, stats, project) {
-  log('Phase 2l: Health');
-
-  const healthPath = join(WATCHTOWER_DIR, 'state', 'ring3-health.json');
+// buildHealth — the pure ring3-health.json shape (exported for tests). Health
+// is "success" ONLY when no account-level API failure occurred; a systemic
+// failure (billing/auth/quota) flips status to "degraded" and records the
+// class so silence can never again read as health. A single per-call error is
+// not systemic and does not degrade the run.
+export function buildHealth(sessionId, stats, project, apiFailure = null) {
   const health = {
     schema_version: 1,
     last_run: new Date().toISOString(),
@@ -2149,6 +2268,10 @@ function writeHealth(sessionId, stats, project) {
     actions_closed: stats.actionsClosed || 0,
     status: 'success',
   };
+  if (apiFailure) {
+    health.status = 'degraded';
+    health.api_error = { type: apiFailure.type, message: apiFailure.message };
+  }
   // Fail loud, never silently: an unresolvable project identity is the
   // anomaly that used to hide behind the basename fallback.
   if (project?.unresolved) {
@@ -2156,9 +2279,15 @@ function writeHealth(sessionId, stats, project) {
       `project identity unresolved: filed under "${project.name}" (${project.path}) with project_unresolved`,
     ];
   }
+  return health;
+}
 
+function writeHealth(sessionId, stats, project, apiFailure = null) {
+  log('Phase 2l: Health');
+  const healthPath = join(WATCHTOWER_DIR, 'state', 'ring3-health.json');
+  const health = buildHealth(sessionId, stats, project, apiFailure);
   atomicWrite(healthPath, JSON.stringify(health, null, 2) + '\n');
-  log('Phase 2l: ring3-health.json written');
+  log(`Phase 2l: ring3-health.json written (status: ${health.status})`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2541,9 +2670,16 @@ async function main() {
     logError(`Phase 2k failed: ${e.message}`);
   }
 
+  // A systemic API failure means EVERY Claude-dependent phase produced
+  // nothing — surface it loudly so it can't hide behind a "success" run.
+  if (systemicApiFailure) {
+    logError(`SYSTEMIC API FAILURE (${systemicApiFailure.type}) — every knowledge-extraction phase was skipped this run (no summary, threads, extractions, or advisor findings). Ring 3 health is DEGRADED. Operator action required: ${systemicApiFailure.message}`);
+    stats.apiFailure = systemicApiFailure.type;
+  }
+
   // Phase 2l: Health
   try {
-    writeHealth(args.sessionId, stats, project);
+    writeHealth(args.sessionId, stats, project, systemicApiFailure);
   } catch (e) {
     logError(`Phase 2l failed: ${e.message}`);
   }
@@ -2552,7 +2688,7 @@ async function main() {
   markProcessed(args.sessionId, stats);
 
   const duration = Date.now() - startTime;
-  log(`Ring 3 close complete in ${duration}ms. Actions closed: ${stats.actionsClosed}, items filed: ${stats.itemsFiled}, memory written: ${stats.memoryWritten}, threads updated: ${stats.threadsUpdated || 0}`);
+  log(`Ring 3 close complete in ${duration}ms. Actions closed: ${stats.actionsClosed}, items filed: ${stats.itemsFiled}, memory written: ${stats.memoryWritten}, threads updated: ${stats.threadsUpdated || 0}${systemicApiFailure ? ` — DEGRADED (${systemicApiFailure.type})` : ''}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2605,4 +2741,7 @@ export {
   extractDimensionNames,
   recordChecklistCatches,
   checklistCatchLens,
+  // Thread-capture hardening (act:e8793574). selectEarnedThreads,
+  // extractRelatedFids, classifyApiError, and buildHealth are exported inline.
+  threadCapture,
 };
