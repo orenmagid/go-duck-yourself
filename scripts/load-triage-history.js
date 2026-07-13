@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Build suppression lists from triage history.
 //
-// Outputs JSON with rejected/deferred finding IDs and fingerprints.
+// Outputs JSON with rejected/deferred/archived finding IDs and fingerprints.
 // The audit skill uses this to skip previously-triaged findings.
 //
 // Usage:
@@ -35,6 +35,11 @@ const result = {
   rejectedFingerprints: [],
   deferredIds: [],
   deferredFingerprints: [],
+  // 'archived' is the triage vocabulary actually in live use (the 2026-07-13
+  // QA drain found 14 archived rows and ZERO rejected) — before act:4ec70792
+  // it never fed suppression, so archived findings regenerated every audit.
+  archivedIds: [],
+  archivedFingerprints: [],
 };
 
 // ---------------------------------------------------------------------------
@@ -59,6 +64,11 @@ function tryDatabase() {
       WHERE triage_status = 'deferred'
     `).all();
 
+    const archived = db.prepare(`
+      SELECT id, cabinet_member, title FROM audit_findings
+      WHERE triage_status = 'archived'
+    `).all();
+
     db.close();
 
     result.rejectedIds = rejected.map(r => r.id);
@@ -68,6 +78,11 @@ function tryDatabase() {
     }));
     result.deferredIds = deferred.map(r => r.id);
     result.deferredFingerprints = deferred.map(r => ({
+      'cabinet-member': r.cabinet_member,
+      title: r.title,
+    }));
+    result.archivedIds = archived.map(r => r.id);
+    result.archivedFingerprints = archived.map(r => ({
       'cabinet-member': r.cabinet_member,
       title: r.title,
     }));
@@ -131,6 +146,11 @@ function tryFilesystem() {
                 result.deferredIds.push(v.id);
                 result.deferredFingerprints.push(fp);
               }
+            } else if (v.verdict === 'archive' || v.status === 'archived') {
+              if (v.id && !result.archivedIds.includes(v.id)) {
+                result.archivedIds.push(v.id);
+                result.archivedFingerprints.push(fp);
+              }
             }
           }
         } catch {
@@ -139,7 +159,8 @@ function tryFilesystem() {
       }
     }
 
-    return result.rejectedIds.length > 0 || result.deferredIds.length > 0;
+    return result.rejectedIds.length > 0 || result.deferredIds.length > 0
+      || result.archivedIds.length > 0;
   } catch {
     return false;
   }

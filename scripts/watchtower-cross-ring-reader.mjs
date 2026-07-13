@@ -109,16 +109,29 @@ const FILED_WINDOW_STATUSES = ['superseded', 'expired'];
 // instead of re-deriving the enum — one classifier, one source.
 export const ENGAGED_TYPES = ['acted-on', 'captured-to-memory', 'deferred'];
 export const DISCARDED_TYPES = ['stale', 'noise'];
+// Machine acts, NOT human engagement (grp:wt-noise-immunity, binding
+// cross-lane convention): every Ring 1 auto-retraction/reconciliation the
+// program adds stamps resolution_type 'auto-reconciled' + evidence.actor
+// 'ring1' (the producer is the program's Ring 1 lane — this spelling and
+// that stamp must stay in lockstep, or the exclusion silently never fires;
+// pre-convention auto-resolves carry no type and age out of the recent
+// windows naturally). Machine acts are structurally EXCLUDED from
+// ENGAGED_TYPES — cron activity masquerading as operator engagement would
+// silently defeat the not-consumed detector (the assessment's worked_recent
+// skips this bucket for the same reason).
+export const MACHINE_TYPES = ['auto-reconciled'];
 
 // bucketResolution — THE single resolution_type → bucket classifier. Returns
-// 'engaged' | 'discarded' | 'other' ('other' = null/untyped or an
-// out-of-enum value). readInboxView's resolution_mix and the sibling
+// 'engaged' | 'discarded' | 'machine' | 'other' ('other' = null/untyped or an
+// out-of-enum value; 'machine' = a ring's own act, never operator
+// engagement). readInboxView's resolution_mix and the sibling
 // inbox-assessment reader both call this so the trust-ladder buckets are
 // defined once. Pure; null/undefined-safe.
 export function bucketResolution(resolution_type) {
   const rt = resolution_type || null;
   if (rt && ENGAGED_TYPES.includes(rt)) return 'engaged';
   if (rt && DISCARDED_TYPES.includes(rt)) return 'discarded';
+  if (rt && MACHINE_TYPES.includes(rt)) return 'machine';
   return 'other';
 }
 
@@ -320,7 +333,7 @@ function readInboxView(name, sinceIso) {
     pending_by_category: {},
     pending_urgent: 0,
     resolution_events: [],
-    resolution_mix: { engaged: 0, discarded: 0, untyped_or_other: 0, total: 0 },
+    resolution_mix: { engaged: 0, discarded: 0, machine: 0, untyped_or_other: 0, total: 0 },
     superseded_by_filed_date: 0,
     expired_by_filed_date: 0,
     attributed_but_flagged: 0,
@@ -363,6 +376,10 @@ function readInboxView(name, sinceIso) {
     const bucket = bucketResolution(item.resolution_type);
     if (bucket === 'engaged') view.resolution_mix.engaged++;
     else if (bucket === 'discarded') view.resolution_mix.discarded++;
+    // Machine acts get their own additive count — folding them into
+    // untyped_or_other would inflate the "operator resolved without typing"
+    // signal with cron acts (the masquerade this bucket exists to prevent).
+    else if (bucket === 'machine') view.resolution_mix.machine++;
     else view.resolution_mix.untyped_or_other++;
     view.resolution_mix.total++;
   }

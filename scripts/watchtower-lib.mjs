@@ -18,6 +18,152 @@ const require = createRequire(import.meta.url);
 
 // Re-export queue operations so ring scripts have a single import source.
 export { createItem, listPending, getItem, resolveItem } from './watchtower-queue.mjs';
+import { resolveItem as queueResolveItem, getItem as queueGetItem } from './watchtower-queue.mjs';
+
+// ---------------------------------------------------------------------------
+// autoReconcileItem — the ONE resolution path for machine (ring) retractions
+// ---------------------------------------------------------------------------
+//
+// Detector-symmetry contract (watchtower-contracts.md "Detector Symmetry"):
+// every auto-retraction/reconciliation a ring performs resolves through this
+// helper so the stamping convention cannot drift across reconcilers —
+// `resolution_type: 'auto-reconciled'` (the machine/human discriminator the
+// cross-ring reader's engagement bucketing keys on: cron activity must never
+// masquerade as operator engagement) plus `evidence.actor` and any
+// evidence the caller supplies naming WHY (action fid / branch), so a
+// semantically-wrong close stays traceable to its mechanical trigger.
+//
+// The queue API has no evidence-mutating verb, so the evidence merge is a
+// read-modify-write against the item file after resolveItem's own atomic
+// write. The path spelling below (queue/items/<id>.json under the watchtower
+// dir) MIRRORS watchtower-queue.mjs's QUEUE_DIR — keep them in step; the
+// hermetic parity tests (branch-diverged-reconcile.test.mjs, "autoReconcileItem
+// resolves through the real queue…") round-trip through the real queue so a
+// drifted spelling fails loudly. A failed evidence stamp is
+// logged and tolerated: the load-bearing half (typed resolution) already
+// landed atomically.
+
+export function autoReconcileItem(id, { resolution, notes, actor = 'ring1', evidence = {} }) {
+  const updated = queueResolveItem(id, {
+    resolution,
+    resolution_notes: notes,
+    resolution_type: 'auto-reconciled',
+  });
+  if (!updated) return null; // not pending — someone (human) got there first
+  const fp = join(getWatchtowerDir(), 'queue', 'items', `${id}.json`);
+  try {
+    const item = JSON.parse(readFileSync(fp, 'utf8'));
+    item.evidence = { ...(item.evidence || {}), actor, ...evidence };
+    atomicWrite(fp, item);
+    return item;
+  } catch (e) {
+    logError('lib', `autoReconcileItem: resolved ${id} but could not stamp evidence.actor: ${e.message}`);
+    return updated;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// INBOX_DETECTOR_REGISTRY — the detector-symmetry ledger
+// ---------------------------------------------------------------------------
+//
+// The Detector Symmetry contract (watchtower-contracts.md): every ring-filed
+// inbox category declares its RECONCILER (the mechanical per-tick retraction
+// + its filing exclusions) or an explicit EXEMPT rationale — exactly one.
+// The structural test (templates/scripts/__tests__/detector-registry.test.mjs)
+// scans the `category:` literals at createItem filing sites across ring1,
+// ring2, and ring3-close and fails the suite when a filed category is
+// missing here (or a registry entry goes stale) — a new detector without a
+// declared retraction path breaks the build, not the operator's trust
+// (act:4d11fd53; four detectors shipped the same one-way-queue bug before
+// the rule was encoded).
+//
+// "candidate future reconciler" notes inside exempt rationales are honest
+// markers, not commitments — promoting one moves the entry to `reconciler`.
+
+export const INBOX_DETECTOR_REGISTRY = {
+  // ring1-filed
+  'branch-diverged': {
+    reconciler: 'autoResolveBranchDivergedItems (ring1): retracts on verified-gone '
+      + '(membership in a successful branch listing), squash-aware no-unmerged-content, '
+      + 'or excluded name; filing exclusion: defaults.long_lived_branches '
+      + '(staging/production exact, backup/* glob), gated at the filing site so '
+      + 'dismissal cannot reopen the loop (act:98649971)',
+  },
+  'worktree-unmerged': {
+    reconciler: 'autoResolveWorktreeItems (ring1): retracts on verified-gone branch or '
+      + 'no-unmerged-content + no-real-uncommitted; fileOrphanedWorktreeItem supersedes '
+      + 'on register change (unmerged ↔ uncommitted-only); filing exclusion: '
+      + 'generated-state classification (GENERATED_STATE_PATTERNS, act:c008862c)',
+  },
+  // ring3-filed, ring1-reconciled
+  'completion-review': {
+    reconciler: 'autoReconcileCompletionReviews (ring1): resolves when the referenced '
+      + 'action (plan_fid || evidence.fid) is verifiably closed in its OWN project db; '
+      + 'fid-not-found keeps (flow vestigial-db + misattribution protection); filing '
+      + 'exclusion: ring3 Phase 2c create-vs-complete guard (act:9eebbac4)',
+  },
+  // ring3-filed
+  'coverage-warning': {
+    exempt: 'standing-debt aggregation, not per-event filing — the DECLARED semantics '
+      + 'this registry binds, shipping as act:e888dd63 (Lane B of the same program; '
+      + 'the merge tail verifies it landed): ONE pending item per (project, '
+      + 'debt-class); Ring 3 APPENDS evidence (path union + per-path counts + session '
+      + 'count, evidence.first_seen = oldest) and escalates urgency at a session-count '
+      + 'threshold; human resolution closes the accumulated view and a persisting debt '
+      + 'refiles FRESH next tick. No mechanical retraction condition exists for "the '
+      + 'coverage debt cleared".',
+  },
+  'knowledge-extraction': {
+    exempt: 'pure extraction — no world-state to re-check (the contract\'s canonical '
+      + 'no-possible-retraction case). Filed by ring2 slow and ring3; deduped at filing '
+      + 'across the five recall corpora.',
+  },
+  'methodology-capture': {
+    exempt: 'pure extraction (session methodology) — nothing mechanical to re-verify.',
+  },
+  'upstream-friction': {
+    exempt: 'a report routed to the CC repo; disposal is the human triage-at-arrival '
+      + 'duty, not a truth condition.',
+  },
+  'advisor-finding': {
+    exempt: 'advisory observation from the session advisor pass (ring2 briefing panel + '
+      + 'ring3 Phase 2m); capped per member per session and deduped vs pending + '
+      + 'resolution corpora at filing; no mechanical truth condition.',
+  },
+  'raised-unhandled': {
+    exempt: 'session-historical fact — a loose end the session raised but neither did '
+      + 'nor filed; cannot be mechanically re-checked. Candidate future reconciler: the '
+      + 'referenced work later filed/closed.',
+  },
+  'skill-candidate': {
+    exempt: 'judgment item (a repeated manual procedure worth a skill); no mechanical '
+      + 'condition.',
+  },
+  // ring2-filed
+  'deferred-trigger': {
+    exempt: 'one-time trigger event; dedup-vs-pending blocks refiring. Candidate future '
+      + 'reconciler: the referenced deferred action closed.',
+  },
+  'watchtower-health': {
+    exempt: 'notification of a stale/failing ring window; recovery is visible in the '
+      + 'ring health sidecars. Candidate future reconciler: health recovered ⇒ retract.',
+  },
+  'stale-project': {
+    exempt: 'staleness notification. Candidate future reconciler: project activity '
+      + 'resumed ⇒ retract.',
+  },
+  'project-completion': {
+    exempt: 'human judgment (close a project?); never mechanically resolvable.',
+  },
+  'pattern-promotion': {
+    exempt: 'threshold event (≥3 sweep instances of a failure class), deduped at '
+      + 'filing; promotion up the compliance stack is a human decision.',
+  },
+  'verify-backfill': {
+    exempt: 'backfill nudge for actions without a Verify Plan. Candidate future '
+      + 'reconciler: the action gains a Verify Plan section ⇒ retract.',
+  },
+};
 
 // ---------------------------------------------------------------------------
 // getWatchtowerDir — resolve watchtower root directory
@@ -318,12 +464,39 @@ export function authoredClaudeDirs(cwd, execFn) {
   return dirs;
 }
 
-// Is this porcelain line DISPOSABLE `.claude/` infra churn (safe to ignore)?
-// A `.claude/` path under an authored top-level dir is real work → false
-// (count it). A non-`.claude/` line is not our concern here → false. Only
-// `.claude/` churn outside the authored subtrees (untracked infra, top-level
-// config files) is disposable → true.
+// Generated runtime state written by the CC/watchtower/verify harnesses —
+// never authored work (act:c008862c: an untracked advisories-state.json
+// identical to main's copy earned two fully-merged branches a data-loss
+// "MERGE OR LOSE" warning). UNTRACKED (`??`) lines ONLY, by anchor: a
+// TRACKED file of the same name is authored by definition (the
+// artifacts-of-thought carve-out — existing consumers deliberately keep
+// advisories-state.json tracked, and their real churn must keep counting).
+// This list is the JS SSOT consumed by ring1's countRealUncommitted and
+// ring3's Phase 2a dirty filter (both via claudeChurnIsDisposable below);
+// the mux shell twin (templates/mux/config/worktree-dirty-check.sh) is a
+// separate implementation of the same concept — the program merge tail
+// diffs the two lists (grp:wt-noise-immunity step 4b).
+export const GENERATED_STATE_PATTERNS = [
+  /^\?\?\s+\.claude\/verification\//,
+  /^\?\?\s+\.claude\/cabinet\/advisories-state\.json$/,
+  /^\?\?\s+\.claude\/cabinet\/checklist-stats\.json$/,
+  /^\?\?\s+e2e\/\.verify-progress\.jsonl$/,
+];
+
+export function generatedStateIsDisposable(porcelainLine) {
+  return GENERATED_STATE_PATTERNS.some((re) => re.test(porcelainLine));
+}
+
+// Is this porcelain line DISPOSABLE infra/runtime churn (safe to ignore)?
+// Untracked generated state (list above) is disposable even under an
+// authored dir — .claude/cabinet/ is authored where tracked files live, but
+// an untracked advisories-state.json there is runtime residue, not work.
+// Otherwise: a `.claude/` path under an authored top-level dir is real work
+// → false (count it); a non-`.claude/` line is not our concern → false;
+// only `.claude/` churn outside the authored subtrees (untracked infra,
+// top-level config files) is disposable → true.
 export function claudeChurnIsDisposable(porcelainLine, authoredDirs) {
+  if (generatedStateIsDisposable(porcelainLine)) return true;
   if (!/\s\.claude(?:\/|$)/.test(porcelainLine)) return false;
   const m = porcelainLine.match(/\.claude\/([^/\s]+)/);
   if (m && authoredDirs.has(m[1])) return false; // authored subtree → count it
@@ -977,6 +1150,96 @@ export function resolveProjectIdentity(cwdOrPath, config, opts = {}) {
   // A real repo no registry tracks: benign, name it by its main root.
   const name = basename(mainReal);
   return { name, slug: slugify(name), path: mainReal, registered: false };
+}
+
+// ---------------------------------------------------------------------------
+// resolveProjectFromTranscriptSlug — transcript-slug fallback for CLEANED-UP
+// mux worktrees (act:29001b07, grp:wt-noise-immunity)
+// ---------------------------------------------------------------------------
+// resolveProjectIdentity is filesystem-based (safeRealpath + git-common-dir),
+// so a worktree that has been cleaned up — routine once auto-cleanup runs —
+// leaves NO live path to resolve, and Ring 3's reprocess path fell back to
+// the runner's cwd project: 302 of 510 recovered extractions were confidently
+// misattributed (dec-bdadfd3c carried project claude-cabinet while its own
+// transcript_ref was a maginnis worktree slug).
+//
+// This sibling decodes the transcript DIRECTORY SLUG instead (the basename of
+// ~/.claude/projects/<slug>, which encodes the session cwd with '/' and '.'
+// both collapsed to '-'):
+//
+//   /Users/o/.mux/worktrees/maginnis-accounts
+//     → -Users-o--mux-worktrees-maginnis-accounts
+//
+// Everything after the '--mux-worktrees-' marker is the worktree basename,
+// which mux names `<mux-project-name>-<task>` — and the mux project name is
+// NOT the registered project key (mux "maginnis" → registered
+// "claudeconsult-maginnis"), so the decode goes through mux's own
+// name→path registry (~/.config/mux/projects.json, the one place the
+// worktree→project convention lives) and then hands the MAIN-CHECKOUT path
+// to the canonical resolver above. Matching is LONGEST-match on a '-'
+// boundary; two distinct names matching at the same length (possible because
+// the encoding is lossy: 'a.b' and 'a-b' collide) is AMBIGUOUS → null.
+// Every failure returns null — the caller files project_unresolved: true,
+// NEVER a cwd guess (misattribution is the disease this exists to cure).
+//
+// Decided exclusions (CP2): first-occurrence marker matching is correct for
+// the realistic collision direction (marker text INSIDE a worktree basename
+// lands after the true marker); a manufactured earlier marker (a parent
+// dotdir literally named '.mux-worktrees-…') is out of scope.
+//
+// NAME AND SHAPE ARE A CROSS-LANE CONTRACT (act:29001b07 notes, "Cross-lane
+// interface note"): ring3-close feature-detects `resolveProjectFromTranscriptSlug`
+// by name on its namespace import — absent (or renamed) means every
+// slug-only session silently files project_unresolved forever. The encoding
+// below mirrors ring3-close's documented `encodeTranscriptSlug` rule: a
+// transcript dir slug is the session cwd with every non-[a-zA-Z0-9] char
+// replaced by '-'. Mux names are encoded with the SAME rule before matching,
+// so a name carrying any slug-collapsed character still matches its own
+// worktree slugs; a mismatch fails toward null, never a guess.
+//
+// opts.muxProjectsPath / opts.registryPath override the registries (tests).
+
+const MUX_WORKTREES_SLUG_MARKER = '--mux-worktrees-';
+
+function encodeSlugComponent(s) {
+  return String(s).replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+export function resolveProjectFromTranscriptSlug(transcriptDirSlug, config, opts = {}) {
+  if (!transcriptDirSlug || typeof transcriptDirSlug !== 'string') return null;
+  const idx = transcriptDirSlug.indexOf(MUX_WORKTREES_SLUG_MARKER);
+  if (idx === -1) return null; // not a mux-worktree slug — nothing to decode
+  const rest = transcriptDirSlug.slice(idx + MUX_WORKTREES_SLUG_MARKER.length);
+  if (!rest) return null;
+
+  const muxProjectsPath = opts.muxProjectsPath
+    || join(homedir(), '.config', 'mux', 'projects.json');
+  let muxProjects;
+  try {
+    muxProjects = JSON.parse(readFileSync(muxProjectsPath, 'utf8')).projects || {};
+  } catch {
+    return null; // no mux registry — no convention to decode against
+  }
+
+  let best = null;
+  let ambiguous = false;
+  for (const [muxName, entry] of Object.entries(muxProjects)) {
+    const enc = encodeSlugComponent(muxName);
+    if (rest !== enc && !rest.startsWith(enc + '-')) continue;
+    if (best && enc.length === best.enc.length && muxName !== best.muxName) {
+      ambiguous = true;
+    } else if (!best || enc.length > best.enc.length) {
+      best = { muxName, enc, path: entry?.path };
+      ambiguous = false;
+    }
+  }
+  if (!best || ambiguous || !best.path) return null;
+
+  // The mux registry maps to the MAIN checkout, which outlives the worktree —
+  // this is what makes the cleaned-up-worktree case resolvable from the slug
+  // alone. The canonical resolver owns everything from here (config key
+  // match, cc-registry, benign-untracked, null-on-anomaly).
+  return resolveProjectIdentity(best.path, config, opts);
 }
 
 // ---------------------------------------------------------------------------

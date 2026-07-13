@@ -48,9 +48,16 @@ import {
   buildLastSessionBlock, upsertLastSessionSection, recordSuppression, recordApiUsage,
   recentSlice,
 } from './watchtower-lib.mjs';
+// Namespace view of the same module record — feature-detection seam for lib
+// exports that land in a different lane's merge (a static named import of a
+// not-yet-merged symbol would throw at module load and take every dynamic-
+// import test suite down with it; a namespace property read is just
+// undefined until the export exists). Consumer: resolveSessionProject's
+// slug fallback (act:29001b07 — Lane A ships resolveProjectFromTranscriptSlug).
+import * as watchtowerLib from './watchtower-lib.mjs';
 // Direct queue import (precedent: ring2 imports expireItem this way) —
 // watchtower-lib deliberately not extended for this (lane separation).
-import { listItems } from './watchtower-queue.mjs';
+import { listItems, supersedeItem } from './watchtower-queue.mjs';
 import { runRoutinePass } from './watchtower-routines.mjs';
 
 const require = createRequire(import.meta.url);
@@ -438,6 +445,21 @@ function preprocessTranscript(transcriptPath) {
 // Phase 2b: Session summary
 // ---------------------------------------------------------------------------
 
+// The pointer line both Last-Session surfaces carry (act:8c076580): the
+// sessions/ file is the authoritative record, and the inline project-state
+// section is an explicit projection that NAMES it — a reader of project.md
+// can always find the full record. The pointer rides INSIDE the one shared
+// body string, so the act:ac119994 contract holds unchanged: both surfaces
+// stay byte-identical, no second formatter exists at the call site, and the
+// lib-owned block format (header + attribution marker) is untouched.
+export function appendRecordPointer(bullets, recordRef) {
+  // Nullish/non-string bullets degrade to a pointer-only body — never a
+  // literal "undefined" line above the pointer.
+  const b = typeof bullets === 'string' ? bullets.trim() : '';
+  const pointer = `_Full record: ${recordRef}_`;
+  return b ? `${b}\n\n${pointer}` : pointer;
+}
+
 async function sessionSummary(compressed, projectSlug, sessionId) {
   log('Phase 2b: Session summary');
 
@@ -457,7 +479,12 @@ async function sessionSummary(compressed, projectSlug, sessionId) {
 
   const date = new Date().toISOString().slice(0, 10);
   const sessionFile = join(sessionsDir, `${date}-${sessionId}.md`);
-  const content = `# Session ${sessionId}\n\nDate: ${new Date().toISOString()}\n\n${bullets}\n`;
+  // ONE shared body feeds BOTH surfaces, now carrying the pointer that names
+  // the authoritative per-session record (appendRecordPointer above). The
+  // ref is relative to state/projects/ — project.md's own directory — so a
+  // consumer can resolve it mechanically, not just read it.
+  const body = appendRecordPointer(bullets, `${projectSlug}/sessions/${date}-${sessionId}.md`);
+  const content = `# Session ${sessionId}\n\nDate: ${new Date().toISOString()}\n\n${body}\n`;
   atomicWrite(sessionFile, content);
 
   // Update the project-level state file's "## Last Session" with the SAME
@@ -474,7 +501,7 @@ async function sessionSummary(compressed, projectSlug, sessionId) {
   const existingState = existsSync(projectStatePath)
     ? readFileSync(projectStatePath, 'utf8')
     : '';
-  const block = buildLastSessionBlock({ date, sessionId, bullets });
+  const block = buildLastSessionBlock({ date, sessionId, bullets: body });
   atomicWrite(projectStatePath, upsertLastSessionSection(existingState, block));
 
   log(`Phase 2b: Summary written to ${projectSlug}/sessions/${date}-${sessionId}.md`);
@@ -701,9 +728,22 @@ Rules:
 // Phase 2c: Work item closure
 // ---------------------------------------------------------------------------
 
-async function workItemClosure(compressed, project, threadIds = []) {
+async function workItemClosure(compressed, project, threadIds = [], sessionStartIso = null) {
   const projectPath = project.path;
   log('Phase 2c: Work item closure');
+  // The transcript's own day — the create-vs-complete filter compares the
+  // action row's `created` date against the SESSION's date, so a reprocess
+  // of an old transcript filters against that day, never today.
+  const sessionDate = typeof sessionStartIso === 'string' && sessionStartIso
+    ? sessionStartIso.slice(0, 10) : null;
+
+  // No resolved project directory (unresolved identity) — there is no
+  // right pib.db to evaluate against; evaluating the RUNNER's would close
+  // another project's actions from this transcript (the act:29001b07 bug).
+  if (!projectPath) {
+    log('Phase 2c: no project path (unresolved identity), skipping');
+    return { closed: 0, queued: 0 };
+  }
 
   const dbPath = join(projectPath, 'pib.db');
   if (!existsSync(dbPath)) {
@@ -750,6 +790,8 @@ async function workItemClosure(compressed, project, threadIds = []) {
 - "low" = mentioned but unclear if completed
 - "none" = not addressed in this session
 
+An action that was merely CREATED during this session is NOT completed — creating or filing a work item is not doing it. Use "none" for actions whose only appearance is their own creation, unless the transcript also shows the work itself being done.
+
 Output JSON array: [{"fid":"act:XXXXXXXX","confidence":"high|medium|low|none","evidence":"brief reason"}]
 Output ONLY the JSON array, no other text.`;
 
@@ -776,10 +818,14 @@ Output ONLY the JSON array, no other text.`;
   // reused across evaluations, and a per-fid dedup corpus built once from
   // pending ∪ recently-closed completion-review items. Both setups FAIL OPEN
   // (distinct logError, empty guard) — never wholesale suppression.
+  // The SELECT also carries `created` for the create-vs-complete filter
+  // (act:9eebbac4): the mechanical "was this action born this session?"
+  // fact — the compressed transcript strips tool_result bodies, so a
+  // transcript scan cannot reliably see creations; the db row can.
   let statusStmt = null;
   try {
     statusStmt = db.prepare(
-      'SELECT status FROM actions WHERE fid = ? AND deleted_at IS NULL');
+      'SELECT status, created FROM actions WHERE fid = ? AND deleted_at IS NULL');
   } catch (e) {
     logError(`Phase 2c: could not prepare emit-time status re-check (${e.message}) — failing open`);
   }
@@ -806,6 +852,8 @@ Output ONLY the JSON array, no other text.`;
     const guard = completionReviewEmitGuard(evalItem.fid, {
       statusStmt,
       existingItems: existingCompletionItems,
+      sessionDate,
+      confidence: evalItem.confidence,
     });
     if (!guard.emit) {
       skipped++;
@@ -899,6 +947,9 @@ function parseMemoryTitles(content) {
 }
 
 function loadMemoryTitles(projectPath) {
+  // Unresolved identities carry no path — no memory dir to consult; the
+  // dedup corpora degrade to empty (nullish guard, never a TypeError).
+  if (!projectPath) return [];
   const encoded = projectPath.replace(/\//g, '-');
   const memDir = join(homedir(), '.claude', 'projects', encoded, 'memory');
   const indexPath = join(memDir, 'MEMORY.md');
@@ -1200,18 +1251,64 @@ function buildExtractionCorpora(project, { phase } = {}) {
 //      item emits anyway — a DB hiccup degrades to today's behavior, never to
 //      silent wholesale suppression. The try/catch is the guard's own so a
 //      throw can't abort the remaining evaluations.
+//   1b. Create-vs-complete filter (act:9eebbac4): skip when the action's db
+//      `created` date falls inside this session's DAY window (the session's
+//      start day, +1 for past-midnight spill — `created` is day-granular by
+//      schema) AND the model's confidence is below 'high' — an action born
+//      this session whose only
+//      evidence is its own creation is not a completion candidate (12 of 66
+//      live items were this). The conjunct keeps the legitimate
+//      create-then-complete flow: high confidence means the transcript shows
+//      the work itself done, and that still emits. Mechanical fact (db row,
+//      same prepared statement as the status re-check — the compressed
+//      transcript strips tool results and cannot show creations), model
+//      hallucination-proof, and FAIL-OPEN in every gap: no sessionDate, no
+//      created column, or a thrown lookup all emit.
 //   2. Per-fid dedup: skip when an existing completion-review item for the
 //      same fid is in `existingItems` (the caller builds that set from
 //      pending ∪ resolved/dismissed-within-COMPLETION_REVIEW_DEDUP_DAYS).
 //
+// `sessionDate` is the transcript's own day (YYYY-MM-DD) — at reprocess the
+// SESSION's date, never today's. `confidence` is the model's for this fid.
+// New params are optional: callers/tests using the original shape are
+// untouched (both checks self-skip).
+//
 // Returns { emit: true } or { emit: false, reason }.
-function completionReviewEmitGuard(fid, { statusStmt, existingItems = [] } = {}) {
+function dayAfter(dateStr) {
+  const t = Date.parse(`${dateStr}T00:00:00Z`);
+  return Number.isFinite(t)
+    ? new Date(t + 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    : null;
+}
+
+function completionReviewEmitGuard(fid, { statusStmt, existingItems = [], sessionDate = null, confidence = null } = {}) {
   if (statusStmt) {
     try {
       const row = statusStmt.get(fid);
       const status = row ? row.status : null;
       if (status !== 'open' && status !== 'in-progress') {
         return { emit: false, reason: `status now '${status ?? 'gone'}'` };
+      }
+      const created = row ? row.created : null;
+      // Day window [sessionDate, sessionDate+1]: pib-db `created` is
+      // day-granular (schema CHECK), so "born this session" is really "born
+      // on the session's day" (+1 covers a past-midnight spill). The upper
+      // bound matters at reprocess: an action created in a LATER session
+      // must not be suppressed by an old transcript's re-run. A sibling
+      // same-day session's creations do fall in the window — the below-high
+      // conjunct is the designed escape (real completion evidence emits).
+      // windowEnd is a REQUIRED conjunct: an unparseable-but-truthy
+      // sessionDate must self-skip the filter (fail OPEN), not silently drop
+      // the upper bound and lexically suppress everything below it.
+      const windowEnd = sessionDate ? dayAfter(sessionDate) : null;
+      if (sessionDate && windowEnd && created
+          && String(confidence).toLowerCase() !== 'high'
+          && String(created) >= sessionDate
+          && String(created) <= windowEnd) {
+        return {
+          emit: false,
+          reason: `created ${created}, within this session's day window (${sessionDate}/+1) — creation is not completion`,
+        };
       }
     } catch (e) {
       // FAIL-OPEN: emit despite the failed re-check.
@@ -1403,6 +1500,11 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
 async function qualityPatternCapture(compressed, projectPath) {
   log('Phase 2e: Quality pattern capture');
 
+  if (!projectPath) {
+    log('Phase 2e: no project path (unresolved identity), skipping');
+    return;
+  }
+
   // Read triage history if available (enriches pattern detection for audit sessions)
   const triageHistoryPath = join(projectPath, '.claude', 'audit', 'triage-history.json');
   let triageHistory = null;
@@ -1449,6 +1551,13 @@ async function qualityPatternCapture(compressed, projectPath) {
 async function methodologyCapture(compressed, project, threadIds = []) {
   const projectPath = project.path;
   log('Phase 2f: Methodology capture');
+
+  // Methodology only counts with a durable artifact verified against the
+  // project root — no path, nothing to verify against.
+  if (!projectPath) {
+    log('Phase 2f: no project path (unresolved identity), skipping');
+    return;
+  }
 
   try {
     const response = await claudeCall(
@@ -1581,6 +1690,9 @@ const ADVISOR_TRANSCRIPT_SLICE = SINGLE_CALL_TRANSCRIPT_BUDGET; // M2: full rece
 const ADVISOR_SKILL_SLICE = 8_000;       // chars of member identity
 
 function discoverSessionAdvisors(projectPath) {
+  if (!projectPath) {
+    return { advisors: [], reason: 'no project path (unresolved identity)' };
+  }
   const indexPath = join(projectPath, '.claude', 'skills', '_index.json');
   if (!existsSync(indexPath)) {
     return { advisors: [], reason: 'no skills index' };
@@ -2078,6 +2190,11 @@ function recordChecklistCatches(projectPath, catches, { date } = {}) {
 async function checklistCatchLens(compressed, project, sessionId, { callFn = claudeCall, date } = {}) {
   log('Phase 2p: Checklist-catch detection');
 
+  if (!project.path) {
+    log('Phase 2p: no project path (unresolved identity), skipping');
+    return { recorded: 0 };
+  }
+
   const yamlPath = join(project.path, '.claude', 'cabinet', 'qa-dimensions.yaml');
   if (!existsSync(yamlPath)) {
     log('Phase 2p: No qa-dimensions.yaml (checklist not opted in), skipping');
@@ -2276,7 +2393,7 @@ export function buildHealth(sessionId, stats, project, apiFailure = null) {
   // anomaly that used to hide behind the basename fallback.
   if (project?.unresolved) {
     health.warnings = [
-      `project identity unresolved: filed under "${project.name}" (${project.path}) with project_unresolved`,
+      `project identity unresolved: filed under "${project.name}" (${project.path || 'no path'}) with project_unresolved`,
     ];
   }
   return health;
@@ -2311,28 +2428,107 @@ function markProcessed(sessionId, stats) {
 }
 
 // ---------------------------------------------------------------------------
-// Resolve project from CWD
+// Session attribution — which project does this TRANSCRIPT belong to?
 // ---------------------------------------------------------------------------
 
-// Thin wrapper over the canonical resolver in watchtower-lib. The old local
-// implementation matched cwd.startsWith(configPath) and silently fell back to
-// basename(cwd) — every mux worktree session failed the match and filed all
-// its output under a phantom project the readers never looked up.
+// Claude Code stores each session's transcript under
+// ~/.claude/projects/<slug>/<session>.jsonl, where <slug> is the session's
+// own cwd encoded by collapsing every non-alphanumeric character to '-'
+// (current era; an older CC era preserved dots — 9 such dirs live on this
+// portfolio's disk beside 271 current-era ones). That slug is the ONLY
+// attribution evidence that survives a reprocess from a different cwd:
+// the 2026-07-12 drain found 302 of 510 reprocessed extractions filed under
+// the RUNNER's cwd project because resolveProject(args.cwd || process.cwd())
+// trusted whatever cwd the invocation happened to carry (act:29001b07).
 //
-// Outcomes:
-//   registered/benign — the resolver named a real main repo; file under it.
-//   unresolved        — no repo root derivable (anomalous). We still file
-//     (never drop work), under basename(cwd), but every item carries
-//     project_unresolved: true and ring3 health gets a warning — fail loud,
-//     never silently.
-function resolveProject(cwd, config) {
-  const identity = resolveProjectIdentity(cwd, config);
-  if (identity) return identity;
+// normalizeSlugKey is the ONE comparison key for both directions: applied to
+// an absolute cwd it reproduces the current-era encoding; applied to a
+// recorded slug it is idempotent for current-era slugs and maps older-era
+// variants ('.mux' preserved) onto the same key. The encoding is a
+// third-party (Claude Code) convention, version-varying and lossy ('-', '.',
+// '/' all collapse to '-'); any mismatch fails SAFE — cwd distrusted → slug
+// fallback → project_unresolved — never a confident misattribution. The
+// decode direction (slug → registered project, needed once the worktree dir
+// is cleaned up) lives in watchtower-lib as resolveProjectFromTranscriptSlug
+// (Lane A of grp:wt-noise-immunity); encoder and decoder are two halves of
+// one convention — consolidation into the lib is the registry follow-up.
+export function normalizeSlugKey(s) {
+  if (typeof s !== 'string' || !s) return null;
+  return s.replace(/[^a-zA-Z0-9]/g, '-');
+}
 
-  const dirName = basename(cwd);
+// The transcript's project-dir name, when the transcript actually lives under
+// a CC project dir (those always encode an absolute path, so they start with
+// '-'). A transcript staged anywhere else yields null — callers then trust
+// cwd, which is today's behavior for non-standard invocations.
+export function transcriptSlugFromPath(transcriptPath) {
+  if (typeof transcriptPath !== 'string' || !transcriptPath) return null;
+  const dir = basename(dirname(transcriptPath));
+  return dir.startsWith('-') ? dir : null;
+}
+
+// resolveSessionProject — the ONE resolution call for both entry points
+// (live close and manual reprocess both enter through main()).
+//
+// Trust order:
+//   1. cwd, only when it AGREES with the transcript slug (or no slug exists)
+//      → resolveProjectIdentity, the canonical path resolver.
+//   2. the transcript slug via the lib's slug resolver — covers a reprocess
+//      run from the wrong cwd AND a live close whose worktree was already
+//      cleaned up. Feature-detected (see the namespace import) until Lane A's
+//      lib half merges; absent ⇒ null ⇒ fall through.
+//   3. unresolved — file under the SESSION's evidence (the transcript dir
+//      name when cwd was distrusted, else basename(cwd)); never the runner's
+//      cwd project. path is null in the slug case: downstream phases that
+//      need a project directory skip loudly, and no state-file key is minted
+//      from a raw encoded-path name.
+//
+// Returns { project, cwdTrusted, slug }. cwdTrusted gates the phases that
+// read live git state at cwd (Phase 2a worktreeCheck) — a distrusted cwd is
+// the RUNNER's environment, not the session's.
+export function resolveSessionProject({ cwd, transcriptPath }, config, deps = {}) {
+  const resolveIdentity = deps.resolveIdentity || resolveProjectIdentity;
+  const resolveSlug = deps.resolveSlug !== undefined
+    ? deps.resolveSlug
+    : (watchtowerLib.resolveProjectFromTranscriptSlug || null);
+
+  const slug = transcriptSlugFromPath(transcriptPath);
+  const cwdTrusted = !!cwd && (!slug || normalizeSlugKey(cwd) === normalizeSlugKey(slug));
+
+  if (cwdTrusted) {
+    const identity = resolveIdentity(cwd, config);
+    if (identity) return { project: identity, cwdTrusted, slug };
+  }
+
+  if (slug && typeof resolveSlug === 'function') {
+    try {
+      const fromSlug = resolveSlug(slug, config);
+      if (fromSlug) return { project: fromSlug, cwdTrusted, slug };
+    } catch (e) {
+      logError(`slug resolution failed for ${slug}: ${e.message} — falling through to unresolved`);
+    }
+  }
+
+  if (slug && !cwdTrusted) {
+    // The session's own evidence is the transcript dir name. Never cwd here:
+    // a distrusted cwd is exactly the misattribution vector this fixes.
+    return {
+      project: {
+        name: slug, path: null, slug: slugify(slug),
+        registered: false, unresolved: true,
+      },
+      cwdTrusted, slug,
+    };
+  }
+
+  const base = cwd || process.cwd();
+  const dirName = basename(base);
   return {
-    name: dirName, path: cwd, slug: slugify(dirName),
-    registered: false, unresolved: true,
+    project: {
+      name: dirName, path: cwd ? base : null, slug: slugify(dirName),
+      registered: false, unresolved: true,
+    },
+    cwdTrusted, slug,
   };
 }
 
@@ -2371,6 +2567,121 @@ function sessionStartFromTranscript(transcriptPath) {
   return null;
 }
 
+// --- Standing-debt aggregation (act:e888dd63) -------------------------------
+// A coverage warning is a STANDING condition, not an event: the same debt
+// recurs every session while the scenarios lag the UI. Filing one item per
+// session buried the signal — the 2026-07-12 drain held 49 identical items
+// for ONE month-old debt. The detector now keeps ONE pending item per
+// (project, debt-class) and APPENDS evidence to it: session-id union (a
+// reprocess replay cannot inflate counts), per-path counts, first_seen =
+// oldest evidence (Lane C's backlog-rot ages the item by this, per the
+// program's amended ACs), filed_at bumped on each append — so runExpiry's
+// 30-day clock measures the LAST recurrence: an actively-recurring debt
+// never silently expires, a debt that stopped recurring ages out normally.
+// Resolution semantics unchanged: any disposition (resolve, dismiss, expire)
+// closes the accumulated view, and post-disposition recurrence files FRESH
+// with fresh counters — a new signal, not a resurrected pile.
+export const COVERAGE_DEBT_CLASS = 'verify-coverage-drift';
+// Urgency escalates with the debt's session count so a 90-session debt never
+// sorts like a 5-session one (named thresholds per the amended AC).
+export const COVERAGE_DEBT_NORMAL_SESSIONS = 5;
+export const COVERAGE_DEBT_URGENT_SESSIONS = 15;
+
+export function coverageDebtUrgency(sessions) {
+  if (sessions >= COVERAGE_DEBT_URGENT_SESSIONS) return 'urgent';
+  if (sessions >= COVERAGE_DEBT_NORMAL_SESSIONS) return 'normal';
+  return 'low';
+}
+
+// Normalize any coverage-warning evidence — a single-session observation, a
+// legacy per-session item, or an aggregated blob — into the foldable form.
+export function coverageContribution(e, fallbackDate = null) {
+  const ids = Array.isArray(e?.session_ids)
+    ? e.session_ids.filter(Boolean)
+    : (e?.session_id ? [e.session_id] : []);
+  let counts = {};
+  if (e?.path_counts && typeof e.path_counts === 'object') {
+    counts = { ...e.path_counts };
+  } else if (Array.isArray(e?.ui_paths)) {
+    for (const p of e.ui_paths) if (typeof p === 'string' && p) counts[p] = 1;
+  }
+  const seen = e?.first_seen || e?.session_start || fallbackDate || null;
+  const last = e?.last_seen || e?.session_start || fallbackDate || null;
+  return { session_ids: ids, path_counts: counts, first_seen: seen, last_seen: last };
+}
+
+export function foldCoverageEvidence(base, add) {
+  const a = base || { session_ids: [], path_counts: {}, first_seen: null, last_seen: null };
+  const ids = [...new Set([...(a.session_ids || []), ...(add.session_ids || [])])];
+  const counts = { ...(a.path_counts || {}) };
+  for (const [p, n] of Object.entries(add.path_counts || {})) {
+    counts[p] = (counts[p] || 0) + (Number(n) || 0);
+  }
+  const firsts = [a.first_seen, add.first_seen].filter(Boolean).sort();
+  const lasts = [a.last_seen, add.last_seen].filter(Boolean).sort();
+  return {
+    session_ids: ids,
+    path_counts: counts,
+    first_seen: firsts[0] || null,
+    last_seen: lasts[lasts.length - 1] || null,
+  };
+}
+
+export function coverageDebtTitle(evidence) {
+  const n = evidence.sessions || (evidence.session_ids || []).length || 1;
+  if (n <= 1) return 'UI shipped this session without a scenario update';
+  const since = (evidence.first_seen || '').slice(0, 10);
+  return `UI drift debt: ${n} sessions without scenario updates${since ? ` since ${since}` : ''}`;
+}
+
+export function coverageDebtSummary(evidence, { topN = 3 } = {}) {
+  const counts = evidence.path_counts || {};
+  const ranked = Object.entries(counts).sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]));
+  const n = evidence.sessions || (evidence.session_ids || []).length || 1;
+  if (n <= 1) {
+    const paths = ranked.map(([p]) => p);
+    const shown = paths.slice(0, topN).join(', ')
+      + (paths.length > topN ? `, +${paths.length - topN} more` : '');
+    return `This session changed UI (${shown}) but touched no .feature file — `
+      + `drift risk: the product changed, the walkthrough scenarios didn't. Run `
+      + `/verify update to propose the matching scenario edits, or accept the drift `
+      + `if the change isn't user-visible.`;
+  }
+  const since = (evidence.first_seen || '').slice(0, 10);
+  const top = ranked.slice(0, topN).map(([p, c]) => `${p} (${c})`).join(', ')
+    + (ranked.length > topN ? `, +${ranked.length - topN} more paths` : '');
+  return `Standing scenario-coverage debt: ${n} sessions${since ? ` since ${since}` : ''} `
+    + `shipped UI changes with no .feature edit. Most-hit: ${top}. Run /verify update `
+    + `to propose the matching scenario edits, or accept the drift if it isn't `
+    + `user-visible. Resolving this item closes the accumulated view; if the debt `
+    + `persists, the next session files fresh.`;
+}
+
+// Direct item-file write for the append. The queue CRUD library exports no
+// update/append verb (and is another lane's file in this program), so the
+// standing-debt append writes the item file in place — the same direct-write
+// precedent Ring 2's enrichment uses. ONE helper owns the mechanics and the
+// byte format matches the queue's own writer (JSON, 2-space, trailing
+// newline); the primitive's proper home is a watchtower-queue verb at next
+// touch — the detector-registry follow-up (act:4d11fd53) documents the
+// aggregation pattern including this seam.
+function queueItemPath(id) {
+  return join(WATCHTOWER_DIR, 'queue', 'items', `${id}.json`);
+}
+function defaultReloadQueueItem(id) {
+  try {
+    const item = JSON.parse(readFileSync(queueItemPath(id), 'utf8'));
+    // Mirror the queue reader's schema boundary: an unknown schema_version is
+    // never appended-to blind — the caller takes the fresh-filing path.
+    return item?.schema_version === 1 ? item : null;
+  } catch {
+    return null; // missing OR corrupt — caller files fresh, never throws
+  }
+}
+function defaultSaveQueueItem(item) {
+  atomicWrite(queueItemPath(item.id), JSON.stringify(item, null, 2) + '\n');
+}
+
 // Deps injectable for hermetic tests; production callers omit them. Runs against
 // the RESOLVED project path (a worktree resolves to its main repo), so "shipped"
 // means landed on the integration branch — un-merged worktree work isn't warned
@@ -2391,33 +2702,137 @@ export function verifyCoverageLens(project, sessionStartIso, sessionId, deps = {
   const { uncovered, uiPaths } = detectUncoveredUi(changed);
   if (!uncovered) return { filed: 0 };
 
-  // Dedup: one coverage-warning per session.
-  const dup = listPendingItems({ project: project.name, category: 'coverage-warning' })
-    .some((i) => i.evidence?.session_id === sessionId);
-  if (dup) return { filed: 0 };
+  const reloadItem = deps.reloadItem || defaultReloadQueueItem;
+  const saveItem = deps.saveItem || defaultSaveQueueItem;
+  const supersede = deps.supersede || supersedeItem;
 
-  const shown = uiPaths.slice(0, 3).join(', ')
-    + (uiPaths.length > 3 ? `, +${uiPaths.length - 3} more` : '');
-  file({
-    project: project.name,
-    project_path: project.path,
-    filed_by: 'ring3-close',
-    category: 'coverage-warning',
-    urgency: 'low',
-    title: 'UI shipped this session without a scenario update',
-    summary: `This session changed UI (${shown}) but touched no .feature file — `
-      + `drift risk: the product changed, the walkthrough scenarios didn't. Run `
-      + `/verify update to propose the matching scenario edits, or accept the drift `
-      + `if the change isn't user-visible.`,
-    context_anchor: `git log --since session start (${sessionId})`,
-    evidence: { session_id: sessionId, ui_paths: uiPaths, session_start: sessionStartIso },
-    options: [
-      { value: 'update', label: 'Update scenarios', description: '/verify update' },
-      { value: 'accept-drift', label: 'Accept drift', description: 'Not user-visible' },
-      { value: 'dismiss', label: 'Dismiss', description: 'Not worth capturing' },
-    ],
+  const listDispositioned = deps.listDispositioned
+    || (() => listItems({
+      project: project.name, category: 'coverage-warning',
+      statuses: ['resolved', 'dismissed', 'superseded', 'expired'],
+    }));
+
+  const pendingCoverage = listPendingItems(
+    { project: project.name, category: 'coverage-warning' });
+
+  // Replay guard: a reprocess of an already-counted session must not double
+  // a debt's counters — legacy per-session shape (session_id) and the
+  // aggregated shape (session_ids union) both count. The DISPOSITIONED
+  // corpus counts too: marker-cleared bulk reprocess is a lived workflow
+  // here (52 sessions in the Jul-2026 backfill), and a replayed session
+  // whose contribution the operator already resolved/dismissed must be a
+  // no-op — resurrection is not recurrence. A genuinely NEW session after a
+  // disposition still files fresh (its id is in no corpus).
+  const carriesSession = (i) =>
+    i.evidence?.session_id === sessionId
+    || (Array.isArray(i.evidence?.session_ids)
+        && i.evidence.session_ids.includes(sessionId));
+  let alreadyCounted = pendingCoverage.some(carriesSession);
+  if (!alreadyCounted) {
+    try {
+      alreadyCounted = listDispositioned().some(carriesSession);
+    } catch (e) {
+      logError(`coverage-debt dispositioned-corpus check failed (${e.message}) — continuing on the pending corpus alone`);
+    }
+  }
+  if (alreadyCounted) return { filed: 0, appended: 0 };
+
+  // ONE standing item per (project, debt-class). Oldest wins as the append
+  // target (deterministic under the multiple-pending race); every other
+  // pending coverage item — legacy per-session filings and race residue —
+  // is absorbed: its evidence folds in and the item is superseded, so
+  // pre-aggregation piles collapse on the first post-upgrade session.
+  const standing = pendingCoverage
+    .filter((i) => i.evidence?.debt_class === COVERAGE_DEBT_CLASS)
+    .sort((a, b) => String(a.filed_at).localeCompare(String(b.filed_at)));
+  const target = standing[0] || null;
+  const absorbed = pendingCoverage.filter((i) => i !== target);
+
+  const nowIso = new Date().toISOString();
+  const sessionContrib = coverageContribution(
+    { session_id: sessionId, ui_paths: uiPaths, session_start: sessionStartIso }, nowIso);
+  let absorbedAgg = null;
+  for (const it of absorbed) {
+    absorbedAgg = foldCoverageEvidence(absorbedAgg, coverageContribution(it.evidence, it.filed_at));
+  }
+
+  const buildEvidence = (agg) => ({
+    debt_class: COVERAGE_DEBT_CLASS,
+    // Latest-session fields keep the legacy single-session reader shape.
+    session_id: sessionId,
+    session_start: sessionStartIso,
+    ...agg,
+    sessions: agg.session_ids.length,
+    ui_paths: Object.keys(agg.path_counts).sort(),
   });
-  return { filed: 1 };
+
+  let appended = 0;
+  if (target) {
+    // Write-time re-check: the item can resolve between the pending read and
+    // this write. A non-pending (or unreadable) target takes the
+    // fresh-after-disposition path — fresh counters, per the contract above.
+    const fresh = reloadItem(target.id);
+    if (fresh && fresh.status === 'pending') {
+      const agg = foldCoverageEvidence(
+        foldCoverageEvidence(coverageContribution(fresh.evidence, fresh.filed_at), absorbedAgg || {}),
+        sessionContrib);
+      const evidence = buildEvidence(agg);
+      fresh.evidence = evidence;
+      fresh.title = coverageDebtTitle(evidence);
+      fresh.summary = coverageDebtSummary(evidence);
+      fresh.urgency = coverageDebtUrgency(evidence.sessions);
+      fresh.filed_at = nowIso; // expiry clock = last recurrence (header comment)
+      fresh.context_anchor = `standing debt ${COVERAGE_DEBT_CLASS} — git log --since session start (${sessionId})`;
+      try {
+        saveItem(fresh);
+        appended = 1;
+      } catch (e) {
+        logError(`coverage-debt append to ${target.id} failed (${e.message}) — filing fresh instead`);
+      }
+    } else {
+      log(`coverage-debt item ${target.id} no longer pending at write time — filing fresh`);
+    }
+  }
+
+  let filed = 0;
+  let newId = null;
+  if (!appended) {
+    const agg = foldCoverageEvidence(absorbedAgg || { session_ids: [], path_counts: {} }, sessionContrib);
+    const evidence = buildEvidence(agg);
+    const created = file({
+      project: project.name,
+      project_path: project.path,
+      ...(project.unresolved ? { project_unresolved: true } : {}),
+      filed_by: 'ring3-close',
+      category: 'coverage-warning',
+      urgency: coverageDebtUrgency(evidence.sessions),
+      title: coverageDebtTitle(evidence),
+      summary: coverageDebtSummary(evidence),
+      context_anchor: `standing debt ${COVERAGE_DEBT_CLASS} — git log --since session start (${sessionId})`,
+      evidence,
+      options: [
+        { value: 'update', label: 'Update scenarios', description: '/verify update' },
+        { value: 'accept-drift', label: 'Accept drift', description: 'Not user-visible' },
+        { value: 'dismiss', label: 'Dismiss', description: 'Not worth capturing' },
+      ],
+    });
+    // createItem returns the new item's id STRING; test doubles may return
+    // an item object — accept both, never lose the successor reference.
+    newId = typeof created === 'string' ? created : (created?.id || null);
+    filed = 1;
+  }
+
+  // Absorbed items exit through the sanctioned verb, naming their successor.
+  const successor = appended ? target.id : (newId || 'the standing coverage-debt item');
+  for (const it of absorbed) {
+    try {
+      supersede(it.id, { reason: `absorbed into standing coverage-debt item ${successor} (${COVERAGE_DEBT_CLASS})` });
+    } catch (e) {
+      logError(`could not supersede absorbed coverage item ${it.id} (${e.message}) — its evidence is folded regardless`);
+    }
+  }
+
+  return { filed, appended };
 }
 
 // ---------------------------------------------------------------------------
@@ -2456,19 +2871,37 @@ async function main() {
     process.exit(1);
   }
 
-  // Resolve project
-  const project = resolveProject(args.cwd || process.cwd(), config);
-  log(`Project: ${project.name} (${project.path})`);
-  if (project.unresolved) {
-    logError(`Project identity UNRESOLVED for cwd ${args.cwd || process.cwd()} — filing under "${project.name}" with project_unresolved`);
+  // Resolve project — ONE resolution call shared by the live close and the
+  // manual-reprocess path (both enter through main()); the transcript's own
+  // project-dir slug is the attribution evidence, cwd only corroborates.
+  const runnerCwd = args.cwd || process.cwd();
+  const { project, cwdTrusted, slug: transcriptSlug } = resolveSessionProject(
+    { cwd: runnerCwd, transcriptPath: args.transcriptPath }, config);
+  log(`Project: ${project.name} (${project.path || 'no path — unresolved identity'})`);
+  if (!transcriptSlug) {
+    log('No transcript project-dir slug — trusting cwd (transcript outside ~/.claude/projects)');
+  } else if (!cwdTrusted) {
+    log(`cwd ${runnerCwd} is not this transcript's session cwd (slug ${transcriptSlug}) — reprocess-style invocation, live-cwd phases skipped`);
   }
+  if (project.unresolved) {
+    logError(`Project identity UNRESOLVED (cwd ${runnerCwd}, transcript ${args.transcriptPath || 'none'}) — filing under "${project.name}" with project_unresolved`);
+  }
+  // Slug-derived unresolved identity: inbox filing proceeds (items carry
+  // project_unresolved and land in /inbox's unresolved group), but no
+  // state-file or thread key is minted from a raw encoded-path name — those
+  // writers are skipped below.
+  const slugUnresolved = !!project.unresolved && !project.path;
 
   // --- Phase 2a: Worktree check (pre-transcript, pure git, zero cost) ---
   let worktreeItemsFiled = 0;
-  try {
-    worktreeItemsFiled = worktreeCheck(args.cwd, project);
-  } catch (e) {
-    logError(`Phase 2a failed: ${e.message}`);
+  if (cwdTrusted) {
+    try {
+      worktreeItemsFiled = worktreeCheck(runnerCwd, project);
+    } catch (e) {
+      logError(`Phase 2a failed: ${e.message}`);
+    }
+  } else {
+    log('Phase 2a: skipped — cwd is the runner\'s environment, not this session\'s');
   }
 
   // --- Preprocessing ---
@@ -2494,24 +2927,36 @@ async function main() {
 
   // Phase 2b: Session summary
   let summary = '';
-  try {
-    summary = await sessionSummary(compressed, project.slug, args.sessionId);
-  } catch (e) {
-    logError(`Phase 2b failed: ${e.message}`);
+  if (slugUnresolved) {
+    log('Phase 2b: skipped — unresolved identity; no state-file key minted from a transcript-slug name');
+  } else {
+    try {
+      summary = await sessionSummary(compressed, project.slug, args.sessionId);
+    } catch (e) {
+      logError(`Phase 2b failed: ${e.message}`);
+    }
   }
 
   // Phase 2b2: Thread capture
   let threadIds = [];
-  try {
-    threadIds = await threadCapture(compressed, project.slug, args.sessionId, summary, args.transcriptPath);
-    stats.threadsUpdated = threadIds.length;
-  } catch (e) {
-    logError(`Phase 2b2 failed: ${e.message}`);
+  if (slugUnresolved) {
+    log('Phase 2b2: skipped — unresolved identity; no thread key minted from a transcript-slug name');
+  } else {
+    try {
+      threadIds = await threadCapture(compressed, project.slug, args.sessionId, summary, args.transcriptPath);
+      stats.threadsUpdated = threadIds.length;
+    } catch (e) {
+      logError(`Phase 2b2 failed: ${e.message}`);
+    }
   }
+
+  // Session start (transcript-derived) — consumed by Phase 2c's
+  // create-vs-complete filter and the Phase 2q verify-coverage lens.
+  const sessionStartIso = sessionStartFromTranscript(args.transcriptPath);
 
   // Phase 2c: Work item closure
   try {
-    const result = await workItemClosure(compressed, project, threadIds);
+    const result = await workItemClosure(compressed, project, threadIds, sessionStartIso);
     stats.actionsClosed = result.closed;
     stats.actionsQueued += result.queued;
     stats.itemsFiled += result.queued;
@@ -2612,7 +3057,7 @@ async function main() {
   if (config.defaults?.verify_coverage !== false) {
     try {
       const r = verifyCoverageLens(
-        project, sessionStartFromTranscript(args.transcriptPath), args.sessionId);
+        project, sessionStartIso, args.sessionId);
       stats.itemsFiled += r.filed;
     } catch (e) {
       logError(`Phase 2q failed: ${e.message}`);
@@ -2744,4 +3189,9 @@ export {
   // Thread-capture hardening (act:e8793574). selectEarnedThreads,
   // extractRelatedFids, classifyApiError, and buildHealth are exported inline.
   threadCapture,
+  // Session attribution (act:29001b07). normalizeSlugKey,
+  // transcriptSlugFromPath, and resolveSessionProject are exported inline;
+  // these two are exported for the null-path guard tests.
+  workItemClosure,
+  methodologyCapture,
 };

@@ -45,8 +45,12 @@ export function assessRunCoherence(reviewDirs, auditRunIds) {
   const sorted = [...reviewDirs].sort((a, b) =>
     `${b.date}/${b.time}`.localeCompare(`${a.date}/${a.time}`));
   const newest = sorted[0];
-  const expectedId = `run-${newest.time}`;
-  if (ids.has(expectedId)) {
+  // Run ids are date-full since act:4ec70792 (run-<date>-<time>, minted by
+  // merge-findings); rows ingested before the change keep the legacy
+  // run-<time> shape, so both spellings count as ingested.
+  const expectedId = `run-${newest.date}-${newest.time}`;
+  const legacyId = `run-${newest.time}`;
+  if (ids.has(expectedId) || ids.has(legacyId)) {
     return { coherent: true, uningested: [] };
   }
   return { coherent: false, uningested: [{ date: newest.date, time: newest.time, expectedId }] };

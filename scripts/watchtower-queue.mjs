@@ -37,8 +37,22 @@ function ensureDir(dir) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
+// Shape guard: ids normally come from generateId()/readdirSync basenames,
+// but exported helpers take caller-supplied ids and evidence fields
+// (possible_duplicate_of) persist id arrays that later flow back in here —
+// reject anything that could escape QUEUE_DIR instead of joining it. Every
+// caller-supplied id → path join goes through this (itemPath AND
+// getEnrichment's directory join).
+function assertLegalItemId(id) {
+  if (typeof id !== 'string' || !id || id.startsWith('.')
+      || id.includes('/') || id.includes('\\') || id.includes('..')) {
+    throw new Error(`watchtower-queue: illegal item id ${JSON.stringify(id)}`);
+  }
+  return id;
+}
+
 function itemPath(id) {
-  return join(QUEUE_DIR, `${id}.json`);
+  return join(QUEUE_DIR, `${assertLegalItemId(id)}.json`);
 }
 
 function atomicWrite(filePath, data) {
@@ -368,6 +382,15 @@ export function isHighConfidenceSignoff(item) {
   if (item.urgency === 'urgent') return false;
   // An explicit low-confidence stamp means "look at this one".
   if (item.confidence === 'low') return false;
+  // Surfacing-intelligence annotations (act:00051dca) demote to individual
+  // review: an overtaken draft (cites since-closed work) or a fold candidate
+  // wants a human look, not a batch nod. Key on the SEMANTIC value, never on
+  // field presence — a future benign "checked, still fresh" stamp under the
+  // same key must not silently demote the whole knowledge-extraction class.
+  if (item.evidence && item.evidence.freshness
+      && item.evidence.freshness.overtaken === true) return false;
+  if (item.evidence && Array.isArray(item.evidence.possible_duplicate_of)
+      && item.evidence.possible_duplicate_of.length > 0) return false;
   return true;
 }
 
@@ -391,6 +414,178 @@ export function partitionForBatchSignoff(items) {
     else individual.push(item);
   }
   return { signoff, individual };
+}
+
+// --- Surfacing intelligence: draft freshness + fold proposals (act:00051dca) ---
+//
+// Ring 2's slow tier sweeps PENDING knowledge-extraction drafts and attaches
+// two ADDITIVE evidence annotations (no new categories, no schema change,
+// and NEVER an auto-dismissal — an annotation demotes confidence so the item
+// routes to `individual` in partitionForBatchSignoff; the human decides):
+//
+//   evidence.freshness = { overtaken: true, cited: [{fid, closed_at}] }
+//     The draft cites act: fids that are now closed — possibly overtaken.
+//     Written ONLY when overtaken (negative-only), and deliberately carries
+//     no timestamp: the value is a pure function of (draft, pib-db state),
+//     so a re-sweep recomputes the identical object and annotateItemEvidence
+//     skips the write (idempotent across the 30-min slow ticks). The cited
+//     fid + close date ride along so /inbox can render "cites act:X, closed
+//     YYYY-MM-DD" without re-resolving another project's pib-db.
+//
+//   evidence.possible_duplicate_of = ['dec-...']  (sorted; reciprocal)
+//     A fold proposal: another PENDING draft in the same project words the
+//     same lesson (unigram Jaccard >= FOLD_SIMILARITY_THRESHOLD). Both sides
+//     of a surfaced pair are annotated (reciprocity is the self-validating
+//     criterion). The annotation persists after its partner resolves — a
+//     draft whose twin was already dispositioned still wants a human look,
+//     not a batch sign-off.
+//
+// This apparatus is the deliberate SIBLING of ring3-close's dedup tokenizer
+// (STOPWORDS/meaningfulTokens/OVERLAP_THRESHOLD): same concept ("do these two
+// short texts describe the same thing"), different corpus and metric. Lane
+// boundaries forced the fork (ring3-close and watchtower-lib are other lanes'
+// files); ring3-close already imports from this module, so a later
+// consolidation can flow ring3 → queue.
+
+// Fid extraction: matches are the ONLY values that ever reach a pib-db query
+// (bound as parameters, never interpolated) — the regex is the validation.
+const ACT_FID_RE = /\bact:[0-9a-f]{8}\b/g;
+
+// Cap per draft so a pathological draft can't build an unbounded lookup.
+const MAX_CITED_FIDS = 50;
+
+/**
+ * Extract unique cited `act:` fids from draft text, in order of first
+ * appearance, capped at MAX_CITED_FIDS. Non-string/empty input → [].
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function extractCitedActFids(text) {
+  if (typeof text !== 'string' || !text) return [];
+  const out = [];
+  for (const m of text.match(ACT_FID_RE) || []) {
+    if (!out.includes(m)) {
+      out.push(m);
+      if (out.length >= MAX_CITED_FIDS) break;
+    }
+  }
+  return out;
+}
+
+// The fold recipe — calibrated 2026-07-12 against the live pairs that a full
+// human read of 510 pending drafts surfaced as real fold candidates:
+//   Boolean#cast trio  dec-5f850429 / dec-b2dc5070 / dec-f3446e84
+//     (hub pairs 0.246 and 0.311 surface; the third pair measures 0.218 —
+//     just under — so the trio connects through its hub, and reciprocal
+//     annotation still marks all three)
+//   testimonials pair  dec-eb6dcdb4 / dec-dd944a5b  (0.600)
+// with a noise ceiling of 0.12 across random unrelated drafts. Tokens are
+// lowercase alphanumeric RUNS ("Boolean#cast" → boolean, cast) —
+// compound-preserving tokenization scored the trio at 0.13–0.18 and missed
+// it. Exact per-pair figures are asserted in draft-surfacing.test.mjs F1.
+export const FOLD_SIMILARITY_THRESHOLD = 0.22;
+
+// Short-text floor (mirrors ring3-close's SHORT-TITLE FLOOR): a draft that
+// can't muster this many meaningful tokens never proposes a fold — two
+// near-empty token sets trivially score high on shared boilerplate.
+export const FOLD_MIN_TOKENS = 3;
+
+const FOLD_STOPWORDS = new Set(('a about after all also an and any are as at be because been before '
+  + 'being but by can could did do does done for from had has have how i if in into is it its just '
+  + 'like may more most much my new no not now of on one only or other our out over so some than '
+  + 'that the then there these they this to too two under up use used using very via was we were '
+  + 'what when where which while who why will with within would you your lesson').split(' '));
+
+/**
+ * Tokenize text for the fold pass: lowercase alphanumeric runs, length >= 3,
+ * stopworded. Returns a Set.
+ * @param {string} text
+ * @returns {Set<string>}
+ */
+export function foldTokens(text) {
+  const tokens = new Set();
+  if (typeof text !== 'string' || !text) return tokens;
+  for (const w of text.toLowerCase().match(/[a-z0-9]+/g) || []) {
+    if (w.length >= 3 && !FOLD_STOPWORDS.has(w)) tokens.add(w);
+  }
+  return tokens;
+}
+
+/**
+ * Unigram Jaccard over two token Sets. Empty sets never match (0, never NaN).
+ * @param {Set<string>} a
+ * @param {Set<string>} b
+ * @returns {number}
+ */
+export function unigramJaccard(a, b) {
+  if (!(a instanceof Set) || !(b instanceof Set) || a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  const union = a.size + b.size - inter;
+  return union === 0 ? 0 : inter / union;
+}
+
+/**
+ * Propose fold candidates over a set of pending drafts (one project's).
+ * Pure — no I/O, no writes. Compares title + draft_artifact pairwise;
+ * items below the FOLD_MIN_TOKENS floor or without an id never pair.
+ * @param {Array} items
+ * @param {object} [opts]
+ * @param {number} [opts.threshold]
+ * @returns {Array<{a: string, b: string, similarity: number}>}
+ */
+export function proposeFolds(items, { threshold = FOLD_SIMILARITY_THRESHOLD } = {}) {
+  const eligible = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item.id !== 'string' || !item.id) continue;
+    const tokens = foldTokens(`${item.title || ''}\n${item.draft_artifact || ''}`);
+    if (tokens.size < FOLD_MIN_TOKENS) continue;
+    eligible.push({ id: item.id, tokens });
+  }
+  const pairs = [];
+  for (let i = 0; i < eligible.length; i++) {
+    for (let j = i + 1; j < eligible.length; j++) {
+      const similarity = unigramJaccard(eligible[i].tokens, eligible[j].tokens);
+      if (similarity >= threshold) {
+        pairs.push({ a: eligible[i].id, b: eligible[j].id, similarity });
+      }
+    }
+  }
+  return pairs;
+}
+
+/**
+ * Merge ADDITIVE annotation fields into a PENDING item's evidence.
+ * The write discipline (every clause is load-bearing):
+ *   - fresh read immediately before the write — the pending fence is checked
+ *     at WRITE time, so a sweep racing an operator disposition can never
+ *     resurrect a resolved item from a stale in-memory copy;
+ *   - only the named evidence fields are touched, on the FRESH copy
+ *     (schema_version and every other field ride through unchanged);
+ *   - deep-equal values skip the write entirely (idempotent re-sweeps).
+ * Returns null when the item is missing or no longer pending (skip, not an
+ * error), else { item, changed }.
+ * @param {string} id
+ * @param {object} patch - evidence fields to set (values replace wholesale)
+ * @returns {{item: object, changed: boolean}|null}
+ */
+export function annotateItemEvidence(id, patch) {
+  const fp = itemPath(id);
+  if (!existsSync(fp)) return null;
+  const item = readItem(fp);
+  if (item.status !== 'pending') return null;
+  const evidence = { ...(item.evidence || {}) };
+  let changed = false;
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (JSON.stringify(evidence[key]) !== JSON.stringify(value)) {
+      evidence[key] = value;
+      changed = true;
+    }
+  }
+  if (!changed) return { item, changed: false };
+  item.evidence = evidence;
+  atomicWrite(fp, item);
+  return { item, changed: true };
 }
 
 // --- Exports ---
@@ -729,7 +924,7 @@ export function getItem(id) {
  * @returns {object}
  */
 export function getEnrichment(id) {
-  const enrichDir = join(QUEUE_DIR, id, 'enrichment');
+  const enrichDir = join(QUEUE_DIR, assertLegalItemId(id), 'enrichment');
   const files = {
     code_context: 'code-context.md',
     related_decisions: 'related-decisions.md',

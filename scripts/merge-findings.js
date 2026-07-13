@@ -13,7 +13,7 @@
 //   PIB_DB_PATH  — path to SQLite file (for --db mode)
 
 import { readdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 
@@ -91,7 +91,14 @@ for (const file of files) {
 // Write run-summary.json
 // ---------------------------------------------------------------------------
 const timestamp = new Date().toISOString();
-const runId = `run-${basename(runDir)}`;
+// Date-full run ids (act:4ec70792): a bare run-<HH-MM-SS> id collides with a
+// same-clock-second run on another day. In the canonical reviews/<date>/<time>
+// layout the parent dir carries the date — fold it in. Any other layout keeps
+// the leaf-name fallback.
+const runParent = basename(dirname(resolve(runDir)));
+const runId = /^\d{4}-\d{2}-\d{2}$/.test(runParent)
+  ? `run-${runParent}-${basename(runDir)}`
+  : `run-${basename(runDir)}`;
 
 const meta = {
   runId,

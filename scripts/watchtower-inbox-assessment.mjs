@@ -53,6 +53,7 @@ import {
   bucketResolution,
   ENGAGED_TYPES,
   DISCARDED_TYPES,
+  MACHINE_TYPES,
 } from './watchtower-cross-ring-reader.mjs';
 import { listPending, listItems } from './watchtower-queue.mjs';
 import { loadActiveThreads, threadMatchesProject, slugify } from './watchtower-lib.mjs';
@@ -67,7 +68,7 @@ export const DERIVED_STATES = ['keeping', 'losing', 'not-consumed', 'too-little-
 
 // Re-export the classifier vocabulary so callers/tests read it from ONE place
 // (these are re-derived from the reader, not re-declared).
-export { bucketResolution, ENGAGED_TYPES, DISCARDED_TYPES };
+export { bucketResolution, ENGAGED_TYPES, DISCARDED_TYPES, MACHINE_TYPES };
 
 const DAY_MS = 86400000;
 
@@ -81,6 +82,17 @@ export const SMALL_PILE = 3;              // fewer pending than this = small
 export const FEW_DECISIONS_EVER = 3;      // fewer typed decisions ever than this = sparse
 export const HEALTHY_KEEP_RATIO = 0.5;    // engaged >= discarded to read as "keeping"
 export const OVER_EAGER_THREAD_COUNT = 5; // a session in >5 threads = over-eager cutting
+// Absolute-pile overrides (act:ab4927eb): a pile deep or old enough is ITSELF
+// the finding — the state can never read "keeping", however honest the keep
+// ratio and however recent the work. Calibrated against the 2026-07-12
+// morning regression fixture (884 pending, oldest 29d, healthy ratio, recent
+// work — reported all-keeping; must read not-consumed) while the low-cadence
+// boundary fixture (small pile, old-ish tail, recent human triage) must keep
+// reading "keeping": the age arm therefore requires a real pile, not one old
+// item in a small, actively-triaged queue.
+export const ABS_PENDING_NOT_KEEPING = 50; // a pile this deep can never read as keeping
+export const ABS_OLDEST_AGE_DAYS = 21;     // a tail this old...
+export const ABS_AGE_MIN_PILE = 10;        // ...on a pile at least this deep
 
 // Ring cadences (ms) for the staleness check — 2x cadence = stale. Ring 3 has
 // no fixed cadence (it fires at session close), so it is never called stale on
@@ -128,17 +140,32 @@ export function assessKeptKnowledge(name, {
   nowMs = Date.now(),
   recentDays = RECENT_DECISION_DAYS,
 } = {}) {
-  let all = [];
+  let raw = [];
   try {
-    all = listItems({ project: name, statuses: ['resolved', 'dismissed'] });
+    raw = listItems({ project: name, statuses: ['resolved', 'dismissed'] });
   } catch {
-    all = [];
+    raw = [];
+  }
+  // Machine acts (Ring 1 auto-reconciliations, bucketResolution 'machine')
+  // are NOT decisions and NOT operator engagement — the binding
+  // grp:wt-noise-immunity convention. They are filtered out of the decision
+  // corpus BEFORE the event-window slice (a burst of auto-retractions must
+  // not crowd real decisions out of the newest-N window) and never count
+  // toward worked_recent (cron activity masquerading as engagement would
+  // silently defeat the not-consumed detector). Surfaced as a count, never
+  // silently dropped.
+  const all = [];
+  let machineResolutions = 0;
+  for (const it of raw) {
+    if (bucketResolution(it.resolution_type) === 'machine') machineResolutions++;
+    else all.push(it);
   }
   // listItems returns newest-first by (resolved_at || filed_at).
   const windowItems = all.slice(0, eventWindowN);
 
-  // Time-windowed engagement — dispositions in the last recentDays (any type;
-  // even an untyped resolve is the operator touching the inbox).
+  // Time-windowed engagement — HUMAN dispositions in the last recentDays (any
+  // non-machine type; even an untyped resolve is the operator touching the
+  // inbox).
   const recentCutoff = nowMs - recentDays * DAY_MS;
   let workedRecent = 0;
   for (const it of all) {
@@ -180,12 +207,20 @@ export function assessKeptKnowledge(name, {
     recent_days: recentDays,
     // null (not 0, not a fabricated ratio) when nothing typed was decided.
     keep_ratio_recent: decidedRecent > 0 ? engagedRecent / decidedRecent : null,
-    // All-time mix, same shape/vocabulary as the cross-ring reader's.
+    // Machine acts, surfaced honestly beside the human numbers (they are in
+    // resolution_mix.machine and machine_resolutions, nowhere else).
+    machine_resolutions: machineResolutions,
+    // All-time mix, same vocabulary as the cross-ring reader's — with ONE
+    // known key divergence predating this shape: the reader spells the
+    // residual bucket 'untyped_or_other', this mix spells it 'other'. Do not
+    // copy either shape assuming the other; a rename is a breaking change
+    // for existing consumers, so it is documented instead.
     resolution_mix: {
       engaged: engagedTotal,
       discarded: discardedTotal,
+      machine: machineResolutions,
       other: otherTotal,
-      total: all.length,
+      total: raw.length,
     },
     decided_total: decidedTotal,
     keep_ratio_all: decidedTotal > 0 ? engagedTotal / decidedTotal : null,
@@ -193,6 +228,40 @@ export function assessKeptKnowledge(name, {
 }
 
 // --- Axis 2: backlog rot -----------------------------------------------------
+
+// Aggregated standing-debt items (Lane B's per-debt append, grp:wt-noise-
+// immunity) re-file fresh each time the debt persists, so filed_at is always
+// young — the DEBT's age lives in evidence.first_seen (oldest evidence date)
+// and its weight in the accumulated session count. Rot must age the debt,
+// not the file: first_seen wins when parseable (falls back to filed_at —
+// every pre-existing item lacks the field, and an unparseable date must
+// degrade, never silently drop the item from the rot counts), and an
+// aggregated item counts its sessions toward the over-30d/90d piles so one
+// 49-session debt can trip MIN_PILE_FOR_ROT by itself. pending_count stays
+// the literal item count — it feeds SMALL_PILE and the deep-pile override,
+// where what the operator sees in /inbox is the honest number.
+function itemRotAgeDays(item, nowMs) {
+  const ev = item && item.evidence;
+  const firstSeen = ev && typeof ev.first_seen === 'string' ? Date.parse(ev.first_seen) : NaN;
+  const filed = Date.parse(item && item.filed_at);
+  const ts = Number.isFinite(firstSeen) ? firstSeen : filed;
+  return Number.isFinite(ts) ? (nowMs - ts) / DAY_MS : null;
+}
+
+function itemSessionWeight(item) {
+  const ev = item && item.evidence;
+  // session_ids is the LIVE producer spelling: Lane B's standing-debt
+  // aggregation (act:e888dd63) unions per-session ids into
+  // evidence.session_ids, and its own renderer counts that array. The
+  // other spellings are tolerated for future/hand-filed shapes — a
+  // consumer that keys on one spelling silently weighs everything else 1
+  // (the dedup-by-one-key blind spot).
+  if (ev && Number.isInteger(ev.session_count) && ev.session_count >= 1) return ev.session_count;
+  if (ev && Array.isArray(ev.session_ids) && ev.session_ids.length >= 1) return ev.session_ids.length;
+  if (ev && Array.isArray(ev.sessions) && ev.sessions.length >= 1) return ev.sessions.length;
+  if (ev && Number.isInteger(ev.sessions) && ev.sessions >= 1) return ev.sessions;
+  return 1;
+}
 
 export function assessBacklogRot(name, { nowMs = Date.now() } = {}) {
   let pending = [];
@@ -204,19 +273,26 @@ export function assessBacklogRot(name, { nowMs = Date.now() } = {}) {
   let oldest = 0;
   let over30 = 0;
   let over90 = 0;
+  let items30 = 0;
+  let items90 = 0;
   for (const it of pending) {
-    const filed = Date.parse(it.filed_at);
-    if (!Number.isFinite(filed)) continue;
-    const ageDays = (nowMs - filed) / DAY_MS;
+    const ageDays = itemRotAgeDays(it, nowMs);
+    if (ageDays == null) continue;
+    const weight = itemSessionWeight(it);
     if (ageDays > oldest) oldest = ageDays;
-    if (ageDays >= ROT_AGE_DAYS) over30++;
-    if (ageDays >= DEEP_ROT_AGE_DAYS) over90++;
+    if (ageDays >= ROT_AGE_DAYS) { over30 += weight; items30++; }
+    if (ageDays >= DEEP_ROT_AGE_DAYS) { over90 += weight; items90++; }
   }
   return {
     pending_count: pending.length,
     oldest_age_days: Math.floor(oldest),
     count_over_30d: over30,
     count_over_90d: over90,
+    // Raw item counts beside the session-weighted ones — the renderer must
+    // never call weighted debt "items" (an operator cross-checking /inbox
+    // would see the item count, not the weight).
+    items_over_30d: items30,
+    items_over_90d: items90,
   };
 }
 
@@ -330,7 +406,28 @@ export function assessRingsAlive(stateDir, { nowMs = Date.now() } = {}) {
       days_since_run: ageMs != null ? Math.floor(ageMs / DAY_MS) : null,
     };
   }
-  return { rings, all_ok: !anyDown && !anyStale, any_down: anyDown, any_stale: anyStale };
+  // The Ring 2 slow draft-annotation sweep's positive-confirmation sidecar
+  // (its named READER — write-only telemetry is waste). Informational only:
+  // it never flips all_ok, because an absent/frozen sidecar can mean the
+  // operator disabled defaults.draft_annotations on purpose, and a false
+  // "needs a look" would erode the trust surface this module IS.
+  const sweep = safeReadJSON(join(stateDir, 'draft-annotations-health.json'));
+  let draftSweep = { present: false, days_since_run: null, items_scanned: null };
+  if (sweep) {
+    const runMs = Date.parse(sweep.last_run);
+    draftSweep = {
+      present: true,
+      days_since_run: Number.isFinite(runMs) ? Math.floor((nowMs - runMs) / DAY_MS) : null,
+      items_scanned: typeof sweep.items_scanned === 'number' ? sweep.items_scanned : null,
+    };
+  }
+  return {
+    rings,
+    all_ok: !anyDown && !anyStale,
+    any_down: anyDown,
+    any_stale: anyStale,
+    draft_sweep: draftSweep,
+  };
 }
 
 // --- Axis 5: not-discarding (recall canary) ----------------------------------
@@ -368,17 +465,30 @@ export function assessNotDiscarding(name, stateDir) {
 
 // --- The derived state (pure) ------------------------------------------------
 
-// deriveAssessmentState — the ONE derived state from the axis numbers. PURE,
-// no I/O — the survivorship-guard and the four-state coverage tests target this
-// directly. Order is precedence, and it is load-bearing:
+// deriveAssessmentDetail — the ONE derived state from the axis numbers, plus
+// WHICH signal produced it (a not-consumed verdict must render its actual
+// evidence — the reasons map to distinct plainState wordings so the trust
+// surface never asserts "no recent decisions" about a pile that is being
+// actively drained). PURE, no I/O — the survivorship-guard and the four-state
+// coverage tests target this directly. Order is precedence, and it is
+// load-bearing:
 //
-//   1. not-consumed — a REAL rotting pile (>= MIN_PILE_FOR_ROT items past 30d)
-//      with ~0 recent dispositions (worked_recent, time-windowed). The
-//      SURVIVORSHIP GUARD: this wins even when the keep ratio is high, because a
-//      great keep ratio computed only from the handful that got decided (and
-//      possibly long ago) says nothing about the pile nobody has looked at
-//      lately. Requires a real pile (not one stale item) so a lone old item
-//      cannot masquerade as "not consuming".
+//   1. not-consumed / rotting-pile — a REAL rotting pile (>= MIN_PILE_FOR_ROT
+//      items past 30d) with ~0 recent HUMAN dispositions (worked_recent is
+//      time-windowed and machine-excluded). The SURVIVORSHIP GUARD: this wins
+//      even when the keep ratio is high, because a great keep ratio computed
+//      only from the handful that got decided (and possibly long ago) says
+//      nothing about the pile nobody has looked at lately. Requires a real
+//      pile (not one stale item) so a lone old item cannot masquerade as
+//      "not consuming".
+//   1b. not-consumed / deep-pile | old-tail — the ABSOLUTE overrides
+//      (act:ab4927eb): a pile past ABS_PENDING_NOT_KEEPING, or a tail past
+//      ABS_OLDEST_AGE_DAYS on a pile of at least ABS_AGE_MIN_PILE, can never
+//      read "keeping" — even mid-drain, even with an honest ratio. The pile
+//      is itself the finding (the 2026-07-12 morning failure: 884 pending /
+//      29d tail read as all-keeping because 29 < 30 and work was recent).
+//      The age arm's pile floor is what keeps the low-cadence boundary case
+//      (small pile, old-ish tail, recent triage) reading "keeping".
 //   2. losing — the recall canary is alerting (dedup may be over-suppressing
 //      NOVEL knowledge before it is even filed). Active knowledge loss.
 //   3. too-little-data — sparse decisions ever AND a small pile: honestly not
@@ -388,7 +498,7 @@ export function assessNotDiscarding(name, stateDir) {
 //      recently, with no alert.
 //   5. residual — sparse ⇒ too-little-data; otherwise keeping (being worked,
 //      no rot, no alert).
-export function deriveAssessmentState(axes = {}) {
+export function deriveAssessmentDetail(axes = {}) {
   const {
     keep_ratio_all = null,
     keep_ratio_recent = null,
@@ -396,6 +506,7 @@ export function deriveAssessmentState(axes = {}) {
     worked_recent = 0,
     pending_count = 0,
     count_over_30d = 0,
+    oldest_age_days = 0,
     recall_alert = false,
   } = axes;
 
@@ -406,12 +517,24 @@ export function deriveAssessmentState(axes = {}) {
   const smallPile = pending_count < SMALL_PILE;
   const fewEver = decided_total < FEW_DECISIONS_EVER;
 
-  if (oldPile && noRecentWork) return 'not-consumed';
-  if (recall_alert) return 'losing';
-  if (fewEver && smallPile) return 'too-little-data';
-  if (keepRatio != null && keepRatio >= HEALTHY_KEEP_RATIO && beingWorked) return 'keeping';
-  if (fewEver) return 'too-little-data';
-  return 'keeping';
+  if (oldPile && noRecentWork) return { state: 'not-consumed', reason: 'rotting-pile' };
+  if (pending_count >= ABS_PENDING_NOT_KEEPING) return { state: 'not-consumed', reason: 'deep-pile' };
+  if (oldest_age_days >= ABS_OLDEST_AGE_DAYS && pending_count >= ABS_AGE_MIN_PILE) {
+    return { state: 'not-consumed', reason: 'old-tail' };
+  }
+  if (recall_alert) return { state: 'losing', reason: 'recall-alert' };
+  if (fewEver && smallPile) return { state: 'too-little-data', reason: 'sparse' };
+  if (keepRatio != null && keepRatio >= HEALTHY_KEEP_RATIO && beingWorked) {
+    return { state: 'keeping', reason: 'worked-and-kept' };
+  }
+  if (fewEver) return { state: 'too-little-data', reason: 'sparse' };
+  return { state: 'keeping', reason: 'worked-and-kept' };
+}
+
+// deriveAssessmentState — the state string alone; thin wrapper kept as the
+// stable public surface (existing tests and consumers target it).
+export function deriveAssessmentState(axes = {}) {
+  return deriveAssessmentDetail(axes).state;
 }
 
 // --- Assemblers --------------------------------------------------------------
@@ -441,13 +564,14 @@ export function assembleProjectAssessment({
   const rings = ringsAlive || assessRingsAlive(sd, { nowMs });
   const recall = assessNotDiscarding(name, sd);
 
-  const state = deriveAssessmentState({
+  const { state, reason } = deriveAssessmentDetail({
     keep_ratio_all: kept.keep_ratio_all,
     keep_ratio_recent: kept.keep_ratio_recent,
     decided_total: kept.decided_total,
     worked_recent: kept.worked_recent,
     pending_count: backlog.pending_count,
     count_over_30d: backlog.count_over_30d,
+    oldest_age_days: backlog.oldest_age_days,
     recall_alert: recall.alert,
   });
 
@@ -456,6 +580,7 @@ export function assembleProjectAssessment({
     slug: resolvedSlug,
     path: path || null,
     state,
+    state_reason: reason,
     kept_knowledge: kept,
     backlog_rot: backlog,
     thread_health: threads,
@@ -558,7 +683,22 @@ export function plainState(view) {
     case 'losing':
       return `losing knowledge — the dedup may be over-suppressing new lessons (recall alert)`;
     case 'not-consumed': {
+      // Word the verdict from the signal that actually fired — the absolute
+      // overrides can fire on a pile that IS being drained, and this line
+      // must never falsely assert "no recent decisions" about it.
+      if (view.state_reason === 'deep-pile') {
+        return `not being worked down — ${b.pending_count} pending, oldest ${b.oldest_age_days}d; too deep to read as keeping`;
+      }
+      if (view.state_reason === 'old-tail') {
+        return `not being worked down — ${b.pending_count} pending with the oldest sitting ${b.oldest_age_days}d`;
+      }
+      // Weighted debt is not "items": one aggregated standing debt can carry
+      // many sessions. Say "items" only when the numbers agree.
       const pile = b.count_over_30d;
+      const items = b.items_over_30d != null ? b.items_over_30d : pile;
+      if (pile !== items) {
+        return `not being worked — ${pile} sessions of standing debt across ${items} item${items === 1 ? '' : 's'} sitting 30+ days with about no recent decisions`;
+      }
       return `not being worked — ${pile} item${pile === 1 ? '' : 's'} sitting 30+ days with about no recent decisions`;
     }
     case 'too-little-data':
@@ -615,9 +755,15 @@ function renderProjectText(view) {
     ? `all time, kept ${k.resolution_mix.engaged} of ${k.decided_total}`
     : `all time, ${k.decided_total} typed decision${k.decided_total === 1 ? '' : 's'}`;
   lines.push(`  Kept knowledge: ${recentRatio}; ${allRatio}.`);
-  // Backlog rot
-  lines.push(`  Backlog: ${b.pending_count} pending, oldest ${b.oldest_age_days}d`
-    + `, ${b.count_over_30d} past 30d, ${b.count_over_90d} past 90d.`);
+  // Backlog rot — weighted debt labeled as such when it diverges from the
+  // literal item count.
+  const w30 = b.items_over_30d != null && b.items_over_30d !== b.count_over_30d
+    ? `${b.count_over_30d} session-weighted past 30d (${b.items_over_30d} item${b.items_over_30d === 1 ? '' : 's'})`
+    : `${b.count_over_30d} past 30d`;
+  const w90 = b.items_over_90d != null && b.items_over_90d !== b.count_over_90d
+    ? `${b.count_over_90d} session-weighted past 90d (${b.items_over_90d} item${b.items_over_90d === 1 ? '' : 's'})`
+    : `${b.count_over_90d} past 90d`;
+  lines.push(`  Backlog: ${b.pending_count} pending, oldest ${b.oldest_age_days}d, ${w30}, ${w90}.`);
   // Thread health
   const smells = [];
   if (t.over_eager_sessions > 0) smells.push(`${t.over_eager_sessions} over-cut session${t.over_eager_sessions === 1 ? '' : 's'}`);
@@ -631,6 +777,11 @@ function renderProjectText(view) {
       .filter(([, v]) => v.state === 'down' || v.state === 'stale')
       .map(([key, v]) => `${key} ${v.state}`);
     lines.push(`  Rings: ${rings.all_ok ? 'all alive' : `needs a look — ${bad.join(', ')}`}.`);
+    const ds = rings.draft_sweep;
+    if (ds && ds.present && ds.days_since_run != null) {
+      lines.push(`  Draft sweep: last ran ${ds.days_since_run}d ago`
+        + (ds.items_scanned != null ? `, ${ds.items_scanned} drafts scanned` : '') + '.');
+    }
   }
   // Not-discarding
   if (!r.present) {

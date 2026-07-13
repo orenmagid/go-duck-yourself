@@ -38,7 +38,10 @@ import {
   loadActiveThreads, threadsForItem, suppressionLedgerPath,
   recordApiUsage, computeActivitySignature, shouldRunIdlePass, markIdlePassRan,
 } from './watchtower-lib.mjs';
-import { expireItem, listItems } from './watchtower-queue.mjs';
+import {
+  expireItem, listItems,
+  extractCitedActFids, proposeFolds, annotateItemEvidence,
+} from './watchtower-queue.mjs';
 
 // Shared thread-file reader (single source of truth in watchtower-lib.mjs).
 // Re-exported so ring2's existing tests (ring2-thread-context.test.mjs) keep
@@ -136,7 +139,9 @@ function openPibDb(projectPath) {
   }
 
   try {
-    return new Database(dbPath, { readonly: true });
+    // timeout: ring3 parity — interactive sessions hold write locks; a busy
+    // wait beats a spurious SQLITE_BUSY skip.
+    return new Database(dbPath, { readonly: true, timeout: 5000 });
   } catch (e) {
     logError(`openPibDb ${projectPath}: ${String(e.message).split('\n')[0]}`);
     return null;
@@ -2027,6 +2032,163 @@ export function recallCanary(config, { nowMs = Date.now() } = {}) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Draft surfacing-intelligence sweep (act:00051dca)
+// ---------------------------------------------------------------------------
+//
+// Annotates PENDING knowledge-extraction drafts with the two surfacing
+// signals the 2026-07-12 full inbox read proved a human otherwise catches
+// only by reading everything:
+//   freshness — the draft cites act: fids that have since CLOSED in the
+//     item's project pib-db (possibly overtaken by events);
+//   folds — another pending draft in the same project words the same lesson
+//     (unigram Jaccard, watchtower-queue.mjs owns the recipe).
+// Annotations are ADDITIVE evidence fields written through the queue lib's
+// annotateItemEvidence (fresh-read pending fence at write time, idempotent
+// re-sweeps). They demote items out of the batch sign-off — never dismiss.
+//
+// Failure posture per the tri-state discipline: only a POSITIVELY-found
+// closed action annotates. Fid-not-found, missing/unreadable db, and
+// unresolved projects all mean "unknown" — no annotation, the draft stays
+// batch-eligible, the skip is LOUD (logged + counted in the summary
+// sidecar), and one bad project never aborts the rest of the sweep.
+//
+// Positive confirmation that the sweep ran (built-but-never-fired guard):
+// every run writes state/draft-annotations-health.json with counts, so
+// "no annotations" is distinguishable from "never ran".
+
+export function runDraftAnnotationSweep(config, deps = {}) {
+  const {
+    listPendingFn = listPending,
+    annotateFn = annotateItemEvidence,
+    openDb = openPibDb,
+    watchtowerDir = WATCHTOWER_DIR,
+    nowIso = () => new Date().toISOString(),
+  } = deps;
+  const summary = {
+    projects_scanned: 0,
+    items_scanned: 0,
+    freshness_annotated: 0,
+    fold_annotated: 0,
+    skipped_projects: [],
+    // Drafts filed under a project NOT in config.projects (incl.
+    // project_unresolved items) are never swept — they stay batch-eligible
+    // with no chance of demotion, so the exclusion must be COUNTED, never
+    // invisible.
+    unscanned_items: 0,
+    errors: 0,
+  };
+  const projects = (config && config.projects) || {};
+  try {
+    summary.unscanned_items = listPendingFn({ category: 'knowledge-extraction' })
+      .filter((i) => typeof i.draft_artifact === 'string' && i.draft_artifact.trim()
+        && !Object.prototype.hasOwnProperty.call(projects, i.project)).length;
+  } catch { /* visibility only — never blocks the sweep */ }
+  for (const [name, proj] of Object.entries(projects)) {
+    const projectPath = (proj && proj.path) || proj;
+    let drafts = [];
+    try {
+      drafts = listPendingFn({ project: name, category: 'knowledge-extraction' })
+        .filter((i) => typeof i.draft_artifact === 'string' && i.draft_artifact.trim());
+    } catch (e) {
+      logError(`Draft sweep ${name}: listPending failed: ${e.message}`);
+      summary.errors++;
+      continue;
+    }
+    if (drafts.length === 0) continue;
+    summary.projects_scanned++;
+    summary.items_scanned += drafts.length;
+
+    // Freshness: cited fids resolved against THIS item's project pib-db.
+    let db = null;
+    if (typeof projectPath === 'string' && projectPath && existsSync(projectPath)) {
+      db = openDb(projectPath); // logs + returns null on failure
+    }
+    if (db) {
+      try {
+        // Probe the schema ONCE per db: only a positively-missing deleted_at
+        // column drops the soft-delete guard. A transient error must NOT
+        // silently degrade to the unguarded query (a soft-deleted action is
+        // "unknown", never "closed") — on probe failure we keep the guard and
+        // let the per-item catch log any real query error.
+        let hasDeletedAt = true;
+        try {
+          db.prepare('SELECT deleted_at FROM actions LIMIT 1');
+        } catch (e) {
+          if (/no such column/i.test(String(e.message))) hasDeletedAt = false;
+        }
+        for (const item of drafts) {
+          try {
+            const fids = extractCitedActFids(`${item.title || ''}\n${item.draft_artifact}`);
+            if (fids.length === 0) continue;
+            // Parameter-bound placeholders only — fids are regex matches, but
+            // they originate in model-drafted text and never touch SQL as
+            // literals. The done predicate covers BOTH close paths (the gated
+            // completed=1 and the ungated status='done').
+            const placeholders = fids.map(() => '?').join(',');
+            const rows = db.prepare(
+              `SELECT fid, completed_at FROM actions WHERE fid IN (${placeholders}) `
+              + "AND (status = 'done' OR completed = 1)"
+              + (hasDeletedAt ? ' AND deleted_at IS NULL' : ''),
+            ).all(...fids);
+            if (rows.length === 0) continue;
+            const cited = rows
+              .map((r) => ({ fid: r.fid, closed_at: r.completed_at || null }))
+              .sort((a, b) => (a.fid < b.fid ? -1 : 1));
+            const res = annotateFn(item.id, { freshness: { overtaken: true, cited } });
+            if (res && res.changed) summary.freshness_annotated++;
+          } catch (e) {
+            logError(`Draft sweep ${name}/${item.id}: freshness failed: ${e.message}`);
+            summary.errors++;
+          }
+        }
+      } finally {
+        try { db.close(); } catch { /* best-effort */ }
+      }
+    } else {
+      // Loud skip: unreadable/missing db ⇒ freshness UNKNOWN for this
+      // project this tick — drafts stay batch-eligible, never demoted.
+      summary.skipped_projects.push(name);
+      log(`Draft sweep ${name}: no readable pib-db — freshness skipped (drafts stay batch-eligible)`);
+    }
+
+    // Folds: pure similarity pass within this project's pending drafts.
+    try {
+      const pairs = proposeFolds(drafts);
+      const dupMap = new Map();
+      for (const { a, b } of pairs) {
+        if (!dupMap.has(a)) dupMap.set(a, new Set());
+        if (!dupMap.has(b)) dupMap.set(b, new Set());
+        dupMap.get(a).add(b);
+        dupMap.get(b).add(a); // reciprocal by construction
+      }
+      for (const [id, partners] of dupMap) {
+        const res = annotateFn(id, { possible_duplicate_of: [...partners].sort() });
+        if (res && res.changed) summary.fold_annotated++;
+      }
+    } catch (e) {
+      logError(`Draft sweep ${name}: fold pass failed: ${e.message}`);
+      summary.errors++;
+    }
+  }
+
+  // Positive confirmation sidecar — "ran with zero annotations" must never
+  // be indistinguishable from "never ran".
+  try {
+    const sidecar = join(watchtowerDir, 'state', 'draft-annotations-health.json');
+    mkdirSync(join(watchtowerDir, 'state'), { recursive: true });
+    atomicWrite(sidecar, JSON.stringify({ schema_version: 1, last_run: nowIso(), ...summary }, null, 2));
+  } catch (e) {
+    logError(`Draft sweep: sidecar write failed: ${e.message}`);
+  }
+  log(`Draft sweep: ${summary.items_scanned} drafts across ${summary.projects_scanned} projects — `
+    + `${summary.freshness_annotated} freshness, ${summary.fold_annotated} fold annotations`
+    + (summary.skipped_projects.length ? `; skipped dbs: ${summary.skipped_projects.join(', ')}` : '')
+    + (summary.unscanned_items ? `; ${summary.unscanned_items} draft(s) outside config never swept` : '')
+    + (summary.errors ? `; ${summary.errors} errors` : ''));
+  return summary;
+}
+
 async function runSlow() {
   log('Ring 2 slow tier starting');
   const config = loadConfig();
@@ -2112,7 +2274,17 @@ async function runSlow() {
     }
   }
 
-  // 9. Consumer hooks
+  // 9. Draft surfacing-intelligence sweep (freshness + fold annotations)
+  if (config.defaults?.draft_annotations !== false) {
+    try {
+      slowState.draft_annotations = runDraftAnnotationSweep(config);
+    } catch (e) {
+      logError(`Draft annotation sweep failed: ${e.message}`);
+      slowState.draft_annotations = { error: e.message };
+    }
+  }
+
+  // 10. Consumer hooks
   try {
     const hookResults = runSlowConsumerHooks(config, slowState);
     slowState.hook_results = hookResults;

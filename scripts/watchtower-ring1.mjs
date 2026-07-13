@@ -26,13 +26,14 @@ import {
 } from 'fs';
 import { pathToFileURL } from 'url';
 import { join, basename } from 'path';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import { homedir } from 'os';
 import {
   atomicWrite, loadConfig, slugify, log as _log, logError as _logError,
-  getWatchtowerDir, createItem, listPending, resolveItem, loadBetterSqlite3,
+  getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
   writeProjectStatePreservingRing3, flushFeedbackOutbox, resolveCcSourceRepo,
   authoredClaudeDirs, claudeChurnIsDisposable, checkMemoryReachability,
+  autoReconcileItem,
 } from './watchtower-lib.mjs';
 import { runRoutinePass } from './watchtower-routines.mjs';
 import { analyze, resolveRoots } from './watchtower-sync.mjs';
@@ -77,6 +78,22 @@ function safeExec(cmd, opts = {}) {
     // stderr is ignored, not inherited — otherwise expected failures
     // (e.g. non-git projects) bleed "fatal:" noise into the launchd log
     return execSync(cmd, {
+      encoding: 'utf8', timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      ...opts,
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+// Non-shell sibling of safeExec for arguments that are DATA, not commands —
+// filenames and other strings a repo's author controls. execFileSync passes
+// args verbatim (no shell parse), so a file literally named `$(cmd)` is just
+// a filename, never an execution (CP3 security finding on isMainShadow).
+function safeExecFile(file, args, opts = {}) {
+  try {
+    return execFileSync(file, args, {
       encoding: 'utf8', timeout: 10_000,
       stdio: ['ignore', 'pipe', 'ignore'],
       ...opts,
@@ -221,16 +238,32 @@ function collectGitState(projectPath) {
   // common already-merged case.
   const { mainName, compareRef, localLagsRemote } = resolveMainRef(exec);
   const branchesAhead = [];
+  // `branches` distinguishes listing FAILURE (null — never treat a branch as
+  // absent) from a successful listing (array, possibly empty). The
+  // branch-diverged reconciler's gone-branch retraction keys on membership in
+  // a VERIFIED listing, never on a failed per-ref probe — safeExec collapses
+  // "ref absent" and "git errored" into the same null, and reading an error
+  // as "branch gone" would auto-close items over real unmerged work.
+  let branches = null;
   const branchList = safeExec(`git for-each-ref --format='%(refname:short)' refs/heads/`, { cwd });
-  if (branchList) {
-    for (const line of branchList.split('\n')) {
-      const b = line.trim().replace(/^\* /, '');
-      if (!b || b === mainName) continue;
+  if (branchList !== null) {
+    branches = branchList.split('\n')
+      .map(line => line.trim().replace(/^\* /, ''))
+      .filter(b => b);
+    for (const b of branches) {
+      if (b === mainName) continue;
+      // Git ref rules allow '$', ';', '(' — legal-but-shell-hostile names
+      // (e.g. from a cloned third-party repo) never reach the interpolated
+      // content check. Skipped loudly; such a branch is not flagged.
+      if (!isSafeRefName(b)) {
+        logError(`collectGitState ${cwd}: skipping unsafe branch name ${JSON.stringify(b)}`);
+        continue;
+      }
       if (hasUnmergedContent(exec, b, compareRef)) branchesAhead.push(b);
     }
   }
 
-  return { branch, lastCommit, branchesAhead, mainBranch: mainName, compareRef, localLagsRemote };
+  return { branch, lastCommit, branchesAhead, branches, mainBranch: mainName, compareRef, localLagsRemote };
 }
 
 // ---------------------------------------------------------------------------
@@ -547,11 +580,66 @@ function runConsumerHooksSync(hooks, projectState) {
 }
 
 // ---------------------------------------------------------------------------
-// Queue item creation for branch divergence
+// Queue item creation + retraction for branch divergence
 // ---------------------------------------------------------------------------
 
-function createBranchDivergedItem(projectName, projectPath, branch) {
+// Long-lived branches that diverge from main BY DESIGN — filing an inbox item
+// for them is pure noise, and because dedup checks only PENDING items, every
+// human dismissal reopens the door on the next tick (the 2026-07-12 backup/*
+// refile loop: dismissed at ~20:15 UTC, refiled 21:19 UTC). Entries without a
+// '*' are EXACT names (a branch named "staging-fix" files normally); a '*' is
+// a glob. Consumers override via config defaults.long_lived_branches (the
+// consumer-default risk — a real work branch literally named "staging" never
+// files — is documented in watchtower-contracts.md "Detector Symmetry").
+const DEFAULT_LONG_LIVED_BRANCHES = ['staging', 'production', 'backup/*'];
+
+function branchExclusionMatcher(config) {
+  const list = Array.isArray(config?.defaults?.long_lived_branches)
+    ? config.defaults.long_lived_branches
+    : DEFAULT_LONG_LIVED_BRANCHES;
+  const rules = [];
+  for (const entry of list) {
+    // A silently-dropped or whitespace-padded entry means the exclusion the
+    // operator configured never fires and the refile loop continues — log
+    // the malformed shape, and trim before compiling (git ref names never
+    // carry surrounding whitespace, so an untrimmed exact-match can't hit).
+    if (typeof entry !== 'string' || !entry.trim()) {
+      logError(`ignoring malformed defaults.long_lived_branches entry: ${JSON.stringify(entry)}`);
+      continue;
+    }
+    const name = entry.trim();
+    if (!name.includes('*')) {
+      rules.push((b) => b === name);
+    } else {
+      const re = new RegExp(
+        '^' + name.split('*').map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$'
+      );
+      rules.push((b) => re.test(b));
+    }
+  }
+  return (branch) => rules.some(rule => rule(branch));
+}
+
+// Git ref names a ring may safely interpolate into a shell line. Queue-item
+// evidence is stored JSON — a branch name is not trusted just because a past
+// tick wrote it. Anything outside this conservative set (or containing '..')
+// is skipped loudly and NEVER passed to safeExec or auto-resolved.
+const SAFE_REF_NAME = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+function isSafeRefName(name) {
+  return typeof name === 'string' && SAFE_REF_NAME.test(name) && !name.includes('..');
+}
+
+// The exclusion gates FILING ONLY (here), never the attention surfaces:
+// main() pushes every diverged branch into ps.divergedBranches BEFORE calling
+// this, and the attention line, git-attention sidecar, summary, and Standing
+// Issues all render from ps.divergedBranches — an excluded branch stays
+// visible everywhere a human looks; it just never becomes an inbox item to
+// dismiss. Gating any earlier (at the ps push) would silently blind all four
+// surfaces (the coupling at the main() detection loop).
+function createBranchDivergedItem(projectName, projectPath, branch, isExcluded) {
   try {
+    if (isExcluded && isExcluded(branch)) return;
+
     // Check for existing branch-diverged item for this branch (dedup)
     const existingItems = listPending({ category: 'branch-diverged' });
     const isDuplicate = existingItems.some(item =>
@@ -578,6 +666,216 @@ function createBranchDivergedItem(projectName, projectPath, branch) {
   }
 }
 
+// Auto-resolve pending branch-diverged items whose alarm no longer holds —
+// the same one-way-queue cure autoResolveWorktreeItems applies to
+// worktree-unmerged (dedup suppresses refiling but nothing retracts the
+// original; stale alarms train the operator to ignore real ones — 35 of 39
+// pending items were stale in the 2026-07-12 drain). Retraction conditions:
+//   - branch verified ABSENT from a successful for-each-ref listing
+//     (git.branches; a null listing = command failure = skip, never resolve)
+//   - branch carries no unmerged content vs origin/<main> (squash-aware
+//     hasUnmergedContent, which fails toward flagging on any git error)
+//   - branch is on the long-lived exclusion list (retract-if-pending half of
+//     the filing exclusion above)
+// No fetch here: `git` state (compareRef, branches) comes from this tick's
+// collectGitState, which already fetched — a fourth per-project fetch per
+// tick would push a network-partitioned tick past the cron interval.
+function autoResolveBranchDivergedItems(projectPath, git, isExcluded, pendingItems) {
+  const mine = (pendingItems || []).filter(i => i.project_path === projectPath);
+  if (mine.length === 0) return;
+  if (!git || !git.compareRef) return; // no git state this tick — leave items alone
+
+  const exec = (cmd) => safeExec(cmd, { cwd: projectPath });
+
+  for (const item of mine) {
+    const ev = item.evidence || {};
+    if (!ev.branch) continue;
+    if (!isSafeRefName(ev.branch)) {
+      logError(`branch-diverged reconciler: item ${item.id} carries unsafe branch name ${JSON.stringify(ev.branch)} — skipping, not resolving`);
+      continue;
+    }
+
+    let resolution = null;
+    let staleReason = null;
+    if (isExcluded && isExcluded(ev.branch)) {
+      resolution = 'excluded-by-design';
+      staleReason = `branch "${ev.branch}" is on the long-lived branch exclusion list (defaults.long_lived_branches)`;
+    } else if (Array.isArray(git.branches) && !git.branches.includes(ev.branch)) {
+      resolution = 'branch-gone';
+      staleReason = `branch "${ev.branch}" no longer exists (verified against the branch listing)`;
+    } else if (Array.isArray(git.branches) && !hasUnmergedContent(exec, ev.branch, git.compareRef)) {
+      resolution = 'merged';
+      staleReason = `branch "${ev.branch}" has no unmerged content vs ${git.compareRef} (squash/merge-aware)`;
+    }
+    // branches not a verified array (null listing failure, or absent field):
+    // fall through — only a successful listing is absence evidence.
+
+    if (!staleReason) continue;
+
+    try {
+      const res = autoReconcileItem(item.id, {
+        resolution,
+        notes: `Auto-resolved by Ring 1: ${staleReason}.`,
+        actor: 'ring1',
+        evidence: { branch: ev.branch },
+      });
+      if (res) log(`Auto-resolved stale branch-diverged item ${item.id} (${ev.branch}: ${resolution})`);
+    } catch (e) {
+      logError(`Failed to auto-resolve branch-diverged item ${item.id}: ${e.message}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Completion-review reconciliation — retract items whose action closed
+// ---------------------------------------------------------------------------
+//
+// A completion-review item filed while its pib-db action was still open goes
+// permanently stale the moment normal work closes the action — nothing
+// re-checked (28 of 66 pending items in the 2026-07-12 drain, ~42% of the
+// pile; act:9eebbac4). Each tick, every pending item's referenced action is
+// looked up in ITS OWN project's pib.db (resolved from the watchtower config
+// entry — never the item's stored path, which the attribution bug filed
+// wrongly) and the item auto-resolves only when the action is verifiably
+// closed.
+//
+// FAIL-TOWARD-KEEPING, like every reconciler here:
+//   - project not in config, db missing/unreadable/ABI-broken → skip loudly,
+//     never resolve (one log line per project per tick, matching
+//     collectPibState's error discipline)
+//   - fid row NOT FOUND → keep pending. This is load-bearing for flow, whose
+//     pib.db is readable but VESTIGIAL (its real tracker is flow.db,
+//     act:dad1e3f3) — "not found → retract" would mass-resolve flow's items
+//     against the wrong database. Misattributed items (act:29001b07's
+//     disease) are equally protected: their fid lives in a different
+//     project's db, so the wrong-project lookup misses and keeps them.
+//   - fid row soft-deleted → keep pending (deletion is not completion; a
+//     human disposes the review).
+//
+// Foreign dbs are opened READ-ONLY behind an existsSync guard — reconciler
+// writes land only in the watchtower queue, never in a project's pib.db.
+// Cross-project db access deliberately reuses ring1's own join(projectPath,
+// 'pib.db') pattern: the runtime tier ships only watchtower-* scripts, so
+// importing the repo's pib-db-path resolver here would die with
+// ERR_MODULE_NOT_FOUND under cron while passing every repo-side test.
+function autoReconcileCompletionReviews({ items, config, openDb }) {
+  // raced: the item left pending state between the tick's snapshot and this
+  // pass (a human resolved it) — nothing to do, but the counters must still
+  // sum to the number of items processed.
+  const summary = { resolved: 0, kept: 0, skipped: 0, raced: 0 };
+  const pending = (items || []).filter(i => i.category === 'completion-review');
+  if (pending.length === 0) return summary;
+
+  const projects = config?.projects || {};
+  const byProject = new Map();
+  for (const item of pending) {
+    const list = byProject.get(item.project) || [];
+    list.push(item);
+    byProject.set(item.project, list);
+  }
+
+  const defaultOpenDb = (projectPath) => {
+    const dbPath = join(projectPath, 'pib.db');
+    if (!existsSync(dbPath)) return { error: 'no pib.db' };
+    const Database = loadBetterSqlite3(projectPath);
+    if (!Database) return { error: 'better-sqlite3 not available' };
+    try {
+      return { db: new Database(dbPath, { readonly: true }) };
+    } catch (e) {
+      return { error: `cannot open pib.db: ${String(e.message).split('\n')[0]}` };
+    }
+  };
+  const open = openDb || defaultOpenDb;
+
+  for (const [projectName, projectItems] of byProject) {
+    if (!projectName || typeof projectName !== 'string') {
+      // Malformed items (no project field) can never be reconciled here and
+      // have no mechanical disposal path — one bounded line per tick, and
+      // fail toward keeping.
+      logError(`completion-review reconciler: ${projectItems.length} item(s) missing a project field (${projectItems.map(i => i.id).join(', ')}) — keeping pending`);
+      summary.skipped += projectItems.length;
+      continue;
+    }
+    const entry = projects[projectName];
+    const projectPath = entry && (entry.path || entry);
+    if (!projectPath || typeof projectPath !== 'string') {
+      logError(`completion-review reconciler: project "${projectName}" not in watchtower config — keeping ${projectItems.length} item(s) pending`);
+      summary.skipped += projectItems.length;
+      continue;
+    }
+
+    const opened = open(projectPath);
+    if (!opened || !opened.db) {
+      logError(`completion-review reconciler: ${projectName}: ${opened?.error || 'db open failed'} — keeping ${projectItems.length} item(s) pending`);
+      summary.skipped += projectItems.length;
+      continue;
+    }
+
+    const { db } = opened;
+    try {
+      let stmt;
+      try {
+        stmt = db.prepare('SELECT status, completed, deleted_at FROM actions WHERE fid = ?');
+      } catch (e) {
+        logError(`completion-review reconciler: ${projectName}: cannot query actions table (${String(e.message).split('\n')[0]}) — keeping ${projectItems.length} item(s) pending`);
+        summary.skipped += projectItems.length;
+        continue;
+      }
+
+      let kept = 0;
+      let resolvedHere = 0;
+      for (const item of projectItems) {
+        // Newer items carry the promoted top-level plan_fid; pre-promotion
+        // items only carry evidence.fid — checking one shape would silently
+        // exempt the other half of the pile.
+        const fid = item.plan_fid || item.evidence?.fid;
+        if (!fid) { kept++; summary.kept++; continue; }
+
+        let row;
+        try {
+          row = stmt.get(fid);
+        } catch (e) {
+          logError(`completion-review reconciler: ${projectName}: lookup failed for ${fid} (${String(e.message).split('\n')[0]}) — keeping item`);
+          kept++; summary.kept++;
+          continue;
+        }
+        const isClosed = row && !row.deleted_at
+          && (row.status === 'done' || row.completed === 1);
+        if (!isClosed) { kept++; summary.kept++; continue; }
+
+        try {
+          const res = autoReconcileItem(item.id, {
+            resolution: 'action-closed',
+            notes: `Auto-resolved by Ring 1: action ${fid} is already closed in ${projectName}'s work tracker — completion confirmed by normal work.`,
+            actor: 'ring1',
+            evidence: { action_fid: fid },
+          });
+          if (res) {
+            summary.resolved++;
+            resolvedHere++;
+            log(`Auto-resolved stale completion-review item ${item.id} (${fid} closed)`);
+          } else {
+            summary.raced++; // no longer pending — a human got there first
+          }
+        } catch (e) {
+          logError(`completion-review reconciler: failed to auto-resolve ${item.id}: ${e.message}`);
+          kept++; summary.kept++;
+        }
+      }
+      // Throttled on THIS project's own activity (not global state, which
+      // would make the line iteration-order-dependent): kept-detail logs
+      // only on ticks where this project's reconciliation did something.
+      if (kept > 0 && resolvedHere > 0) {
+        log(`completion-review reconciler: ${projectName}: ${kept} item(s) kept pending (action open, missing, or deleted)`);
+      }
+    } finally {
+      try { db.close(); } catch { /* readonly close failure is inert */ }
+    }
+  }
+
+  return summary;
+}
+
 // ---------------------------------------------------------------------------
 // Worktree scan — find orphaned worktrees with unmerged work
 // ---------------------------------------------------------------------------
@@ -602,19 +900,13 @@ function countRealUncommitted(wtPath) {
   const authoredDirs = authoredClaudeDirs(wtPath, safeExec);
   return uncommitted.split('\n').filter(l => {
     if (!l.trim()) return false;
+    // Generated-state exclusions (untracked verification/advisories/
+    // checklist/verify-progress residue) live in the lib's
+    // GENERATED_STATE_PATTERNS — the SSOT claudeChurnIsDisposable now checks
+    // FIRST, so ring3's Phase 2a filter inherits the same names with zero
+    // edits (act:c008862c; never fork the list). Tracked files of those
+    // names still count: the patterns are anchored to `??` lines.
     if (claudeChurnIsDisposable(l, authoredDirs)) return false;
-    // Disposable runtime state written by the watchtower/verify harnesses
-    // (act:a152cf6c). These churn in every worktree without representing work
-    // to lose. Gitignored in this repo (so invisible to porcelain here), but a
-    // consumer's .claude/ gitignore differs and DOES surface them — the
-    // flow/maginnis false positives. Scoped to UNTRACKED (`??`) lines so a
-    // deliberately-tracked file of the same name (e.g. a committed
-    // .claude/verification/*.json) still counts as authored work, never
-    // silently dropped. Runs AFTER claudeChurnIsDisposable so it overrides the
-    // dir-level authored re-inclusion (.claude/cabinet/ is authored here).
-    if (/^\?\?\s+\.claude\/verification\//.test(l)) return false;
-    if (/^\?\?\s+\.claude\/cabinet\/advisories-state\.json$/.test(l)) return false;
-    if (/^\?\?\s+e2e\/\.verify-progress\.jsonl$/.test(l)) return false;
     if (/\s\.mcp\.json$/.test(l)) return false;
     if (/\snode_modules$/.test(l) || /\snode_modules\//.test(l)) return false;
     if (/(?:^|[\s/])package-lock\.json$/.test(l)) return false;
@@ -640,9 +932,12 @@ function isMainShadow(porcelainLine, wtPath) {
   if (!m) return false;
   let p = m[1].trim();
   if (p.startsWith('"') && p.endsWith('"')) p = p.slice(1, -1);
-  const mainBlob = safeExec(`git rev-parse --verify --quiet "main:${p}"`, { cwd: wtPath });
+  // Untracked FILENAMES are repo-author-controlled data — passed as
+  // execFile args (no shell), never interpolated: double quotes don't stop
+  // $()/backtick expansion, and porcelain doesn't C-quote those characters.
+  const mainBlob = safeExecFile('git', ['rev-parse', '--verify', '--quiet', `main:${p}`], { cwd: wtPath });
   if (!mainBlob) return false;
-  const wtBlob = safeExec(`git hash-object "${p}"`, { cwd: wtPath });
+  const wtBlob = safeExecFile('git', ['hash-object', '--', p], { cwd: wtPath });
   return !!wtBlob && wtBlob === mainBlob;
 }
 
@@ -680,20 +975,35 @@ function autoResolveWorktreeItems(projectName, projectPath) {
 
   const exec = (cmd) => safeExec(cmd, { cwd: projectPath });
   const { compareRef } = resolveMainRef(exec);
+  // Verified branch listing for the gone-branch test (fail-toward-keeping,
+  // same discipline as autoResolveBranchDivergedItems): safeExec collapses
+  // "ref absent" and "git errored" into one null, so a per-ref probe reads
+  // any transient git failure as "branch gone" and auto-closes an item over
+  // real work. Absence is only ever concluded from membership in a
+  // SUCCESSFUL listing; a failed listing retracts nothing via absence.
+  const listing = safeExec(`git for-each-ref --format='%(refname:short)' refs/heads/`, { cwd: projectPath });
+  const localBranches = listing === null
+    ? null
+    : listing.split('\n').map(l => l.trim().replace(/^\* /, '')).filter(Boolean);
 
   for (const item of pending) {
-    if (!itemBelongsToProject(item, projectPath)) continue;
     const ev = item.evidence || {};
+    // Stored queue JSON is not a trusted shell input (the same
+    // isSafeRefName gate as the branch-diverged reconciler) — checked
+    // BEFORE itemBelongsToProject, which interpolates ev.branch.
+    if (ev.branch && !isSafeRefName(ev.branch)) {
+      logError(`worktree reconciler: item ${item.id} carries unsafe branch name ${JSON.stringify(ev.branch)} — skipping, not resolving`);
+      continue;
+    }
+    if (!itemBelongsToProject(item, projectPath)) continue;
     if (!ev.branch) continue;
 
-    const branchRef = safeExec(`git rev-parse --verify ${ev.branch}`, { cwd: projectPath });
-
     let staleReason = null;
-    if (!branchRef) {
-      // Branch is gone entirely — merged or deliberately deleted;
+    if (Array.isArray(localBranches) && !localBranches.includes(ev.branch)) {
+      // Branch is verified gone — merged or deliberately deleted;
       // either way there is nothing left to lose.
-      staleReason = `branch "${ev.branch}" no longer exists`;
-    } else {
+      staleReason = `branch "${ev.branch}" no longer exists (verified against the branch listing)`;
+    } else if (Array.isArray(localBranches)) {
       // Content-based, squash-aware retraction: an item whose branch carries no
       // unmerged content vs origin/<main> and no real uncommitted work is a
       // stale alarm — this is what finally retracts the ~40 squash-merged
@@ -711,11 +1021,18 @@ function autoResolveWorktreeItems(projectName, projectPath) {
     if (!staleReason) continue;
 
     try {
-      resolveItem(item.id, {
+      // Routed through autoReconcileItem (watchtower-lib) like every ring
+      // retraction, so machine resolutions carry the typed
+      // 'auto-reconciled' + evidence.actor stamp — an untyped resolution
+      // here would count cron activity as operator engagement in the
+      // cross-ring reader's disposition mix.
+      const res = autoReconcileItem(item.id, {
         resolution: 'merged',
-        resolution_notes: `Auto-resolved by Ring 1: ${staleReason}.`,
+        notes: `Auto-resolved by Ring 1: ${staleReason}.`,
+        actor: 'ring1',
+        evidence: { branch: ev.branch },
       });
-      log(`Auto-resolved stale worktree-unmerged item ${item.id} (${ev.branch})`);
+      if (res) log(`Auto-resolved stale worktree-unmerged item ${item.id} (${ev.branch})`);
     } catch (e) {
       logError(`Failed to auto-resolve ${item.id}: ${e.message}`);
     }
@@ -767,6 +1084,12 @@ function scanWorktrees(projectName, projectPath) {
     // rather than let the merge-tree call fail toward flagging an
     // "undefined"-branch worktree (act:a152cf6c).
     if (!wt.branch) continue;
+    // worktree-list output is git-controlled but the NAME is repo-author
+    // data — same interpolation gate as every other branch-name path.
+    if (!isSafeRefName(wt.branch)) {
+      logError(`scanWorktrees ${projectPath}: skipping unsafe branch name ${JSON.stringify(wt.branch)}`);
+      continue;
+    }
 
     // Flag on CONTENT, not ahead-count: a squash-merged branch is a
     // non-ancestor with phantom "ahead" commits but no real unmerged content
@@ -793,45 +1116,101 @@ function scanWorktrees(projectName, projectPath) {
       branch: wt.branch,
       ahead,
       uncommitted: uncommittedCount,
+      // Drives the wording split at every render site: real unmerged
+      // commits earn the data-loss register ("MERGE OR LOSE"); a fully
+      // merged branch with only authored uncommitted files is a review
+      // nudge, never a data-loss alarm (act:c008862c).
+      unmerged,
     });
   }
 
   // Create inbox items for orphaned worktrees
   for (const wt of orphaned) {
-    try {
-      const existing = listPending({ category: 'worktree-unmerged' });
-      const isDuplicate = existing.some(item =>
-        item.evidence?.branch === wt.branch &&
-        item.evidence?.worktree_path === wt.path
-      );
-      if (isDuplicate) continue;
-
-      const detail = [];
-      if (wt.ahead > 0) detail.push(`${wt.ahead} unmerged commit(s)`);
-      if (wt.uncommitted > 0) detail.push(`${wt.uncommitted} uncommitted change(s)`);
-
-      createItem({
-        project: projectName,
-        project_path: projectPath,
-        filed_by: 'ring1',
-        category: 'worktree-unmerged',
-        urgency: 'urgent',
-        title: `Orphaned worktree "${wt.branch}" has unmerged work`,
-        summary: `Worktree at ${wt.path} has ${detail.join(' and ')} with no active tmux window. Merge to main or the work may be lost.`,
-        context_anchor: `git log ${wt.branch} --not origin/main in ${wt.path}`,
-        evidence: { branch: wt.branch, worktree_path: wt.path, ahead: wt.ahead, uncommitted: wt.uncommitted },
-        options: [
-          { key: 'merge', label: 'Merge to main now' },
-          { key: 'keep', label: 'Keep branch for later' },
-          { key: 'dismiss', label: 'Dismiss (already handled)' },
-        ],
-      });
-    } catch (e) {
-      logError(`Failed to create worktree-unmerged item: ${e.message}`);
-    }
+    fileOrphanedWorktreeItem(projectName, projectPath, wt);
   }
 
   return orphaned;
+}
+
+// Files (or re-registers) the inbox item for one orphaned worktree.
+// Exported for hermetic tests — the register logic below is not reachable
+// through scanWorktrees without a live tmux server.
+//
+// The dedup is REGISTER-AWARE (CP2 finding): before the urgency/wording
+// split both worktree states produced identical items, so branch+path dedup
+// was lossless; with the split, a pending item filed under the OTHER
+// register would mask a real state transition — an escalation (fully-merged
+// worktree later gains real unmerged commits, but the queue keeps the soft
+// "review or commit" item) or a stale data-loss alarm (branch merged,
+// authored files remain: the reconciler can't retract while uncommitted>0,
+// and dedup blocked the correct 'normal' refile). On a register change the
+// stale item is auto-resolved (typed, machine-stamped) and a fresh item
+// files under the current register. Items filed before the split carry no
+// evidence.unmerged — treated as the ALARMING register, matching the
+// render-site fail-toward-alarm default.
+function fileOrphanedWorktreeItem(projectName, projectPath, wt) {
+  try {
+    const fresh = wt.unmerged !== false;
+    const existing = listPending({ category: 'worktree-unmerged' });
+    const match = existing.find(item =>
+      item.evidence?.branch === wt.branch &&
+      item.evidence?.worktree_path === wt.path
+    );
+    if (match) {
+      const filedRegister = match.evidence?.unmerged !== false;
+      if (filedRegister === fresh) return; // duplicate, same register
+      // Escalation damping (CP3): hasUnmergedContent fails toward TRUE on
+      // transient git errors, so a soft→urgent flip is trusted only when
+      // corroborated by real commits ahead (a genuine escalation has them);
+      // an uncorroborated flip keeps the existing soft item — the attention
+      // surfaces still render the alarming register from the fresh scan, so
+      // nothing is hidden, and the item stops flapping (supersede+refile
+      // twice per git blip). De-escalation needs no damping: git errors
+      // cannot produce unmerged=false.
+      if (fresh && !filedRegister && !(wt.ahead > 0)) return;
+      try {
+        autoReconcileItem(match.id, {
+          resolution: 'register-changed',
+          notes: `Auto-resolved by Ring 1: worktree "${wt.branch}" changed state (${filedRegister ? 'unmerged work' : 'uncommitted files only'} → ${fresh ? 'unmerged work' : 'uncommitted files only'}) — refiled under the current register.`,
+          actor: 'ring1',
+          evidence: { branch: wt.branch },
+        });
+      } catch (e) {
+        // Keep the old item rather than risk double-filing.
+        logError(`Failed to supersede worktree item ${match.id} on register change: ${e.message}`);
+        return;
+      }
+    }
+
+    const detail = [];
+    if (wt.ahead > 0) detail.push(`${wt.ahead} unmerged commit(s)`);
+    if (wt.uncommitted > 0) detail.push(`${wt.uncommitted} uncommitted change(s)`);
+
+    createItem({
+      project: projectName,
+      project_path: projectPath,
+      filed_by: 'ring1',
+      category: 'worktree-unmerged',
+      // Data-loss urgency is earned by unmerged COMMITS; a fully merged
+      // branch with uncommitted files is a normal review nudge.
+      urgency: fresh ? 'urgent' : 'normal',
+      title: fresh
+        ? `Orphaned worktree "${wt.branch}" has unmerged work`
+        : `Orphaned worktree "${wt.branch}" has uncommitted files`,
+      summary: fresh
+        ? `Worktree at ${wt.path} has ${detail.join(' and ')} with no active tmux window. Merge to main or the work may be lost.`
+        : `Worktree at ${wt.path} has ${detail.join(' and ')} with no active tmux window. The branch itself is fully merged — review or commit the files.`,
+      context_anchor: `git log ${wt.branch} --not origin/main in ${wt.path}`,
+      evidence: { branch: wt.branch, worktree_path: wt.path, ahead: wt.ahead, uncommitted: wt.uncommitted, unmerged: fresh },
+      options: [
+        { key: 'merge', label: 'Merge to main now' },
+        { key: 'keep', label: 'Keep branch for later' },
+        { key: 'dismiss', label: 'Dismiss (already handled)' },
+      ],
+    });
+  } catch (e) {
+    logError(`Failed to create worktree-unmerged item: ${e.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -859,7 +1238,11 @@ function buildGitAttentionSidecar(projectStates) {
           worktree_path: wt.path,
           compare_ref: compareRef,
           // The cached banner — what build-context relays only if re-verified.
-          line: `⚠ ${ps.name}: worktree "${wt.branch}" has unmerged work — MERGE OR LOSE`,
+          // MERGE OR LOSE is reserved for real unmerged commits; a missing
+          // flag (older cached shape) fails toward the alarming register.
+          line: wt.unmerged !== false
+            ? `⚠ ${ps.name}: worktree "${wt.branch}" has unmerged work — MERGE OR LOSE`
+            : `${ps.name}: worktree "${wt.branch}" has uncommitted files (branch fully merged)`,
         });
       }
     }
@@ -993,7 +1376,9 @@ function assembleSummary(projectStates, config, extraAttention = []) {
     }
     if (ps.orphanedWorktrees && ps.orphanedWorktrees.length > 0) {
       for (const wt of ps.orphanedWorktrees) {
-        attention.unshift(`⚠ ${ps.name}: worktree "${wt.branch}" has unmerged work — MERGE OR LOSE`);
+        attention.unshift(wt.unmerged !== false
+          ? `⚠ ${ps.name}: worktree "${wt.branch}" has unmerged work — MERGE OR LOSE`
+          : `${ps.name}: worktree "${wt.branch}" has uncommitted files (branch fully merged)`);
       }
     }
     if (ps.ccFeedbackArrival) {
@@ -1337,6 +1722,18 @@ function main() {
     // project's entry into its Standing Issues (the canary's named reader).
     const recallCanaryProjects = readRecallCanary();
 
+    // Branch-diverged reconciliation inputs, resolved ONCE per tick: the
+    // exclusion matcher (config-driven) and one pending-items snapshot —
+    // listPending reads every file in the queue dir, so per-project
+    // per-category rescans grow linearly with lifetime item count.
+    const branchExcluded = branchExclusionMatcher(config);
+    let pendingBranchDiverged = [];
+    try {
+      pendingBranchDiverged = listPending({ category: 'branch-diverged' });
+    } catch (e) {
+      logError(`could not list pending branch-diverged items: ${e.message}`);
+    }
+
     for (const name of projectNames) {
       const projectPath = projects[name].path || projects[name];
       if (!existsSync(projectPath)) {
@@ -1358,7 +1755,18 @@ function main() {
         hookResults: [],
       };
 
-      // Branch divergence detection (feature-flagged)
+      // Retract stale branch-diverged alarms before detecting new ones
+      // (same retract-then-scan order as scanWorktrees). Runs regardless of
+      // the detection flag: items filed before an operator disabled
+      // detection would otherwise rot pending forever.
+      autoResolveBranchDivergedItems(projectPath, ps.git, branchExcluded, pendingBranchDiverged);
+
+      // Branch divergence detection (feature-flagged). The exclusion list
+      // gates FILING only (inside createBranchDivergedItem) — every diverged
+      // branch, excluded or not, is pushed to ps.divergedBranches, which
+      // feeds the attention line, the git-attention sidecar, the summary,
+      // and Standing Issues. Excluded branches stay visible; they just never
+      // become dismissable inbox noise.
       if (config.defaults?.branch_orphan_detection !== false && ps.git && ps.git.branchesAhead) {
         for (const branch of ps.git.branchesAhead) {
           // Check if there's an active session on this branch
@@ -1366,7 +1774,7 @@ function main() {
             ps.git.branch === branch;
           if (!hasActiveSession) {
             ps.divergedBranches.push(branch);
-            createBranchDivergedItem(name, projectPath, branch);
+            createBranchDivergedItem(name, projectPath, branch, branchExcluded);
           }
         }
       }
@@ -1379,6 +1787,19 @@ function main() {
       ps.hookResults = runConsumerHooksSync(hooks, ps);
 
       projectStates.push(ps);
+    }
+
+    // Completion-review reconciliation — one global pass per tick (items
+    // reference their OWN project's db via the config, so this is not a
+    // per-project concern). Failure must not kill the state-collection pass.
+    try {
+      const pendingReviews = listPending({ category: 'completion-review' });
+      const rec = autoReconcileCompletionReviews({ items: pendingReviews, config });
+      if (rec.resolved > 0) {
+        log(`completion-review reconciler: ${rec.resolved} resolved, ${rec.kept} kept, ${rec.skipped} skipped`);
+      }
+    } catch (e) {
+      logError(`completion-review reconciliation failed: ${e.message}`);
     }
 
     // Ensure output directories exist
@@ -1467,7 +1888,7 @@ function main() {
 // pure given an injectable `exec` — the inline call sites bind safeExec to a
 // cwd; the tests bind a runner against a temp git repo (act:6f36cbe2,
 // act:a136b362).
-export { resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState };
+export { resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState, branchExclusionMatcher, DEFAULT_LONG_LIVED_BRANCHES, createBranchDivergedItem, autoResolveBranchDivergedItems, autoResolveWorktreeItems, autoReconcileCompletionReviews, fileOrphanedWorktreeItem, isSafeRefName };
 
 // Entry guard so tests (and other modules) can import this file's pure
 // helpers without executing main(). realpathSync matters: node

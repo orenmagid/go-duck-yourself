@@ -44,7 +44,11 @@ function today() {
 //   6 — added projects.tags (symmetric with actions.tags at v2)
 //   7 — added client-facing copy columns on actions + projects (4 each)
 //   8 — added engagement_events.visibility (client|internal, default internal)
-export const SCHEMA_VERSION = 8;
+//   9 — audit finding ids run-prefixed (run_id || '/' || id) — same change
+//       as BASE v7 (act:4ec70792); numbered 9 here because the patch owns
+//       7-8. Keep base and patch bumped in the same release
+//       (engagement-setup's base-ahead guard enforces it).
+export const SCHEMA_VERSION = 9;
 
 // Each entry: { version, sql }. A single version may have multiple SQL
 // statements (e.g. column add + index). Statements run in array order;
@@ -53,8 +57,8 @@ export const SCHEMA_VERSION = 8;
 // gate — try/catch is a safety net for pre-pragma DBs.
 //
 // NOTE on version numbering (base vs patch):
-//   Base (work-tracking): v1-v6 (v6 = client columns)
-//   Patch (engagement):   v1-v7 (v5 = engagement_events, v6 = projects.tags, v7 = client columns)
+//   Base (work-tracking): v1-v7 (v6 = client columns, v7 = audit id prefix)
+//   Patch (engagement):   v1-v9 (v5 = engagement_events, v6 = projects.tags, v7 = client columns, v9 = audit id prefix)
 //   The same physical columns appear at different version numbers because
 //   base and patch have different migration histories. The try/catch on
 //   "duplicate column" makes the overlap safe — a DB that already has
@@ -86,6 +90,10 @@ const MIGRATIONS = [
   { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_generated_at TEXT" },
   { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_generated_status TEXT" },
   { version: 8, sql: "ALTER TABLE engagement_events ADD COLUMN visibility TEXT NOT NULL DEFAULT 'internal' CHECK(visibility IN ('client','internal'))" },
+  // v9: prefix legacy audit finding ids with their run id (base v7 twin —
+  // act:4ec70792). Idempotent via the NOT LIKE guard. skipOn: a db that
+  // predates the audit tables has nothing to prefix.
+  { version: 9, sql: "UPDATE audit_findings SET id = run_id || '/' || id WHERE run_id IS NOT NULL AND run_id != '' AND id NOT LIKE run_id || '/%'", skipOn: /no such table: audit_findings/i },
 ];
 
 export function migrate(db) {
@@ -102,7 +110,11 @@ export function migrate(db) {
       if (m.version <= current) continue;
       try { db.exec(m.sql); applied++; }
       catch (e) {
-        if (!/already exists|duplicate column/i.test(e.message || '')) throw e;
+        const msg = e.message || '';
+        // Per-entry skip condition (explicit, never a general widening):
+        // e.g. the v9 audit-id prefix on a db that predates audit tables.
+        if (m.skipOn && m.skipOn.test(msg)) continue;
+        if (!/already exists|duplicate column/i.test(msg)) throw e;
       }
     }
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -438,37 +450,69 @@ export function ingestFindings(db, { runDir }) {
   const timestamp = data.meta?.timestamp || new Date().toISOString();
   const dateStr = timestamp.slice(0, 10);
 
+  // Same-run re-ingest refreshes the run row; cross-run id collisions are
+  // structurally impossible now that run ids carry the date
+  // (run-<YYYY-MM-DD>-<HH-MM-SS>, minted by merge-findings).
   db.prepare(`
-    INSERT OR REPLACE INTO audit_runs (id, date, timestamp, trigger, finding_count)
+    INSERT INTO audit_runs (id, date, timestamp, trigger, finding_count)
     VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      date = excluded.date, timestamp = excluded.timestamp,
+      trigger = excluded.trigger, finding_count = excluded.finding_count
   `).run(runId, dateStr, timestamp, data.meta?.trigger || 'manual', data.findings?.length || 0);
 
-  // Try the full INSERT with deliberation columns first; fall back to the
+  // Stored finding ids are RUN-PREFIXED (<runId>/<member-NNNN>): member ids
+  // restart every run, and the old bare-id INSERT OR REPLACE silently
+  // destroyed prior runs' rows AND their triage columns on collision
+  // (act:4ec70792, demonstrated live 2026-07-13). The upsert updates
+  // CONTENT columns only — the four triage columns (triage_status,
+  // triage_notes, triaged_at, fix_description) are never in the SET list,
+  // so a same-run re-ingest can never reset an operator's dispositions.
+  // Try the full shape with deliberation columns first; fall back to the
   // legacy shape for existing databases that haven't added them yet.
   let insert;
   let hasDeliberationCols = true;
   try {
     insert = db.prepare(`
-      INSERT OR REPLACE INTO audit_findings
+      INSERT INTO audit_findings
         (id, run_id, cabinet_member, severity, title, description, assumption,
          evidence, question, file, line, suggested_fix, auto_fixable, type,
          status, annotations, rebuttal)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        run_id = excluded.run_id, cabinet_member = excluded.cabinet_member,
+        severity = excluded.severity, title = excluded.title,
+        description = excluded.description, assumption = excluded.assumption,
+        evidence = excluded.evidence, question = excluded.question,
+        file = excluded.file, line = excluded.line,
+        suggested_fix = excluded.suggested_fix,
+        auto_fixable = excluded.auto_fixable, type = excluded.type,
+        status = excluded.status, annotations = excluded.annotations,
+        rebuttal = excluded.rebuttal
     `);
   } catch {
     hasDeliberationCols = false;
     insert = db.prepare(`
-      INSERT OR REPLACE INTO audit_findings
+      INSERT INTO audit_findings
         (id, run_id, cabinet_member, severity, title, description, assumption,
          evidence, question, file, line, suggested_fix, auto_fixable, type)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        run_id = excluded.run_id, cabinet_member = excluded.cabinet_member,
+        severity = excluded.severity, title = excluded.title,
+        description = excluded.description, assumption = excluded.assumption,
+        evidence = excluded.evidence, question = excluded.question,
+        file = excluded.file, line = excluded.line,
+        suggested_fix = excluded.suggested_fix,
+        auto_fixable = excluded.auto_fixable, type = excluded.type
     `);
   }
 
   let count = 0;
   for (const f of (data.findings || [])) {
+    const storedId = String(f.id).startsWith(`${runId}/`) ? f.id : `${runId}/${f.id}`;
     const base = [
-      f.id, runId, f['cabinet-member'], f.severity, f.title,
+      storedId, runId, f['cabinet-member'], f.severity, f.title,
       f.description || null, f.assumption || null, f.evidence || null,
       f.question || null, f.file || null, f.line || null,
       f.suggestedFix || null, f.autoFixable ? 1 : 0, f.type || 'finding'
