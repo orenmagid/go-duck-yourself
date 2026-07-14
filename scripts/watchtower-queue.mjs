@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, rename
 import { join } from 'path';
 import { randomBytes } from 'crypto';
 import { pathToFileURL } from 'url';
+import { execFileSync } from 'child_process';
 
 const WATCHTOWER_DIR = process.env.WATCHTOWER_DIR
   || join(process.env.HOME, '.claude-cabinet', 'watchtower');
@@ -82,6 +83,10 @@ function generateId() {
 // picked up without tmux involvement.
 function clearDispatchEntries(item) {
   try {
+    // item.id comes from disk CONTENT (which can differ from the gated
+    // filename) — same shape discipline as the write side in
+    // writeStage2Dispatch: never join an illegal token into unlink paths.
+    if (!isLegalPathToken(item.id)) return;
     if (!existsSync(MUX_QA_DIR)) return;
     for (const desk of readdirSync(MUX_QA_DIR, { withFileTypes: true })) {
       if (!desk.isDirectory()) continue;
@@ -115,8 +120,10 @@ const URGENCY_ORDER = { urgent: 0, normal: 1, low: 2 };
 // in-flight staging deploy) carries 'merge-pending': the skill defers stage-2
 // dispatch and the pickup prompt says "merge then QA" instead of asserting a
 // merge — no more hand-flagging merged_into: "PENDING". The recipient gate is
-// unchanged: a merge-pending handoff still resolves only through a stamped
-// qa_verdict, cited against the post-merge commit once the merge has happened.
+// unchanged in what it DEMANDS (a stamped qa_verdict against the post-merge
+// commit) and tightened in when it can FIRE: a merge-pending item cannot
+// resolve at all until markHandoffMerged records the verified merge
+// (act:3d1ac2b7).
 
 const QA_CATEGORY = 'qa-handoff';
 
@@ -173,6 +180,87 @@ export function normalizeMergeState(raw) {
   if (t === 'merged') return 'merged';
   if (['merge-pending', 'mergepending', 'pending', 'unmerged'].includes(t)) return 'merge-pending';
   return null;
+}
+
+// --- merged-by-construction (act:3d1ac2b7) ---
+//
+// A 'merged' qa-handoff claim is VERIFIED against git at the boundary, not
+// asserted: sha-shaped merged_commit required (omission was the trivial
+// bypass), ancestry checked where git can answer. Reject only on positive
+// refutation (git says "not an ancestor") — the detector-symmetry discipline;
+// when git CANNOT answer (no repo, no resolvable main ref, timeout) the filing
+// proceeds with a visible evidence.ancestry_verified: 'unverifiable' stamp,
+// and the drain's Step 0 live check remains the second layer. 'merge-pending'
+// requires a named external blocker (evidence.merge_gate) — the lazy silent
+// default fails loud at file time, with a message that teaches the merge-first
+// close-out so a session on older skill text self-corrects.
+
+// Sha shape: hex, 7-40 chars. Also the option-injection guard — a '-'-prefixed
+// or ref-name value (HEAD, @{u}) never reaches the git argv.
+const SHA_RE = /^[0-9a-f]{7,40}$/i;
+
+function runGit(projectPath, args) {
+  // Args only, never shell-interpolated (Ring 1 CP3 convention); the 5s
+  // timeout bounds each git call (Ring 2's openPibDb timeout precedent).
+  // Known seam: the existsSync gate upstream is a synchronous stat with no
+  // timeout — a hard-hung network mount can stall there before git ever
+  // runs; sync Node offers no stat timeout, and all live project paths are
+  // local disks.
+  return execFileSync('git', ['-C', projectPath, ...args], {
+    encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+// Queue-local main-ref resolution: origin/HEAD → origin/main → origin/master
+// → local main/master. Deliberately NOT imported from Ring 1's resolveMainRef:
+// watchtower-lib re-exports createItem FROM this file and ring1 imports both,
+// so queue→ring1/lib is an ESM cycle. Never fetches — resolution is against
+// local refs only (a network call inside every interactive filing is wrong,
+// and the merge-first close-out just pushed, so the tracking ref is current).
+function resolveAncestryRef(projectPath) {
+  try {
+    const head = runGit(projectPath, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).trim();
+    if (head) return head;
+  } catch { /* fall through to candidates */ }
+  for (const cand of ['origin/main', 'origin/master', 'main', 'master']) {
+    try {
+      runGit(projectPath, ['rev-parse', '--verify', '--quiet', `${cand}^{commit}`]);
+      return cand;
+    } catch { /* next candidate */ }
+  }
+  return null;
+}
+
+/**
+ * Verify a merged claim against git. Returns one of:
+ *   { state: 'verified', ref }   — merged_commit IS an ancestor of the main ref
+ *   { state: 'refuted', ref }    — git answered definitively: NOT an ancestor
+ *   { state: 'unverifiable', reason } — git could not answer (no repo/ref/git,
+ *                                  unknown object, timeout)
+ * Callers reject ONLY on 'refuted'. Exported for tests.
+ */
+export function verifyMergedAncestry(projectPath, mergedCommit) {
+  if (typeof mergedCommit !== 'string' || !SHA_RE.test(mergedCommit)) {
+    return { state: 'unverifiable', reason: 'merged_commit is not sha-shaped' };
+  }
+  if (typeof projectPath !== 'string' || !projectPath || !existsSync(projectPath)) {
+    return { state: 'unverifiable', reason: 'project_path missing or not on disk' };
+  }
+  // resolveAncestryRef never throws (every git call inside it is caught
+  // per-candidate) — a git-absent ENOENT surfaces here as a null ref, so
+  // this one reason covers both no-ref and no-git.
+  const ref = resolveAncestryRef(projectPath);
+  if (!ref) return { state: 'unverifiable', reason: 'no main ref resolvable (or git unavailable)' };
+  try {
+    runGit(projectPath, ['merge-base', '--is-ancestor', mergedCommit, ref]);
+    return { state: 'verified', ref };
+  } catch (err) {
+    // Exit 1 is git's definitive "not an ancestor"; anything else (128 =
+    // unknown object / not a repo, killed = timeout) is can't-determine —
+    // an unknown sha is not PROOF of unmergedness (shallow clones exist).
+    if (err && err.status === 1) return { state: 'refuted', ref };
+    return { state: 'unverifiable', reason: `git error${err && err.status ? ` (exit ${err.status})` : ''}` };
+  }
 }
 
 function gateError(item, message) {
@@ -574,6 +662,21 @@ export function annotateItemEvidence(id, patch) {
   if (!existsSync(fp)) return null;
   const item = readItem(fp);
   if (item.status !== 'pending') return null;
+  // The merge VERIFICATION RECORD is not annotatable on a qa-handoff — an
+  // evidence patch that could flip merge_state, rewrite the verified sha,
+  // falsify the ancestry stamp, or pre-plant a 'dispatched' status would
+  // bypass every createItem guard (or make markHandoffMerged short-circuit
+  // without verifying). The one legal doorway is markHandoffMerged (same
+  // ancestry verification + the deferred stage-2 dispatch). Fenced to
+  // qa-handoff, so Ring 2's freshness/fold sweeps on other categories are
+  // untouched. (act:3d1ac2b7)
+  const QA_VERIFICATION_KEYS = ['merge_state', 'merged_commit', 'ancestry_verified', 'stage2_dispatch'];
+  if (item.category === QA_CATEGORY && patch) {
+    const hit = QA_VERIFICATION_KEYS.find((k) => Object.prototype.hasOwnProperty.call(patch, k));
+    if (hit) {
+      throw new Error(`annotateItemEvidence: ${hit} on a qa-handoff is part of the merge verification record and is not annotatable — use markHandoffMerged(id, { merged_commit }) so the merge claim is verified and the deferred stage-2 dispatch fires.`);
+    }
+  }
   const evidence = { ...(item.evidence || {}) };
   let changed = false;
   for (const [key, value] of Object.entries(patch || {})) {
@@ -586,6 +689,120 @@ export function annotateItemEvidence(id, patch) {
   item.evidence = evidence;
   atomicWrite(fp, item);
   return { item, changed: true };
+}
+
+// Non-throwing shape check for a mux desk-dir token — same discipline as
+// assertLegalItemId (the desk name becomes a path component under MUX_QA_DIR,
+// so a slash/dot-dot token must never reach the join).
+function isLegalPathToken(t) {
+  return typeof t === 'string' && !!t && !t.startsWith('.')
+    && !t.includes('/') && !t.includes('\\') && !t.includes('..');
+}
+
+// The stage-2 pickup prompt for a handoff whose merge landed AFTER filing.
+// Wording keeps parity with the qa-handoff skill's Step 6 merged prompt (the
+// skill's inline heredoc is the interactive spelling; this is the library
+// spelling for the deferred-dispatch path). Exported for tests.
+export function buildQaPickupPrompt(item, mergedCommit) {
+  const short = String(mergedCommit).slice(0, 7);
+  return `Post-merge QA: ${item.title} — merged to main at ${short}. `
+    + `Read qa-handoff inbox item ${item.id} (run /inbox), then run the recipient gate `
+    + `(the qa-handoff skill's 'The recipient gate' section) at the tier the handoff's fields select — `
+    + `re-validate risk_surface against the merged file list. Resolve only with a stamped qa_verdict `
+    + `(resolveItem rejects an incomplete shape).`;
+}
+
+// Write the stage-2 mux dispatch descriptor for an item directly into the mux
+// dispatch queue dir — fs-only on purpose: this runs from whatever context
+// called markHandoffMerged (possibly cron), where mux/tmux/python3 may be off
+// PATH (the routines library shells mux and degrades; here the enqueue file IS
+// the contract — `mux qa drain` reads the desk dir, and the ·N badge recomputes
+// on mux's next mutation/desk-open). Never throws; returns a status the caller
+// records in evidence so a failed dispatch re-triggers by STATE on the next
+// markHandoffMerged call, not lost to a write-skip:
+//   'dispatched'        — descriptor written (or already queued: idempotent)
+//   'already-in-flight' — a drain already holds it; do not double-offer
+//   'no-desk'           — item carries no legal desk token to route to
+//   'failed: <why>'     — write failed; re-callable
+function writeStage2Dispatch(item, mergedCommit) {
+  try {
+    const desk = item.desk;
+    if (!isLegalPathToken(desk)) return 'no-desk';
+    // item.id was read from disk, not from a caller — a hand-edited queue
+    // file must not become a path escape (same discipline as assertLegalItemId).
+    if (!isLegalPathToken(item.id)) return 'failed: illegal item id';
+    const deskDir = join(MUX_QA_DIR, desk);
+    if (existsSync(join(deskDir, 'in-flight', `${item.id}.json`))) return 'already-in-flight';
+    ensureDir(deskDir);
+    atomicWrite(join(deskDir, `${item.id}.json`), {
+      project: desk,
+      project_path: item.project_path,
+      item_id: item.id,
+      merged_commit: mergedCommit,
+      what: item.title,
+      pickup_prompt: buildQaPickupPrompt(item, mergedCommit),
+    });
+    return 'dispatched';
+  } catch (err) {
+    return `failed: ${err && err.message ? err.message.slice(0, 80) : 'unknown'}`;
+  }
+}
+
+/**
+ * The ONE legal merge-pending → merged transition for a qa-handoff item
+ * (act:3d1ac2b7). Verifies the merge claim exactly as createItem does
+ * (sha-shaped merged_commit; git ancestry — reject on positive refutation,
+ * visible 'unverifiable' stamp when git can't answer), flips
+ * evidence.merge_state, and performs the stage-2 mux dispatch that
+ * merge-pending deferred. The dispatch outcome is recorded in
+ * evidence.stage2_dispatch {status, at}; calling again on an already-merged
+ * item retries ONLY a non-dispatched dispatch (state-keyed, so a mux hiccup
+ * is recoverable and a success never double-injects).
+ * annotateItemEvidence refuses merge_state patches on qa-handoffs, making
+ * this the only doorway. Named callers: the qa-handoff drain playbook's
+ * merge-then-QA step and the amend-after-merge path (both in the qa-handoff
+ * skill text).
+ * @param {string} id
+ * @param {{merged_commit: string}} params
+ * @returns {{item: object, dispatch: string}|null} null when missing/not pending
+ */
+export function markHandoffMerged(id, { merged_commit } = {}) {
+  const fp = itemPath(id);
+  if (!existsSync(fp)) return null;
+  const item = readItem(fp);
+  if (item.status !== 'pending') return null;
+  if (item.category !== QA_CATEGORY) {
+    throw new Error(`markHandoffMerged: ${id} is category '${item.category}', not qa-handoff`);
+  }
+  const sha = typeof merged_commit === 'string' ? merged_commit.trim() : merged_commit;
+  if (typeof sha !== 'string' || !SHA_RE.test(sha)) {
+    throw new Error(`markHandoffMerged: requires a sha-shaped merged_commit (got ${JSON.stringify(merged_commit ?? null)}) — the post-merge sha on main.`);
+  }
+  const evidence = { ...(item.evidence || {}) };
+  const already = normalizeMergeState(evidence.merge_state) === 'merged'
+    && evidence.stage2_dispatch && evidence.stage2_dispatch.status === 'dispatched';
+  if (already) {
+    // Never silently swallow a DIFFERENT sha — an amend session correcting a
+    // wrong recorded sha must hear the mismatch, not a success shape.
+    if (typeof evidence.merged_commit === 'string' && evidence.merged_commit !== sha) {
+      throw new Error(`markHandoffMerged: ${id} is already recorded merged+dispatched at ${evidence.merged_commit.slice(0, 12)} — refusing to silently ignore differing sha ${sha.slice(0, 12)}. If the recorded sha is wrong, that is a hand-repair with an operator, not a re-flip.`);
+    }
+    return { item, dispatch: 'dispatched' };
+  }
+  const v = verifyMergedAncestry(item.project_path, sha);
+  if (v.state === 'refuted') {
+    throw new Error(`markHandoffMerged: ${sha.slice(0, 12)} is NOT an ancestor of ${v.ref} in ${item.project_path} — the merge hasn't landed on the main ref (did the push happen? or your local ${v.ref} may be behind: fetch and retry). Item left unchanged.`);
+  }
+  const dispatch = writeStage2Dispatch(item, sha);
+  item.evidence = {
+    ...evidence,
+    merge_state: 'merged',
+    merged_commit: sha,
+    ancestry_verified: v.state === 'verified' ? 'verified' : 'unverifiable',
+    stage2_dispatch: { status: dispatch, at: new Date().toISOString() },
+  };
+  atomicWrite(fp, item);
+  return { item, dispatch };
 }
 
 // --- Exports ---
@@ -647,6 +864,51 @@ export function createItem({
       }
     }
   }
+  // Merged-by-construction guards (act:3d1ac2b7). The string check above
+  // catches free-texted pending markers; these verify the POSITIVE claim.
+  // Firing matrix (pinned — see the taxonomy note at verifyMergedAncestry):
+  //   merged (explicit OR the absent-field default):
+  //     - merged_commit absent / not sha-shaped → REJECT (omission was the
+  //       trivial bypass; the skill's producer contract has always required
+  //       the sha on merged handoffs);
+  //     - git refutes ancestry → REJECT, message teaches merge-first;
+  //     - verified / can't-determine → file, stamped 'verified'/'unverifiable'.
+  //   merge-pending:
+  //     - evidence.merge_gate absent/empty → REJECT. An INTERNAL failure
+  //       (merge conflict, gate red) is not a gate — HALT and fix instead.
+  if (category === QA_CATEGORY) {
+    // MINT-ONLY fields: the boundary owns the verification record. A
+    // caller-supplied ancestry stamp or dispatch status is discarded, never
+    // trusted — a pre-planted stage2_dispatch:'dispatched' would make
+    // markHandoffMerged short-circuit without verifying or dispatching, and
+    // a re-filed item (standing-debt refile, supersede+refile) legitimately
+    // carries stale stamps that must not survive into the fresh filing.
+    if (evidence && (evidence.ancestry_verified !== undefined || evidence.stage2_dispatch !== undefined)) {
+      const { ancestry_verified: _av, stage2_dispatch: _sd, ...minted } = evidence;
+      evidence = minted;
+    }
+    const ms = normalizeMergeState(evidence && evidence.merge_state);
+    if (ms === 'merged') {
+      const sha = evidence && typeof evidence.merged_commit === 'string'
+        ? evidence.merged_commit.trim() : evidence?.merged_commit;
+      if (typeof sha !== 'string' || !SHA_RE.test(sha)) {
+        throw new Error(`createItem: a 'merged' qa-handoff requires a sha-shaped evidence.merged_commit (got ${JSON.stringify(sha ?? null)}). Merge-first close-out: merge the branch into main, push, then file with the post-merge sha — or, if the merge is genuinely gated on something external, file merge_state:'merge-pending' with evidence.merge_gate naming the blocker.`);
+      }
+      const v = verifyMergedAncestry(project_path, sha);
+      if (v.state === 'refuted') {
+        throw new Error(`createItem: qa-handoff filed as 'merged' but ${sha.slice(0, 12)} is NOT an ancestor of ${v.ref} in ${project_path} — the merge hasn't landed on the main ref (did the push happen? or your local ${v.ref} may be behind: fetch and retry). Merge + push first and file with the post-merge sha, or file merge_state:'merge-pending' with evidence.merge_gate naming the external blocker.`);
+      }
+      // Store the TRIMMED sha (the value the check ran against) so the
+      // stamp and the stored value can never disagree — markHandoffMerged
+      // canonicalizes the same way.
+      evidence = { ...evidence, merged_commit: sha, ancestry_verified: v.state === 'verified' ? 'verified' : 'unverifiable' };
+    } else if (ms === 'merge-pending') {
+      const gate = evidence && evidence.merge_gate;
+      if (typeof gate !== 'string' || !gate.trim()) {
+        throw new Error(`createItem: a 'merge-pending' qa-handoff requires evidence.merge_gate — a non-empty string naming the EXTERNAL blocker and when it clears (e.g. "staging deploy <id> in flight — clears on deploy SUCCESS"). An internal failure (merge conflict, red gate) is not a merge gate: HALT and fix, then merge-first (merge → push → file 'merged'). The silent merge-pending default is retired.`);
+      }
+    }
+  }
   const id = generateId();
   const item = {
     schema_version: 1,
@@ -699,6 +961,14 @@ export function resolveItem(id, { resolution, resolution_notes = null, resolutio
   const item = readItem(fp);
   if (item.status !== 'pending') return null;
   if (item.category === QA_CATEGORY) {
+    // A merge-pending handoff cannot be RESOLVED — resolution asserts QA of
+    // merged work, and the merge was never recorded. The drain merges, calls
+    // markHandoffMerged (verified flip + deferred dispatch), THEN resolves.
+    // Dismissal (the audited escape hatch below) stays legal for abandoned
+    // work. (act:3d1ac2b7 — the widest bypass around the flip doorway.)
+    if (normalizeMergeState(item.evidence && item.evidence.merge_state) === 'merge-pending') {
+      throw gateError(item, `item is merge_state 'merge-pending' — the merge has not been recorded. Merge the branch, run markHandoffMerged(id, { merged_commit }) so the merge is verified and the deferred dispatch fires, then resolve with the qa_verdict`);
+    }
     const verdict = validateQaVerdict(item, qa_verdict);
     item.qa_verdict = { ...qa_verdict, verdict };
   }

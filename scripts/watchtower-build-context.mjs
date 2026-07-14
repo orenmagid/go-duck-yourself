@@ -31,7 +31,7 @@ const PROJECT_STALENESS_DAYS = 7;
 // `assembleSections` removes whole sections (never trims within one) in
 // descending priority order until the output fits MAX_OUTPUT_CHARS;
 // PRIORITY_NEVER is never dropped.
-const PRIORITY_NEVER = 0;    // summary + missed-routine directive — always kept
+const PRIORITY_NEVER = 0;    // ack directive + summary + missed-routine directive — always kept
 const PRIORITY_KEEP = 1;     // threads, inbox, advisories — try hard to keep
 const PRIORITY_PROJECT = 2;  // per-project state
 const PRIORITY_DOMAIN = 3;   // injected domain files
@@ -377,6 +377,22 @@ function isMainCheckout(projectPath) {
 // Render the run-first directive for pending routine items, or null when there
 // are none. qa-handoff items never reach here — the caller filters to
 // category 'routine'. Caps the inline list at 3; the rest stay in the inbox.
+// --- Session-start acknowledgment directive (act:058d00f0) ---
+//
+// The injection is invisible in the terminal, so a healthy quiet session is
+// indistinguishable from a silently broken hook. This never-truncated
+// directive tells the session to open its first reply with one visible
+// plain-English line composed from the injected state — positive
+// confirmation the context loaded (no-silent-failures), replacing the
+// signal orient's briefing used to give. Prompt-layer convention only:
+// nothing is blocked if the line is skipped.
+function renderSessionAckSection() {
+  return [
+    '--- Session-Start Acknowledgment ---',
+    'Open your first reply of this session with ONE plain-English line confirming this watchtower context loaded: where the operator left off, what needs attention in this project, and the inbox count — e.g. "Watchtower: picked up where you left off (merged the auth fix to main, 2h ago); 1 flagged action here; inbox 12 pending." If the state below carries a staleness or health warning, lead with that warning instead. A frontier-model warning above this block stays first. One line, then proceed with the operator\'s request. Skip it if the conversation already has replies (context re-injected on resume).',
+  ].join('\n');
+}
+
 function renderMissedRoutineSection(pendingItems, projectName, projectPath) {
   if (!Array.isArray(pendingItems) || pendingItems.length === 0) return null;
   const n = pendingItems.length;
@@ -424,6 +440,12 @@ function main() {
   }
 
   const sections = [];
+
+  // Step 1b: Session-start acknowledgment directive — rendered first so the
+  // visible-confirmation contract sits at the top of the injection
+  // (act:058d00f0). The shell hook prepends any frontier-model warning above
+  // the builder output, so that warning still comes first overall.
+  sections.push({ key: 'session-ack', content: renderSessionAckSection(), priority: PRIORITY_NEVER });
 
   // Step 2: Read state/summary.md
   const summaryPath = join(WATCHTOWER_DIR, 'state', 'summary.md');
@@ -618,7 +640,7 @@ function assembleSections(sections) {
 
 // Exports for hermetic tests (act:a136b362). Importing this module must NOT
 // run main() — gate the entry on an argv/url match (matches the ring scripts).
-export { reverifyGitAttention, verifyGitFact, renderMissedRoutineSection, isMainCheckout };
+export { reverifyGitAttention, verifyGitFact, renderMissedRoutineSection, renderSessionAckSection, isMainCheckout };
 
 const isMain = (() => {
   try {
