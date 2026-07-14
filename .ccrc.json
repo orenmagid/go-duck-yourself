@@ -19,8 +19,8 @@
     "date": "2026-05-28T14:40:48.357Z",
     "sunset_at": "2026-06-01"
   },
-  "version": "0.50.0",
-  "installedAt": "2026-07-14T16:10:57.927Z",
+  "version": "0.51.0",
+  "installedAt": "2026-07-14T20:04:42.873Z",
   "upstreamPackage": "create-claude-cabinet",
   "modules": {
     "session-loop": true,
@@ -38,6 +38,7 @@
     "watchtower": true,
     "mux": true,
     "engagement-server": true,
+    "output-register": true,
     "bash-compress": true
   },
   "skipped": {},
@@ -346,6 +347,7 @@
     ".claude/skills/close/SKILL.md": "560eb66ea15e8b22",
     ".claude/skills/orient/phases/dx-captures.md": "7c27aaaf679c9596",
     ".claude/skills/dx-feedback/SKILL.md": "55d74047893d53fe",
+    ".claude/hooks/register-reinforce.sh": "57ff674a136ed063",
     ".claude/hooks/bash-output-compress.sh": "e200949344d78bf7"
   },
   "dbSchemaVersion": 7
