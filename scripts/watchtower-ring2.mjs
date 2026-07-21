@@ -40,7 +40,7 @@ import {
 } from './watchtower-lib.mjs';
 import {
   expireItem, listItems,
-  extractCitedActFids, proposeFolds, annotateItemEvidence,
+  proposeFolds, annotateItemEvidence,
 } from './watchtower-queue.mjs';
 
 // Shared thread-file reader (single source of truth in watchtower-lib.mjs).
@@ -1077,15 +1077,24 @@ async function detectStaleWork(config) {
 // 4. Thread absorption
 // ---------------------------------------------------------------------------
 
-// Pruning safety gate (act:ef5a3842): pruning is the LOSSY step in the
-// memory-consolidation gradient — once session detail files are gone, every
-// recovery costs a full transcript replay. Until the re-enrichment ascent
-// (on-demand re-sharpening of the absorbed past) exists, keep the cheap
-// middle tier around for 90 days instead of 7.
-const ABSORPTION_SESSION_AGE_DAYS = 90;
-const DORMANT_THREAD_AGE_DAYS = 30;
+// Age-only session-record pruning RETIRED (act:6f93a1f1, N4 of
+// grp:retro-remeaning) — it deleted ~1.7 MB of session detail files against
+// ~1.1 GB of permanent raw transcripts that are never deleted, on an age
+// check that did NOT do the absorption its own name claimed (it checked the
+// date and unlinked; it never read cursor_history). It also orphaned two
+// real consumers: `appendRecordPointer` (watchtower-ring3-close.mjs) writes
+// the session file path into the project-state "## Last Session" block as
+// the authoritative record, and watchtower-cross-ring-reader.mjs reads these
+// files for /briefing — deleting the file left both pointing at nothing.
+// The 90-day gate existed to hold the line "until the re-enrichment ascent
+// exists" (act:ef5a3842); that ascent is what's being built now, and there
+// was never a data-loss deadline to protect against — the reach-back reads
+// the permanent transcripts directly, regardless of whether this file
+// survives. See memory `decision_pruning_absorption_threshold` (resolution:
+// revisit condition resolves upward, to never).
+export const DORMANT_THREAD_AGE_DAYS = 30;
 
-async function absorbThreadSessions(config) {
+export async function absorbThreadSessions() {
   const threadsDir = join(WATCHTOWER_DIR, 'state', 'threads');
   if (!existsSync(threadsDir)) {
     log('Slow: no threads directory, skipping absorption');
@@ -1093,9 +1102,7 @@ async function absorbThreadSessions(config) {
   }
 
   const now = Date.now();
-  const sessionAgeCutoff = now - ABSORPTION_SESSION_AGE_DAYS * 86400000;
   const dormantCutoff = now - DORMANT_THREAD_AGE_DAYS * 86400000;
-  let pruned = 0;
   let dormant = 0;
 
   const threadFiles = readdirSync(threadsDir).filter(f => f.endsWith('.json'));
@@ -1116,41 +1123,13 @@ async function absorbThreadSessions(config) {
       atomicWrite(threadPath, JSON.stringify(thread, null, 2));
       dormant++;
       log(`Slow: thread ${thread.thread} marked dormant (${Math.floor((now - lastUpdated) / 86400000)}d inactive)`);
-      continue;
-    }
-
-    // Prune old session detail files that are already captured in the thread's
-    // cursor_history. The session entry in the thread's sessions array (with
-    // transcript pointer) survives.
-    if (!thread.sessions || thread.sessions.length === 0) continue;
-
-    const projects = config.projects || {};
-    for (const sess of thread.sessions) {
-      const sessDate = new Date(sess.date || 0).getTime();
-      if (sessDate >= sessionAgeCutoff) continue;
-
-      // Find the session detail file and prune it if it exists
-      const projectSlug = sess.project;
-      const sessionsDir = join(WATCHTOWER_DIR, 'state', 'projects', projectSlug, 'sessions');
-      if (!existsSync(sessionsDir)) continue;
-
-      // Match session files by session ID
-      const sessFilePattern = `${sess.date}-${sess.id}.md`;
-      const sessFilePath = join(sessionsDir, sessFilePattern);
-
-      if (existsSync(sessFilePath)) {
-        try {
-          unlinkSync(sessFilePath);
-          pruned++;
-        } catch { /* best effort */ }
-      }
     }
   }
 
-  if (pruned > 0 || dormant > 0) {
-    log(`Slow: absorption — ${pruned} session files pruned, ${dormant} threads marked dormant`);
+  if (dormant > 0) {
+    log(`Slow: absorption — ${dormant} threads marked dormant`);
   } else {
-    log('Slow: absorption — nothing to prune');
+    log('Slow: absorption — nothing to mark dormant');
   }
 }
 
@@ -1857,6 +1836,14 @@ function triggerRing1Reeval() {
 // telemetry). Guards (boundary-man): total===0 ⇒ no alert; a minimum
 // denominator before a rate can fire; window by record timestamp; baseline =
 // the FIRST captured (post-M1a) rate, else it would alert on its own fix.
+//
+// N2/N3 of grp:retro-remeaning (act:471dd701/act:5182beda) change what this
+// canary measures — the extraction prompt's schema and suppression paths
+// both moved. The pre-change state was retained at
+// state/recall-canary-baseline-pre-n2-471dd701.json (a one-time copy, not
+// auto-generated) so a future comparison isn't blind to the shift; this
+// writer still targets only the fixed `recall-canary.json` path and never
+// touches the baseline file.
 
 const CANARY_WINDOW_DAYS = 14;       // rate computed over this trailing window
 const CANARY_RETENTION_DAYS = 60;    // ledger pruned to this on each run
@@ -2036,22 +2023,18 @@ export function recallCanary(config, { nowMs = Date.now() } = {}) {
 // Draft surfacing-intelligence sweep (act:00051dca)
 // ---------------------------------------------------------------------------
 //
-// Annotates PENDING knowledge-extraction drafts with the two surfacing
-// signals the 2026-07-12 full inbox read proved a human otherwise catches
-// only by reading everything:
-//   freshness — the draft cites act: fids that have since CLOSED in the
-//     item's project pib-db (possibly overtaken by events);
-//   folds — another pending draft in the same project words the same lesson
-//     (unigram Jaccard, watchtower-queue.mjs owns the recipe).
+// Annotates PENDING knowledge-extraction drafts with the fold signal the
+// 2026-07-12 full inbox read proved a human otherwise catches only by
+// reading everything: another pending draft in the same project words the
+// same lesson (unigram Jaccard, watchtower-queue.mjs owns the recipe).
 // Annotations are ADDITIVE evidence fields written through the queue lib's
 // annotateItemEvidence (fresh-read pending fence at write time, idempotent
 // re-sweeps). They demote items out of the batch sign-off — never dismiss.
 //
-// Failure posture per the tri-state discipline: only a POSITIVELY-found
-// closed action annotates. Fid-not-found, missing/unreadable db, and
-// unresolved projects all mean "unknown" — no annotation, the draft stays
-// batch-eligible, the skip is LOUD (logged + counted in the summary
-// sidecar), and one bad project never aborts the rest of the sweep.
+// The sibling freshness signal (a draft citing a since-CLOSED act: fid) was
+// RETIRED (act:471dd701, N2 of grp:retro-remeaning) — see the retirement
+// note beside proposeFolds' evidence.possible_duplicate_of doc in
+// watchtower-queue.mjs for the measurement that killed it.
 //
 // Positive confirmation that the sweep ran (built-but-never-fired guard):
 // every run writes state/draft-annotations-health.json with counts, so
@@ -2061,14 +2044,12 @@ export function runDraftAnnotationSweep(config, deps = {}) {
   const {
     listPendingFn = listPending,
     annotateFn = annotateItemEvidence,
-    openDb = openPibDb,
     watchtowerDir = WATCHTOWER_DIR,
     nowIso = () => new Date().toISOString(),
   } = deps;
   const summary = {
     projects_scanned: 0,
     items_scanned: 0,
-    freshness_annotated: 0,
     fold_annotated: 0,
     skipped_projects: [],
     // Drafts filed under a project NOT in config.projects (incl.
@@ -2084,8 +2065,7 @@ export function runDraftAnnotationSweep(config, deps = {}) {
       .filter((i) => typeof i.draft_artifact === 'string' && i.draft_artifact.trim()
         && !Object.prototype.hasOwnProperty.call(projects, i.project)).length;
   } catch { /* visibility only — never blocks the sweep */ }
-  for (const [name, proj] of Object.entries(projects)) {
-    const projectPath = (proj && proj.path) || proj;
+  for (const [name] of Object.entries(projects)) {
     let drafts = [];
     try {
       drafts = listPendingFn({ project: name, category: 'knowledge-extraction' })
@@ -2099,58 +2079,15 @@ export function runDraftAnnotationSweep(config, deps = {}) {
     summary.projects_scanned++;
     summary.items_scanned += drafts.length;
 
-    // Freshness: cited fids resolved against THIS item's project pib-db.
-    let db = null;
-    if (typeof projectPath === 'string' && projectPath && existsSync(projectPath)) {
-      db = openDb(projectPath); // logs + returns null on failure
-    }
-    if (db) {
-      try {
-        // Probe the schema ONCE per db: only a positively-missing deleted_at
-        // column drops the soft-delete guard. A transient error must NOT
-        // silently degrade to the unguarded query (a soft-deleted action is
-        // "unknown", never "closed") — on probe failure we keep the guard and
-        // let the per-item catch log any real query error.
-        let hasDeletedAt = true;
-        try {
-          db.prepare('SELECT deleted_at FROM actions LIMIT 1');
-        } catch (e) {
-          if (/no such column/i.test(String(e.message))) hasDeletedAt = false;
-        }
-        for (const item of drafts) {
-          try {
-            const fids = extractCitedActFids(`${item.title || ''}\n${item.draft_artifact}`);
-            if (fids.length === 0) continue;
-            // Parameter-bound placeholders only — fids are regex matches, but
-            // they originate in model-drafted text and never touch SQL as
-            // literals. The done predicate covers BOTH close paths (the gated
-            // completed=1 and the ungated status='done').
-            const placeholders = fids.map(() => '?').join(',');
-            const rows = db.prepare(
-              `SELECT fid, completed_at FROM actions WHERE fid IN (${placeholders}) `
-              + "AND (status = 'done' OR completed = 1)"
-              + (hasDeletedAt ? ' AND deleted_at IS NULL' : ''),
-            ).all(...fids);
-            if (rows.length === 0) continue;
-            const cited = rows
-              .map((r) => ({ fid: r.fid, closed_at: r.completed_at || null }))
-              .sort((a, b) => (a.fid < b.fid ? -1 : 1));
-            const res = annotateFn(item.id, { freshness: { overtaken: true, cited } });
-            if (res && res.changed) summary.freshness_annotated++;
-          } catch (e) {
-            logError(`Draft sweep ${name}/${item.id}: freshness failed: ${e.message}`);
-            summary.errors++;
-          }
-        }
-      } finally {
-        try { db.close(); } catch { /* best-effort */ }
-      }
-    } else {
-      // Loud skip: unreadable/missing db ⇒ freshness UNKNOWN for this
-      // project this tick — drafts stay batch-eligible, never demoted.
-      summary.skipped_projects.push(name);
-      log(`Draft sweep ${name}: no readable pib-db — freshness skipped (drafts stay batch-eligible)`);
-    }
+    // Freshness annotation RETIRED (act:471dd701, N2 of grp:retro-remeaning):
+    // it demoted a draft out of batch sign-off when it cited a now-closed
+    // act: fid, on the theory that closed-work citations mean the draft may
+    // be overtaken. Measured against the 2026-07-14 read-pass answer key: it
+    // fired on 62-of-66 TRUE drafts (a lesson always names the work it was
+    // learned during, which always closes) and 70-of-84 flags fired on
+    // actions that closed BEFORE the draft was even filed — false by
+    // construction. It caught less than chance. The fold half (below) is
+    // unaffected and stays.
 
     // Folds: pure similarity pass within this project's pending drafts.
     try {
@@ -2231,7 +2168,7 @@ async function runSlow() {
 
   // 4. Thread absorption
   try {
-    await absorbThreadSessions(config);
+    await absorbThreadSessions();
   } catch (e) {
     logError(`Thread absorption failed: ${e.message}`);
   }

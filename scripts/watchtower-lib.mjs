@@ -18,7 +18,12 @@ const require = createRequire(import.meta.url);
 
 // Re-export queue operations so ring scripts have a single import source.
 export { createItem, listPending, getItem, resolveItem } from './watchtower-queue.mjs';
-import { resolveItem as queueResolveItem, getItem as queueGetItem } from './watchtower-queue.mjs';
+// The knowledge-extraction four-axis vocabulary (act:471dd701) — defined in
+// watchtower-queue.mjs (createItem's boundary check needs it with zero
+// imports; this file already imports FROM queue.mjs, so the reverse would
+// be a cycle), re-exported here for Ring 3 / Ring 2 / /inbox consumers.
+export { KNOWLEDGE_EXTRACTION_TYPES, KNOWLEDGE_EXTRACTION_HOMES } from './watchtower-queue.mjs';
+import { resolveItem as queueResolveItem, getItem as queueGetItem, listItems as queueListItems } from './watchtower-queue.mjs';
 
 // ---------------------------------------------------------------------------
 // autoReconcileItem — the ONE resolution path for machine (ring) retractions
@@ -163,6 +168,31 @@ export const INBOX_DETECTOR_REGISTRY = {
     exempt: 'backfill nudge for actions without a Verify Plan. Candidate future '
       + 'reconciler: the action gains a Verify Plan section ⇒ retract.',
   },
+  // ring3-filed, ring1-reconciled (act:5182beda, N3/Reach 1 of grp:retro-remeaning)
+  'pending-relation': {
+    reconciler: 'autoReconcilePendingRelations (ring1): a proposal that two still-PENDING '
+      + 'inbox items relate (pairs_with/answers/contradicts) retracts when EITHER cited '
+      + 'side (evidence.from_id / evidence.to_id) leaves pending — a relation between two '
+      + 'open questions no longer applies once one resolves. Fails toward KEEPING: a cited '
+      + 'id that no longer resolves via getItem is ambiguous, not evidence of resolution. '
+      + 'Filing exclusion: dedup by evidence.relation_key (sorted ids + relation verb) '
+      + 'across ALL statuses, UNWINDOWED (act:bcb7edd4 tightening) — a dismissed relation '
+      + 'never refiles, ever; never a refile loop.',
+  },
+  // ring3-filed, ring1-reconciled (act:bcb7edd4, Reach 2 of grp:retro-remeaning)
+  'significance-change': {
+    reconciler: 'autoReconcileSignificanceItems (ring1): a proposal that a session\'s '
+      + 'new understanding recolors an EARLIER cursor entry of a thread it touched '
+      + '(reframes/answers/contradicts) retracts when the cited thread file is POSITIVELY '
+      + 'gone from state/threads/ (dir readable, file absent) — a recolor of deleted '
+      + 'history is moot. Fails toward KEEPING on any read error. Filing exclusion: dedup '
+      + 'by evidence.relation_key (thread|prior_session|new_session|verb) across ALL '
+      + 'statuses, UNWINDOWED — a dismissed/expired judgment about a static corpus never '
+      + 're-nags, and a reprocess replay of the same session produces the same key and '
+      + 'files nothing. Event-driven (fires on session close only), never a periodic '
+      + 'sweep. Relational category: in GATED_CATEGORIES, so applyBatch structurally '
+      + 'refuses to bulk it — each proposal is confirmed or dismissed individually.',
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -260,6 +290,142 @@ export function recordSuppression(record = {}, { watchtowerDir, ts } = {}) {
     try { logError('suppression-ledger', `append failed (${e.message}) — continuing`); }
     catch { /* logging itself must never throw the caller */ }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Significance ledger (act:bcb7edd4, Reach 2 of grp:retro-remeaning)
+// ---------------------------------------------------------------------------
+//
+// One structured line per session close that ran the thread reach-back —
+// the DENOMINATOR of the observed significance-change rate, the honest
+// metric that gates Reach 3 (L2) per the plan (replacing the wrong
+// contradiction-density gate: significance change leaves no contradiction
+// to detect, so only observed proposal/keep rates can measure it). The
+// NUMERATOR (proposals filed / kept / dismissed) lives in the queue itself
+// under category 'significance-change'; readSignificanceRate combines the
+// two. Named reader: the L2 pickup gate (its action notes point here) plus
+// the close run's own log line — never write-only telemetry.
+//
+// Same fail-open discipline as recordSuppression: observability, never the
+// filing decision; a dropped ledger line must not block a session close.
+
+export function significanceLedgerPath(watchtowerDir) {
+  return join(watchtowerDir || getWatchtowerDir(),
+    'state', 'significance-ledger.jsonl');
+}
+
+export function recordSignificanceEvent(record = {}, { watchtowerDir, ts } = {}) {
+  try {
+    const path = significanceLedgerPath(watchtowerDir);
+    const dir = dirname(path);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const line = JSON.stringify({
+      ts: ts || record.ts || new Date().toISOString(),
+      session_id: record.session_id ?? null,
+      project: record.project ?? null,
+      threads_touched: record.threads_touched ?? 0,
+      threads_with_history: record.threads_with_history ?? 0,
+      prior_entries_shown: record.prior_entries_shown ?? 0,
+      proposals_filed: record.proposals_filed ?? 0,
+    }) + '\n';
+    appendFileSync(path, line);
+  } catch (e) {
+    try { logError('significance-ledger', `append failed (${e.message}) — continuing`); }
+    catch { /* logging itself must never throw the caller */ }
+  }
+}
+
+/**
+ * The observed significance-change rate — the L2 gate's metric. Sessions
+ * come from the ledger (deduped by session_id so a reprocess replay cannot
+ * inflate the denominator); proposal dispositions come from the queue by
+ * category. Ratios are null when their denominator is zero — an unknown
+ * rate is reported as unknown, never fabricated as 0.
+ * @param {object} [opts]
+ * @param {string} [opts.watchtowerDir]
+ * @param {Function} [opts.listItemsFn] - injectable for tests
+ * @returns {{sessions: number, sessions_with_history: number,
+ *   proposals_filed_ledger: number, queue: {pending: number, kept: number,
+ *   dismissed: number, expired: number, superseded: number, retracted: number},
+ *   proposals_per_session: number|null, keep_ratio: number|null}}
+ */
+export function readSignificanceRate({ watchtowerDir, listItemsFn = queueListItems } = {}) {
+  const sessions = new Map(); // session_id -> latest record
+  try {
+    const path = significanceLedgerPath(watchtowerDir);
+    if (existsSync(path)) {
+      for (const line of readFileSync(path, 'utf8').split('\n')) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const rec = JSON.parse(t);
+          if (rec && rec.session_id) sessions.set(rec.session_id, rec);
+        } catch { /* skip malformed lines */ }
+      }
+    }
+  } catch { /* fail-open: an unreadable ledger reads as zero sessions */ }
+
+  const queue = { pending: 0, kept: 0, dismissed: 0, expired: 0, superseded: 0, retracted: 0 };
+  try {
+    for (const item of listItemsFn({ category: 'significance-change' })) {
+      if (item.status === 'pending') queue.pending++;
+      else if (item.status === 'resolved') {
+        if (item.resolution_type === 'auto-reconciled') queue.retracted++;
+        else queue.kept++;
+      } else if (item.status === 'dismissed') queue.dismissed++;
+      else if (item.status === 'expired') queue.expired++;
+      else if (item.status === 'superseded') queue.superseded++;
+    }
+  } catch { /* fail-open: an unreadable queue reads as zero dispositions */ }
+
+  const records = [...sessions.values()];
+  const sessionsWithHistory = records.filter((r) => (r.threads_with_history ?? 0) > 0).length;
+  const proposalsFiledLedger = records.reduce((s, r) => s + (r.proposals_filed ?? 0), 0);
+  const decided = queue.kept + queue.dismissed;
+  return {
+    sessions: records.length,
+    sessions_with_history: sessionsWithHistory,
+    proposals_filed_ledger: proposalsFiledLedger,
+    queue,
+    proposals_per_session: sessionsWithHistory > 0
+      ? proposalsFiledLedger / sessionsWithHistory : null,
+    keep_ratio: decided > 0 ? queue.kept / decided : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// appendThreadRecolor — the human-gated APPLY step for a confirmed
+// significance-change proposal (act:bcb7edd4). When the operator confirms in
+// /inbox that a session's understanding recolors an earlier thread entry,
+// the reinterpretation must LAND somewhere — otherwise the confirmation is
+// archival and the meaning-change evaporates (the exact disease the program
+// treats). Appends to the thread file's additive `recolor_log` array (old
+// readers unaffected; never touches cursor_history — the recolor ANNOTATES
+// history, it never rewrites it). Called by /inbox's confirm follow-up only,
+// never by any ring: the rings PROPOSE, the operator applies.
+// Returns the updated thread object, or null when the thread file is
+// missing/corrupt (caller surfaces it — never a silent no-op).
+export function appendThreadRecolor(threadsDir, threadSlug, entry) {
+  const p = join(threadsDir, `${threadSlug}.json`);
+  if (!existsSync(p)) return null;
+  let thread;
+  try {
+    thread = JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(thread.recolor_log)) thread.recolor_log = [];
+  thread.recolor_log.push({
+    ts: entry.ts || new Date().toISOString(),
+    prior_session_id: entry.prior_session_id ?? null,
+    prior_date: entry.prior_date ?? null,
+    new_session_id: entry.new_session_id ?? null,
+    verb: entry.verb ?? null,
+    explanation: entry.explanation ?? null,
+    confirmed_via: entry.confirmed_via ?? null, // the inbox item id
+  });
+  atomicWrite(p, JSON.stringify(thread, null, 2));
+  return thread;
 }
 
 // ---------------------------------------------------------------------------

@@ -176,7 +176,7 @@ const TOOLS = [
   },
   {
     name: 'pib_defer_with_trigger',
-    description: 'Defer an action or project with a free-text trigger condition describing what would reactivate it. Orient re-evaluates triggers each session. Use this INSTEAD of pib_update_action with status=deferred when the deferral is waiting for a specific condition.',
+    description: 'Defer an action or project with a free-text trigger condition describing what would reactivate it. Each session re-evaluates triggers and surfaces those whose condition has fired. Use this INSTEAD of pib_update_action with status=deferred when the deferral is waiting for a specific condition.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -199,7 +199,7 @@ const TOOLS = [
   },
   {
     name: 'pib_mark_trigger_checked',
-    description: 'Record that a trigger was evaluated. Use after orient\'s deferred-check phase evaluates triggers against session context. Result must be one of: triggered | still-waiting | needs-info | condition-obsolete.',
+    description: 'Record that a trigger was evaluated. Use after a session evaluates triggers against session context. Result must be one of: triggered | still-waiting | needs-info | condition-obsolete.',
     inputSchema: {
       type: 'object',
       properties: {

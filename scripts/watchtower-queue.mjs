@@ -126,6 +126,30 @@ const URGENCY_ORDER = { urgent: 0, normal: 1, low: 2 };
 // (act:3d1ac2b7).
 
 const QA_CATEGORY = 'qa-handoff';
+const KNOWLEDGE_CATEGORY = 'knowledge-extraction';
+
+// --- Knowledge-extraction four-axis vocabulary (act:471dd701) ---
+//
+// type / home / derivable / subject is the taxonomy Ring 3's extraction
+// prompt, Ring 2's sweep, and /inbox all read. SSOT here (createItem's
+// boundary check needs it directly, with zero imports — watchtower-lib.mjs
+// already imports FROM this file to re-export createItem, so the reverse
+// import would be a cycle); watchtower-lib.mjs re-exports both consts
+// alongside createItem. A prompt-parity test asserts the extraction
+// prompt's JSON schema literal matches these arrays — a doc is not
+// enforcement.
+//
+// 'unclassifiable' (type) is the junk drawer that produced this taxonomy:
+// a required `unclassifiable_reason` makes model uncertainty visible
+// instead of forcing a confident wrong type/home guess — home is not
+// validated when type is 'unclassifiable' (the model isn't asked to guess
+// one). 'derivation' (home) is the route for a DERIVABLE fact (recomputable
+// on demand — a memory of it is a stale cache): a `derivable: true` item
+// requires `derivation`, a short instruction for how to recompute it, and
+// is ALWAYS filed (never dropped) — home becomes the recomputation itself,
+// not a written record.
+export const KNOWLEDGE_EXTRACTION_TYPES = ['decision', 'constraint', 'lesson', 'preference', 'unclassifiable'];
+export const KNOWLEDGE_EXTRACTION_HOMES = ['memory', 'claude-md', 'pib-db-trigger', 'upstream-feedback', 'derivation'];
 
 // Categories whose items carry a structural recipient gate: they may never be
 // included in a batch disposition — each leaves the queue only through its own
@@ -133,7 +157,17 @@ const QA_CATEGORY = 'qa-handoff';
 // dismissal). Distinct from DISPATCHED_CATEGORIES: 'routine' is dispatched but
 // NOT gated — stale routines are legal batch fodder. Future gated categories
 // join this set and inherit batch refusal for free.
-export const GATED_CATEGORIES = new Set([QA_CATEGORY]);
+//
+// The RELATIONAL categories (pending-relation, significance-change — the
+// retro-remeaning proposal verbs, act:5182beda/act:bcb7edd4) are gated per
+// the plan's non-goal: "relational verbs go in GATED_CATEGORIES so applyBatch
+// structurally refuses to bulk them." A relation proposal is a judgment about
+// how two pieces of knowledge relate — rubber-stamping a batch of them is
+// re-meaning without a real human gate, which is how a system gaslights its
+// operator (MANIFESTO principle 4). Unlike qa-handoff they have no verdict
+// shape and MAY auto-expire; the durable relation_key filing exclusion
+// guarantees an expired proposal never refiles.
+export const GATED_CATEGORIES = new Set([QA_CATEGORY, 'pending-relation', 'significance-change']);
 
 const QA_TERMINAL_VERDICTS = ['runtime-verified', 'blocked'];
 // The parameterized token. Canonical form uses U+00B7 (·); input tolerates
@@ -471,14 +505,16 @@ export function isHighConfidenceSignoff(item) {
   // An explicit low-confidence stamp means "look at this one".
   if (item.confidence === 'low') return false;
   // Surfacing-intelligence annotations (act:00051dca) demote to individual
-  // review: an overtaken draft (cites since-closed work) or a fold candidate
-  // wants a human look, not a batch nod. Key on the SEMANTIC value, never on
-  // field presence — a future benign "checked, still fresh" stamp under the
-  // same key must not silently demote the whole knowledge-extraction class.
-  if (item.evidence && item.evidence.freshness
-      && item.evidence.freshness.overtaken === true) return false;
+  // review: a fold candidate wants a human look, not a batch nod. Key on the
+  // SEMANTIC value, never on field presence. (The sibling freshness/overtaken
+  // demotion was RETIRED — act:471dd701, N2 of grp:retro-remeaning: it fired
+  // on 62-of-66 TRUE drafts and 70-of-84 flags were false by construction,
+  // catching less than chance. See runDraftAnnotationSweep in
+  // watchtower-ring2.mjs for the measurement.)
   if (item.evidence && Array.isArray(item.evidence.possible_duplicate_of)
       && item.evidence.possible_duplicate_of.length > 0) return false;
+  // Held items (holdItem) are deliberate human retention — never a batch nod.
+  if (item.evidence && item.evidence.held) return false;
   return true;
 }
 
@@ -504,21 +540,12 @@ export function partitionForBatchSignoff(items) {
   return { signoff, individual };
 }
 
-// --- Surfacing intelligence: draft freshness + fold proposals (act:00051dca) ---
+// --- Surfacing intelligence: fold proposals (act:00051dca) ---
 //
 // Ring 2's slow tier sweeps PENDING knowledge-extraction drafts and attaches
-// two ADDITIVE evidence annotations (no new categories, no schema change,
-// and NEVER an auto-dismissal — an annotation demotes confidence so the item
+// an ADDITIVE evidence annotation (no new category, no schema change, and
+// NEVER an auto-dismissal — the annotation demotes confidence so the item
 // routes to `individual` in partitionForBatchSignoff; the human decides):
-//
-//   evidence.freshness = { overtaken: true, cited: [{fid, closed_at}] }
-//     The draft cites act: fids that are now closed — possibly overtaken.
-//     Written ONLY when overtaken (negative-only), and deliberately carries
-//     no timestamp: the value is a pure function of (draft, pib-db state),
-//     so a re-sweep recomputes the identical object and annotateItemEvidence
-//     skips the write (idempotent across the 30-min slow ticks). The cited
-//     fid + close date ride along so /inbox can render "cites act:X, closed
-//     YYYY-MM-DD" without re-resolving another project's pib-db.
 //
 //   evidence.possible_duplicate_of = ['dec-...']  (sorted; reciprocal)
 //     A fold proposal: another PENDING draft in the same project words the
@@ -528,37 +555,20 @@ export function partitionForBatchSignoff(items) {
 //     draft whose twin was already dispositioned still wants a human look,
 //     not a batch sign-off.
 //
+// The sibling `evidence.freshness` annotation (a draft citing a now-closed
+// act: fid, demoted as "possibly overtaken") was RETIRED (act:471dd701, N2
+// of grp:retro-remeaning): measured against the 2026-07-14 read-pass answer
+// key, it fired on 62-of-66 TRUE drafts and 70-of-84 flags fired on actions
+// that closed BEFORE the draft was even filed — false by construction, it
+// caught less than chance. `extractCitedActFids` (its sole caller) was
+// deleted alongside it.
+//
 // This apparatus is the deliberate SIBLING of ring3-close's dedup tokenizer
 // (STOPWORDS/meaningfulTokens/OVERLAP_THRESHOLD): same concept ("do these two
 // short texts describe the same thing"), different corpus and metric. Lane
 // boundaries forced the fork (ring3-close and watchtower-lib are other lanes'
 // files); ring3-close already imports from this module, so a later
 // consolidation can flow ring3 → queue.
-
-// Fid extraction: matches are the ONLY values that ever reach a pib-db query
-// (bound as parameters, never interpolated) — the regex is the validation.
-const ACT_FID_RE = /\bact:[0-9a-f]{8}\b/g;
-
-// Cap per draft so a pathological draft can't build an unbounded lookup.
-const MAX_CITED_FIDS = 50;
-
-/**
- * Extract unique cited `act:` fids from draft text, in order of first
- * appearance, capped at MAX_CITED_FIDS. Non-string/empty input → [].
- * @param {string} text
- * @returns {string[]}
- */
-export function extractCitedActFids(text) {
-  if (typeof text !== 'string' || !text) return [];
-  const out = [];
-  for (const m of text.match(ACT_FID_RE) || []) {
-    if (!out.includes(m)) {
-      out.push(m);
-      if (out.length >= MAX_CITED_FIDS) break;
-    }
-  }
-  return out;
-}
 
 // The fold recipe — calibrated 2026-07-12 against the live pairs that a full
 // human read of 510 pending drafts surfaced as real fold candidates:
@@ -601,6 +611,8 @@ export function foldTokens(text) {
 
 /**
  * Unigram Jaccard over two token Sets. Empty sets never match (0, never NaN).
+ * Kept for callers that want it directly; proposeFolds no longer uses it as
+ * of act:421a8ab2 — see overlapCoefficient below.
  * @param {Set<string>} a
  * @param {Set<string>} b
  * @returns {number}
@@ -614,9 +626,43 @@ export function unigramJaccard(a, b) {
 }
 
 /**
- * Propose fold candidates over a set of pending drafts (one project's).
- * Pure — no I/O, no writes. Compares title + draft_artifact pairwise;
- * items below the FOLD_MIN_TOKENS floor or without an id never pair.
+ * Overlap coefficient over two token Sets: intersection / min(|a|, |b|).
+ * The fold retrieval metric as of act:421a8ab2 (N5 of grp:retro-remeaning) —
+ * replaces unigramJaccard, whose union denominator punishes LENGTH
+ * ASYMMETRY: two genuine duplicate drafts phrased as cause vs. effect (one
+ * short, one long) share most of the short side's vocabulary but score low
+ * under Jaccard because the long side's extra tokens inflate the union. The
+ * live specimen this fixes: a JSONB read-merge-write pair scored 0.109 under
+ * Jaccard (below the 0.22 threshold, invisible to the fold pass) and ranks
+ * 19th of 1081 under the overlap coefficient over the same corpus. Empty
+ * sets never match (0, never NaN) — same contract as unigramJaccard.
+ * @param {Set<string>} a
+ * @param {Set<string>} b
+ * @returns {number}
+ */
+export function overlapCoefficient(a, b) {
+  if (!(a instanceof Set) || !(b instanceof Set) || a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  const denom = Math.min(a.size, b.size);
+  return denom === 0 ? 0 : inter / denom;
+}
+
+/**
+ * Propose fold candidates over a set of items (pending drafts, or memory
+ * files shaped the same way — {id, title, draft_artifact}). Pure — no I/O,
+ * no writes.
+ *
+ * DUAL-SCORED as of act:421a8ab2 (N5): title-alone AND title+artifact are
+ * each scored independently via overlapCoefficient, and a pair proposes on
+ * whichever clears `threshold` (the max of the two, reported). Combined
+ * scoring alone can miss a real duplicate whose BODIES differ more than
+ * their titles (the live Meta specimen: 0.25 on titles alone, above
+ * threshold, but diluted when the differing bodies are folded in) — titles
+ * are short and specific, so they carry the strongest signal on their own.
+ * Each score is independently floor-gated by FOLD_MIN_TOKENS: a title too
+ * short to score never contributes a false floor-cleared title score, and
+ * vice versa for the combined text.
  * @param {Array} items
  * @param {object} [opts]
  * @param {number} [opts.threshold]
@@ -626,16 +672,25 @@ export function proposeFolds(items, { threshold = FOLD_SIMILARITY_THRESHOLD } = 
   const eligible = [];
   for (const item of Array.isArray(items) ? items : []) {
     if (!item || typeof item.id !== 'string' || !item.id) continue;
-    const tokens = foldTokens(`${item.title || ''}\n${item.draft_artifact || ''}`);
-    if (tokens.size < FOLD_MIN_TOKENS) continue;
-    eligible.push({ id: item.id, tokens });
+    const titleTokens = foldTokens(item.title || '');
+    const combinedTokens = foldTokens(`${item.title || ''}\n${item.draft_artifact || ''}`);
+    if (titleTokens.size < FOLD_MIN_TOKENS && combinedTokens.size < FOLD_MIN_TOKENS) continue;
+    eligible.push({ id: item.id, titleTokens, combinedTokens });
   }
   const pairs = [];
   for (let i = 0; i < eligible.length; i++) {
     for (let j = i + 1; j < eligible.length; j++) {
-      const similarity = unigramJaccard(eligible[i].tokens, eligible[j].tokens);
+      const x = eligible[i];
+      const y = eligible[j];
+      let similarity = 0;
+      if (x.combinedTokens.size >= FOLD_MIN_TOKENS && y.combinedTokens.size >= FOLD_MIN_TOKENS) {
+        similarity = Math.max(similarity, overlapCoefficient(x.combinedTokens, y.combinedTokens));
+      }
+      if (x.titleTokens.size >= FOLD_MIN_TOKENS && y.titleTokens.size >= FOLD_MIN_TOKENS) {
+        similarity = Math.max(similarity, overlapCoefficient(x.titleTokens, y.titleTokens));
+      }
       if (similarity >= threshold) {
-        pairs.push({ a: eligible[i].id, b: eligible[j].id, similarity });
+        pairs.push({ a: x.id, b: y.id, similarity });
       }
     }
   }
@@ -844,6 +899,25 @@ export function createItem({
     }
     evidence = { ...evidence, merge_state: ms };
   }
+  // Knowledge-extraction four-axis boundary check (act:471dd701) — reject an
+  // illegal type/home token at the boundary, as merge_state does above.
+  if (category === KNOWLEDGE_CATEGORY && evidence) {
+    if (evidence.type !== undefined && !KNOWLEDGE_EXTRACTION_TYPES.includes(evidence.type)) {
+      throw new Error(`createItem: illegal knowledge-extraction type ${JSON.stringify(evidence.type)} — must be one of: ${KNOWLEDGE_EXTRACTION_TYPES.join(' | ')}`);
+    }
+    const isUnclassifiable = evidence.type === 'unclassifiable';
+    if (isUnclassifiable && (typeof evidence.unclassifiable_reason !== 'string' || !evidence.unclassifiable_reason.trim())) {
+      throw new Error("createItem: type 'unclassifiable' requires evidence.unclassifiable_reason (a one-line reason) — unclassifiable is a verdict, not a silent drop");
+    }
+    // home is not validated for an unclassifiable item — the model is not
+    // asked to guess one when it can't confidently classify the item at all.
+    if (!isUnclassifiable && evidence.home !== undefined && !KNOWLEDGE_EXTRACTION_HOMES.includes(evidence.home)) {
+      throw new Error(`createItem: illegal knowledge-extraction home ${JSON.stringify(evidence.home)} — must be one of: ${KNOWLEDGE_EXTRACTION_HOMES.join(' | ')}`);
+    }
+    if (evidence.derivable === true && (typeof evidence.derivation !== 'string' || !evidence.derivation.trim())) {
+      throw new Error('createItem: derivable:true requires evidence.derivation naming how to recompute it — a derivable fact is routed to its derivation, never filed as an opaque flag');
+    }
+  }
   // A 'merged' handoff must reference work actually on main. merge_state
   // replaced the old hand-flagged `merged_into: "PENDING — not yet merged"`
   // antipattern, but a producer can still free-text a not-yet-merged marker
@@ -1027,6 +1101,62 @@ export function supersedeItem(id, { reason = null } = {}) {
 }
 
 /**
+ * Hold a pending inbox item — mark it for deliberate human retention rather
+ * than resolving/dismissing it. The item STAYS pending (still visible, still
+ * editable) but carries `evidence.held = { reason, held_at }` and drops out
+ * of batch disposition (isHighConfidenceSignoff demotes on evidence.held;
+ * applyBatch refuses a held item outright). Delegates to
+ * annotateItemEvidence for the write, so hold inherits its discipline: a
+ * fresh read at write time, the pending fence, additive-only fields.
+ *
+ * A reason is required — hold marks deliberate retention, not silent limbo.
+ * The id comes from the item under review (never hand-transcribed): the
+ * 2026-07-14 read-pass held 13 specimens via a scratchpad script that
+ * hand-copied hex ids into a Map literal, and its one error (dec-3609fe4a
+ * held under dec-837d172c's reason — the true duplicate escaping to memory)
+ * was CAUSED by that transcription step. Calling holdItem(item.id, ...)
+ * against the item object under review makes that error class impossible.
+ * @param {string} id
+ * @param {object} params
+ * @param {string} params.reason - required; why this item is held
+ * @param {object} [params.marker] - additional evidence fields to stamp in
+ *   the SAME write (e.g. `{ specimen: { class, reason } }`)
+ * @returns {{item: object, changed: boolean}|null} null when missing/not pending
+ */
+export function holdItem(id, { reason, marker = null } = {}) {
+  if (typeof reason !== 'string' || !reason.trim()) {
+    throw new Error('holdItem: a reason is required — hold marks deliberate retention, not silent limbo');
+  }
+  const patch = { held: { reason, held_at: new Date().toISOString() } };
+  if (marker && typeof marker === 'object' && !Array.isArray(marker)) {
+    Object.assign(patch, marker);
+  }
+  return annotateItemEvidence(id, patch);
+}
+
+/**
+ * Release a held item: clears `evidence.held` (and `evidence.specimen`, if
+ * present) so it re-enters normal disposition. annotateItemEvidence can only
+ * MERGE evidence fields, never delete one, so this reads+writes directly —
+ * same fresh-read + pending-fence discipline.
+ * @param {string} id
+ * @returns {object|null} the updated item; null when missing/not pending
+ */
+export function releaseHold(id) {
+  const fp = itemPath(id);
+  if (!existsSync(fp)) return null;
+  const item = readItem(fp);
+  if (item.status !== 'pending') return null;
+  if (!item.evidence || !item.evidence.held) return item;
+  const evidence = { ...item.evidence };
+  delete evidence.held;
+  delete evidence.specimen;
+  item.evidence = evidence;
+  atomicWrite(fp, item);
+  return item;
+}
+
+/**
  * Mark an inbox item as expired.
  * @param {string} id
  * @returns {object} The updated item
@@ -1087,6 +1217,10 @@ export function applyBatch(ids, { disposition, resolution_type, notes, resolutio
   if (gated.length > 0) {
     throw new Error(`applyBatch: ${gated.map((i) => `${i.id} (${i.category})`).join(', ')} carr${gated.length === 1 ? 'ies' : 'y'} a recipient gate — gated items never batch; handle each through its own gate. Nothing was applied`);
   }
+  const held = items.filter((i) => i.evidence && i.evidence.held);
+  if (held.length > 0) {
+    throw new Error(`applyBatch: ${held.map((i) => i.id).join(', ')} ${held.length === 1 ? 'is' : 'are'} held — held items are excluded from batch disposition; releaseHold(id) first if this should proceed. Nothing was applied`);
+  }
   const applied = [];
   const skipped_not_pending = [];
   for (const item of items) {
@@ -1102,9 +1236,11 @@ export function applyBatch(ids, { disposition, resolution_type, notes, resolutio
 /**
  * List pending inbox items with optional filters.
  * @param {object} filters
+ * @param {boolean} [filters.held] - true: only held items (evidence.held
+ *   truthy); false: only non-held items; omit: no filter on held state
  * @returns {Array} Sorted array of pending items
  */
-export function listPending({ project, category, urgency, maxAge } = {}) {
+export function listPending({ project, category, urgency, maxAge, held } = {}) {
   if (!existsSync(QUEUE_DIR)) return [];
   const entries = readdirSync(QUEUE_DIR, { withFileTypes: true });
   const items = [];
@@ -1116,6 +1252,9 @@ export function listPending({ project, category, urgency, maxAge } = {}) {
       if (project && item.project !== project) continue;
       if (category && item.category !== category) continue;
       if (urgency && item.urgency !== urgency) continue;
+      const isHeld = !!(item.evidence && item.evidence.held);
+      if (held === true && !isHeld) continue;
+      if (held === false && isHeld) continue;
       if (maxAge) {
         const filed = new Date(item.filed_at);
         const cutoff = new Date(Date.now() - maxAge);

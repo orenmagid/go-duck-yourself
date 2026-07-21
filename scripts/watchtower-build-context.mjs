@@ -407,6 +407,24 @@ function renderMissedRoutineSection(pendingItems, projectName, projectPath) {
   return lines.join('\n');
 }
 
+function renderRing3FailedSection() {
+  // Outage-recovery visibility (act:6fb2b7d1): surface sessions Ring 3 left
+  // UNMARKED because the API was down — so the loss is never silent. Reads the
+  // GLOBAL ring3/failed/ worklist (the recovery drain is portfolio-wide).
+  try {
+    const failedDir = join(WATCHTOWER_DIR, 'ring3', 'failed');
+    if (!existsSync(failedDir)) return null;
+    const n = readdirSync(failedDir).filter((f) => f.endsWith('.json')).length;
+    if (n === 0) return null;
+    return [
+      '--- Ring 3 Capture Recovery ---',
+      `⚠ ${n} session(s) failed Ring 3 capture during an API outage and were NOT lost — their transcripts are queued for recovery. When the API is up, run \`watchtower-ring3-close.mjs --reprocess-failed\` from the main checkout to reprocess them.`,
+    ].join('\n');
+  } catch {
+    return null;
+  }
+}
+
 // --- Main ---
 
 function main() {
@@ -494,6 +512,20 @@ function main() {
       }
     } catch {
       // never block session start on routine re-delivery
+    }
+  }
+
+  // Outage-recovery visibility (act:6fb2b7d1): sessions Ring 3 left UNMARKED
+  // because the API was down. Main checkout only (worktree windows stay quiet);
+  // never truncated — a silent capture loss is exactly what this surfaces.
+  if (isMainCheckout(projectPath)) {
+    try {
+      const ring3FailedSection = renderRing3FailedSection();
+      if (ring3FailedSection) {
+        sections.push({ key: 'ring3-failed', content: ring3FailedSection, priority: PRIORITY_NEVER });
+      }
+    } catch {
+      // never block session start on recovery visibility
     }
   }
 
@@ -640,7 +672,7 @@ function assembleSections(sections) {
 
 // Exports for hermetic tests (act:a136b362). Importing this module must NOT
 // run main() — gate the entry on an argv/url match (matches the ring scripts).
-export { reverifyGitAttention, verifyGitFact, renderMissedRoutineSection, renderSessionAckSection, isMainCheckout };
+export { reverifyGitAttention, verifyGitFact, renderMissedRoutineSection, renderSessionAckSection, renderRing3FailedSection, isMainCheckout };
 
 const isMain = (() => {
   try {

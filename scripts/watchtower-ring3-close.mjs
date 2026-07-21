@@ -32,13 +32,13 @@
 
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync,
-  renameSync, statSync, realpathSync,
+  renameSync, statSync, realpathSync, rmSync,
 } from 'fs';
 import { join, basename, dirname } from 'path';
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import { createRequire } from 'module';
 import { homedir } from 'os';
-import { pathToFileURL } from 'url';
+import { pathToFileURL, fileURLToPath } from 'url';
 import {
   atomicWrite, loadConfig, slugify,
   log as _log, logError as _logError,
@@ -46,7 +46,8 @@ import {
   updateThreadFile, currentCursor, resolveProjectIdentity, VERIFY_UI_PATHS,
   projectThreadCursorLines, authoredClaudeDirs, claudeChurnIsDisposable,
   buildLastSessionBlock, upsertLastSessionSection, recordSuppression, recordApiUsage,
-  recentSlice,
+  recentSlice, parseMemoryIndex, parseMemoryRegionPointers, memoryGlobToRegex,
+  recordSignificanceEvent,
 } from './watchtower-lib.mjs';
 // Namespace view of the same module record — feature-detection seam for lib
 // exports that land in a different lane's merge (a static named import of a
@@ -129,6 +130,13 @@ function parseArgs() {
     else if (args[i] === '--transcript') parsed.transcriptPath = args[++i];
     else if (args[i] === '--cwd') parsed.cwd = args[++i];
     else if (args[i] === '--reason') parsed.reason = args[++i];
+    // --reprocess: replay ONE failed session (a fresh subprocess spawned by
+    // the --reprocess-failed drain). Stamps suppressions with the session's
+    // original date so a backfill can't flood the recall-canary window.
+    else if (args[i] === '--reprocess') parsed.reprocess = true;
+    // --reprocess-failed: drain the ring3/failed/ worklist (parent mode —
+    // spawns one --reprocess subprocess per marker; never calls main()).
+    else if (args[i] === '--reprocess-failed') parsed.reprocessFailed = true;
   }
   return parsed;
 }
@@ -183,9 +191,38 @@ export function classifyApiError(err) {
 // Reset per process — each Ring 3 invocation is a fresh node process.
 let systemicApiFailure = null;
 
+// Per-process API-call accounting (act:6fb2b7d1). If EVERY API-dependent
+// phase threw this run — not only the account-level `classifyApiError`
+// classes — the session captured nothing and must NOT be marked processed;
+// these counters detect that broader outage (network / 500 / timeout) at the
+// single API chokepoint (claudeCall), without touching each phase.
+let apiCallsAttempted = 0;
+let apiCallsFailed = 0;
+
+// Reprocess-mode date override (act:6fb2b7d1). In --reprocess mode this is
+// the failed session's ORIGINAL date; the suppression call sites pass it as
+// `record.ts` so backfilled ledger entries land in their historical window
+// (aged out of the recall-canary's 14-day window) instead of spiking the
+// current window with now()-stamped entries. Null in live mode → suppression
+// stamps now() exactly as before (byte-identical live behavior).
+let reprocessTs = null;
+
 async function claudeCall(systemPrompt, userMessage) {
-  const client = await getAnthropicClient();
+  apiCallsAttempted++;
+  // Once a systemic failure is latched, every subsequent phase would fail the
+  // same way — stop hammering a dead API (the July outage burned ~15 failed
+  // calls per session across every phase). Fail fast; still counts as a failed
+  // attempt so the all-phases-failed detector stays consistent (act:6fb2b7d1).
+  if (systemicApiFailure) {
+    apiCallsFailed++;
+    throw new Error(`skipped — systemic API failure already latched (${systemicApiFailure.type})`);
+  }
   try {
+    // getAnthropicClient() is INSIDE the try: a client-construction failure
+    // (e.g. a missing/invalid key during an outage) must count as a failed
+    // call too, or the all-api-phases-failed detector would undercount and a
+    // total-outage session could slip through as "not all failed" (act:6fb2b7d1).
+    const client = await getAnthropicClient();
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 4096,
@@ -195,6 +232,7 @@ async function claudeCall(systemPrompt, userMessage) {
     recordApiUsage({ ring: 'ring3', model: MODEL, usage: response.usage }, { watchtowerDir: WATCHTOWER_DIR });
     return response.content[0]?.text || '';
   } catch (e) {
+    apiCallsFailed++;
     const cls = classifyApiError(e);
     if (cls && !systemicApiFailure) {
       systemicApiFailure = { type: cls, message: String(e.message || e).slice(0, 300) };
@@ -572,8 +610,188 @@ export function selectEarnedThreads(threads, {
   return accepted;
 }
 
+// ---------------------------------------------------------------------------
+// Reach 2 — significance reach-back (act:bcb7edd4, grp:retro-remeaning)
+// ---------------------------------------------------------------------------
+//
+// The second reach of the one retrospective-temporality motion: when a
+// session CONCLUDES something, reach back from that new understanding into
+// the prior cursor history of the threads THIS session touched, and PROPOSE
+// where the new understanding recolors an earlier entry. This is where "the
+// feedback turned out to be the seed of the architecture" gets caught — a
+// SIGNIFICANCE change, not a contradiction, which is why a contradiction
+// scan is blind to the whole class (the plan's § What this is).
+//
+// Shape constraints, all load-bearing:
+// - EVENT-DRIVEN: fires inside Phase 2b2 on session close, bounded to the
+//   threads the session earned — never a periodic all-pairs sweep (the shape
+//   the cabinet killed: no way to select among ~1.5M pairs, and a 30-min
+//   re-scan re-proposes dismissed pairs forever).
+// - One extra model call per real-work session, and only when at least one
+//   earned thread has prior history. It cannot ride the capture call the way
+//   Reach 1 rode extraction: the reach-back corpus (which threads matter) IS
+//   that call's output, and pre-loading every active thread's history would
+//   cost more than the second focused call.
+// - PROPOSE only, human-gated: the proposal never modifies the thread file;
+//   the apply step is /inbox's confirm follow-up (appendThreadRecolor), and
+//   the category is in GATED_CATEGORIES so it can never ride a batch.
+// - Anchors are validated: a proposal must cite an ACTUAL prior entry
+//   (session_id + date checked against the on-disk history snapshot); a
+//   hallucinated anchor drops the proposal, logged, never filed.
+// - DURABLE filing exclusion: relation_key = thread|prior_session|new_
+//   session|verb, checked across ALL queue statuses with NO time window —
+//   a dismissed judgment about a static corpus must never re-nag (not even
+//   after RESOLUTION_CORPUS_DAYS), and a reprocess replay produces the same
+//   key and files nothing.
+
+const PRIOR_HISTORY_CAP = 5;      // last K prior cursor entries shown per thread
+const RECOLOR_FIELD_SLICE = 300;  // per-field char bound in the prompt
+const RECOLOR_VERBS = ['reframes', 'answers', 'contradicts'];
+
+// Bounded, labeled rendering of one thread's prior trail + this session's
+// new understanding. Pure; exported for tests.
+export function buildReachBackPrompt(reachBackThreads) {
+  const clip = (s, n = RECOLOR_FIELD_SLICE) =>
+    typeof s === 'string' ? s.slice(0, n) : '';
+  const blocks = reachBackThreads.map((t) => {
+    const priorLines = t.prior.map((p, i) => {
+      const c = p.cursor || {};
+      const oq = Array.isArray(c.open_questions) ? c.open_questions.join(' | ') : '';
+      return `  [${i + 1}] date=${p.date} session=${p.session_id}\n`
+        + `      what: ${clip(c.what)}\n`
+        + `      where_left_off: ${clip(c.where_left_off)}\n`
+        + (oq ? `      open_questions: ${clip(oq, 200)}\n` : '');
+    }).join('');
+    const nc = t.newCursor || {};
+    return `THREAD: ${t.slug} — ${clip(t.displayName, 120)}\n`
+      + `THIS SESSION'S UNDERSTANDING (new):\n`
+      + `  contribution: ${clip(t.contribution)}\n`
+      + `  what: ${clip(nc.what)}\n`
+      + `  where_left_off: ${clip(nc.where_left_off)}\n`
+      + `PRIOR UNDERSTANDING TRAIL (earlier sessions, oldest first):\n${priorLines}`;
+  });
+  return blocks.join('\n');
+}
+
+const REACH_BACK_SYSTEM_PROMPT = `You look for RETROSPECTIVE MEANING CHANGES: places where a session's NEW understanding changes what an EARLIER record of the same work stream meant. Later events change what earlier events were — the question filed Monday is answered Tuesday; the friction noted in June turns out in September to have been the seed of the architecture.
+
+You are given, per thread: this session's new understanding, and the prior understanding trail (earlier sessions' snapshots). For each PRIOR entry, ask: in light of what this session concluded, does that entry now MEAN something different than it did when written?
+
+Three verbs, use exactly these:
+- "reframes" — the prior entry's SIGNIFICANCE changed: what looked like X turns out to have been Y (the most important and least obvious case)
+- "answers" — the prior entry raised a question or uncertainty that this session's understanding resolves
+- "contradicts" — this session's understanding conflicts with what the prior entry asserts
+
+Most sessions recolor NOTHING — normal progress does not change what earlier entries meant, it just extends them. Return [] unless a prior entry's meaning GENUINELY shifts. Do not propose "answers" for routine next-step completion; the open question must have been a real uncertainty that this session settled in a way that recolors the earlier record.
+
+Cite the EXACT prior entry: copy its session= and date= values verbatim from the trail. Never invent entries.
+
+Output a JSON array (ONLY the array, no other text; [] when nothing recolors):
+[{"thread":"<slug exactly as given>","prior_session_id":"<session= value>","prior_date":"<date= value>","verb":"reframes|answers|contradicts","explanation":"One or two sentences: what the prior entry meant THEN, and what it means NOW in light of this session."}]`;
+
+// Validate the model's proposals against the real on-disk history snapshot.
+// Pure; exported for tests. Returns { accepted, dropped } — every drop is
+// itemized so the caller can log it (a hallucinated anchor must be visible,
+// never silently absorbed).
+export function validateRecolorProposals(proposals, priorBySlug) {
+  const accepted = [];
+  const dropped = [];
+  for (const p of Array.isArray(proposals) ? proposals : []) {
+    if (!p || typeof p !== 'object') { dropped.push({ p, why: 'not an object' }); continue; }
+    const prior = priorBySlug.get(p.thread);
+    if (!prior) { dropped.push({ p, why: `unknown thread ${JSON.stringify(p.thread)}` }); continue; }
+    if (!RECOLOR_VERBS.includes(p.verb)) { dropped.push({ p, why: `illegal verb ${JSON.stringify(p.verb)}` }); continue; }
+    if (typeof p.explanation !== 'string' || !p.explanation.trim()) {
+      dropped.push({ p, why: 'empty explanation' }); continue;
+    }
+    const anchor = prior.find(
+      (e) => e.session_id === p.prior_session_id && e.date === p.prior_date);
+    if (!anchor) { dropped.push({ p, why: `no prior entry matches session=${p.prior_session_id} date=${p.prior_date}` }); continue; }
+    accepted.push({ ...p, anchor });
+  }
+  return { accepted, dropped };
+}
+
+// File one significance-change proposal. Durable relation_key exclusion:
+// ALL statuses, no time window (see the block comment above). Returns the
+// filed (or existing) item id.
+export function fileSignificanceProposal({ project, threadSlug, anchor, verb, explanation, sessionId }) {
+  const key = `${threadSlug}|${anchor.session_id}|${sessionId}|${verb}`;
+  const existing = listItems({ category: 'significance-change' })
+    .find((i) => i.evidence && i.evidence.relation_key === key);
+  if (existing) return existing.id;
+  const priorExcerpt = (anchor.cursor && typeof anchor.cursor.what === 'string')
+    ? anchor.cursor.what.slice(0, 200) : '';
+  return createItem({
+    project: project.name,
+    project_path: project.path,
+    ...(project.unresolved ? { project_unresolved: true } : {}),
+    category: 'significance-change',
+    urgency: 'normal',
+    title: `Recolor: this session ${verb} a ${anchor.date} entry of "${threadSlug}"`,
+    summary: explanation,
+    context_anchor: `session ${sessionId}`,
+    evidence: {
+      relation_key: key,
+      thread: threadSlug,
+      verb,
+      prior_session_id: anchor.session_id,
+      prior_date: anchor.date,
+      prior_excerpt: priorExcerpt,
+      new_session_id: sessionId,
+      explanation,
+    },
+    options: [
+      { key: 'confirm', label: 'Confirm — apply the recolor to the thread record' },
+      { key: 'dismiss', label: 'The earlier entry stands as it was' },
+    ],
+    filed_by: 'ring3-close',
+    thread_ids: [threadSlug],
+  });
+}
+
+// The reach-back pass. Fail-open at every stage: a reach-back failure must
+// never break thread capture (the cursor writes already landed). Exported
+// for tests; threadCapture is the only production caller.
+export async function significanceReachBack({
+  reachBackThreads, project, sessionId, callFn = claudeCall,
+}) {
+  const withHistory = reachBackThreads.filter((t) => t.prior.length > 0);
+  if (withHistory.length === 0) return { proposals_filed: 0, prior_entries_shown: 0 };
+
+  const priorEntriesShown = withHistory.reduce((s, t) => s + t.prior.length, 0);
+  let filed = 0;
+  try {
+    const response = await callFn(REACH_BACK_SYSTEM_PROMPT, buildReachBackPrompt(withHistory));
+    const jsonMatch = String(response).match(/\[[\s\S]*\]/);
+    const proposals = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    const priorBySlug = new Map(withHistory.map((t) => [t.slug, t.prior]));
+    const { accepted, dropped } = validateRecolorProposals(proposals, priorBySlug);
+    for (const d of dropped) {
+      log(`Phase 2b2: reach-back proposal dropped — ${d.why}`);
+    }
+    for (const p of accepted) {
+      try {
+        fileSignificanceProposal({
+          project, threadSlug: p.thread, anchor: p.anchor,
+          verb: p.verb, explanation: p.explanation, sessionId,
+        });
+        filed++;
+      } catch (e) {
+        logError(`Phase 2b2: reach-back filing failed for ${p.thread} (${e.message})`);
+      }
+    }
+    if (filed > 0) {
+      log(`Phase 2b2: Reach 2 — ${filed} significance-change proposal(s) filed against ${withHistory.length} thread(s) with prior history`);
+    }
+  } catch (e) {
+    logError(`Phase 2b2: significance reach-back failed (${e.message}) — thread capture is unaffected`);
+  }
+  return { proposals_filed: filed, prior_entries_shown: priorEntriesShown };
+}
+
 async function threadCapture(compressed, projectSlug, sessionId, summary, transcriptPath,
-  { callFn = claudeCall } = {}) {
+  { callFn = claudeCall, project = null } = {}) {
   log('Phase 2b2: Thread capture');
 
   const threadsDir = join(WATCHTOWER_DIR, 'state', 'threads');
@@ -673,6 +891,34 @@ Rules:
   const relatedFids = extractRelatedFids(compressed);
   const acceptedSlugs = threads.map((t) => slugify(t.thread));
 
+  // Reach 2 snapshot (act:bcb7edd4): capture each earned thread's PRIOR
+  // cursor history BEFORE this session's entry is appended below — the
+  // reach-back corpus is the trail as it stood when this session started,
+  // and snapshotting before the append is robust even if an append fails.
+  const reachBackThreads = [];
+  for (const t of threads) {
+    if (!t.thread || !t.cursor) continue;
+    const slug = slugify(t.thread);
+    let prior = [];
+    const p = join(threadsDir, `${slug}.json`);
+    if (existsSync(p)) {
+      try {
+        const existing = JSON.parse(readFileSync(p, 'utf8'));
+        if (Array.isArray(existing.cursor_history)) {
+          prior = existing.cursor_history.slice(-PRIOR_HISTORY_CAP)
+            .filter((e) => e && e.session_id && e.date);
+        }
+      } catch { /* corrupt file → no prior trail; capture handles the backup */ }
+    }
+    reachBackThreads.push({
+      slug,
+      displayName: t.display_name || slug,
+      contribution: t.contribution || '',
+      newCursor: t.cursor,
+      prior,
+    });
+  }
+
   const threadIds = [];
   const now = new Date().toISOString();
   const date = now.slice(0, 10);
@@ -719,6 +965,26 @@ Rules:
     } catch (e) {
       logError(`Phase 2b2: Thread ${threadSlug} write failed: ${e.message} — continuing with remaining threads`);
     }
+  }
+
+  // Reach 2 (act:bcb7edd4): reach back from this session's understanding
+  // into the touched threads' prior trails. Runs AFTER the cursor writes so
+  // a reach-back failure can never cost a cursor append; records the ledger
+  // event (the L2 gate's denominator) whenever real work happened, whether
+  // or not anything was proposed.
+  if (threadIds.length > 0) {
+    const filingProject = project || { name: projectSlug, path: null };
+    const { proposals_filed, prior_entries_shown } = await significanceReachBack({
+      reachBackThreads, project: filingProject, sessionId, callFn,
+    });
+    recordSignificanceEvent({
+      session_id: sessionId,
+      project: filingProject.name,
+      threads_touched: threadIds.length,
+      threads_with_history: reachBackThreads.filter((t) => t.prior.length > 0).length,
+      prior_entries_shown,
+      proposals_filed,
+    });
   }
 
   return threadIds;
@@ -946,6 +1212,76 @@ function parseMemoryTitles(content) {
   return titles;
 }
 
+// extractMemoryFileTitle — a memory file's real title from its own content
+// (act:421a8ab2, N5 of grp:retro-remeaning). writeMemoryFile's on-disk shape
+// is `# <slug-derived title>\n\n_Captured: <date>_\n\n<content>`, and when
+// content itself starts with its own `# <real title>` (every ring3-close
+// draft_artifact does: `# ${item.title}\n\n${item.content}`), the file ends
+// up with TWO H1 headers — a generic slug-title, then the real descriptive
+// one (the act:252b17e7 double-prefix). Scanning the first few lines and
+// keeping the LAST `# ` header found favors the real title when both exist,
+// and degrades to the sole header when a caller supplied an explicit title
+// with no embedded H1 in content.
+function extractMemoryFileTitle(content, maxLines = 10) {
+  if (typeof content !== 'string') return null;
+  let last = null;
+  for (const line of content.split('\n').slice(0, maxLines)) {
+    const m = line.match(/^#\s+(.+)/);
+    if (m) last = m[1].trim();
+  }
+  return last;
+}
+
+// loadRegionPointerTitles — the dedup-hole fix (act:421a8ab2). A region
+// pointer (`- region \`lesson_*.md\` → …`) makes a whole class of memory
+// files reachable from MEMORY.md WITHOUT a per-file index line — that is
+// the point of a region pointer (bounded working-set budget) — but it also
+// made those files invisible to isDuplicate, which only ever parsed direct
+// `[Title](file.md)` links. Both the 2026-07-12 outage-recovery reprocess
+// and the 2026-07-14 read-pass wrote bulk memory files this way, with "zero
+// new MEMORY.md index lines" by design, and both created a ~50% duplicate
+// layer the dedup couldn't see. This expands each region-pointer glob
+// against the files ACTUALLY on disk and reads each matched file's own
+// title, so a future bulk/manual write is visible to extraction dedup
+// without paying the index-line budget cost region pointers exist to avoid.
+// Files already covered by a direct index line are skipped (already in the
+// corpus via parseMemoryTitles). Fails open at every step — a missing dir,
+// an unreadable index, or one unreadable file degrades the corpus, never
+// throws.
+function loadRegionPointerTitles(memDir, indexText) {
+  const titles = [];
+  let regexes;
+  try {
+    regexes = parseMemoryRegionPointers(indexText).map(memoryGlobToRegex);
+  } catch {
+    return titles;
+  }
+  if (regexes.length === 0) return titles;
+  let referenced;
+  try {
+    referenced = parseMemoryIndex(indexText);
+  } catch {
+    referenced = new Set();
+  }
+  let files;
+  try {
+    files = readdirSync(memDir).filter((f) => f.endsWith('.md'));
+  } catch {
+    return titles;
+  }
+  for (const f of files) {
+    if (referenced.has(f)) continue; // already reachable via a direct index line
+    if (!regexes.some((re) => re.test(f))) continue; // not region-pointer-reachable
+    try {
+      const title = extractMemoryFileTitle(readFileSync(join(memDir, f), 'utf8'));
+      if (title) titles.push(title.toLowerCase());
+    } catch {
+      // one unreadable file degrades the corpus, never aborts the load
+    }
+  }
+  return titles;
+}
+
 function loadMemoryTitles(projectPath) {
   // Unresolved identities carry no path — no memory dir to consult; the
   // dedup corpora degrade to empty (nullish guard, never a TypeError).
@@ -954,9 +1290,19 @@ function loadMemoryTitles(projectPath) {
   const memDir = join(homedir(), '.claude', 'projects', encoded, 'memory');
   const indexPath = join(memDir, 'MEMORY.md');
   if (!existsSync(indexPath)) return [];
+  let indexText;
   try {
-    return parseMemoryTitles(readFileSync(indexPath, 'utf8'));
-  } catch { return []; }
+    indexText = readFileSync(indexPath, 'utf8');
+  } catch {
+    return [];
+  }
+  let directTitles;
+  try {
+    directTitles = parseMemoryTitles(indexText);
+  } catch {
+    directTitles = [];
+  }
+  return [...directTitles, ...loadRegionPointerTitles(memDir, indexText)];
 }
 
 function tokenize(text) {
@@ -1088,6 +1434,85 @@ function selectNearbyMemoryTitles(memoryTitles, transcript, limit = 15) {
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit).map(s => s.title);
+}
+
+// Separate cap for the pending-inbox shortlist (act:5182beda, N3/Reach 1 of
+// grp:retro-remeaning) — NOT a shared budget with selectNearbyMemoryTitles'
+// default 15. A large pending pile would otherwise evict memory titles from
+// a shared slice and degrade the M1b novelty gate; the two corpora are
+// separately capped so growth in one never starves the other.
+const PENDING_RELATION_CAP = 10;
+
+// The legal relation verbs a pending-relation proposal can carry. 'none' is
+// the model's explicit no-relation answer, never a filed value.
+const RELATION_VALUES = ['pairs_with', 'answers', 'contradicts'];
+
+// selectNearbyPendingItems — the Reach-1 sibling of selectNearbyMemoryTitles:
+// same relevance-scoring recipe, over a DIFFERENT corpus (pending inbox
+// items, not saved memory) with its OWN cap. Returns {id, title} pairs, not
+// bare strings — a relation proposal must resolve back to an actual pending
+// item id, which a title string alone cannot do.
+function selectNearbyPendingItems(pendingItems, transcript, limit = PENDING_RELATION_CAP) {
+  if (!Array.isArray(pendingItems) || pendingItems.length === 0) return [];
+  const tx = new Set(meaningfulTokens(transcript));
+  if (tx.size === 0) return [];
+  const scored = [];
+  for (const p of pendingItems) {
+    if (!p || typeof p.id !== 'string' || typeof p.title !== 'string' || !p.title.trim()) continue;
+    const score = [...new Set(meaningfulTokens(p.title))].filter(t => tx.has(t)).length;
+    if (score > 0) scored.push({ id: p.id, title: p.title, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(({ id, title }) => ({ id, title }));
+}
+
+// relationKey — the dedup key for a pending-relation proposal: sorted ids +
+// the relation verb, so the SAME relation between the SAME pair of items
+// never files twice regardless of which side is extracted first.
+function relationKey(idA, idB, relation) {
+  return `${[idA, idB].sort().join('|')}:${relation}`;
+}
+
+// fileRelationProposal — files (or returns the existing) 'pending-relation'
+// item for a proposed relation between a freshly-filed item and a still-
+// pending one. Dedup is a listItems scan by evidence.relation_key — global,
+// not project-scoped, ACROSS ALL STATUSES WITH NO TIME WINDOW (act:bcb7edd4
+// tightening, backported from Reach 2's durable-exclusion constraint): a
+// relation the operator DISMISSED must never refile when a later session's
+// extraction re-proposes it — the original pending-only check left exactly
+// that hole. Never throws on a dup; the caller's try/catch covers genuine
+// I/O failure only.
+function fileRelationProposal({ project, fromId, fromTitle, toId, toTitle, relation, sessionId, threadIds }) {
+  const key = relationKey(fromId, toId, relation);
+  const existing = listItems({ category: 'pending-relation' })
+    .find((i) => i.evidence && i.evidence.relation_key === key);
+  if (existing) return existing.id;
+  return createItem({
+    project: project.name,
+    project_path: project.path,
+    ...(project.unresolved ? { project_unresolved: true } : {}),
+    category: 'pending-relation',
+    urgency: 'normal',
+    title: `Relation: "${fromTitle}" ${relation} "${toTitle}"`,
+    summary: `New understanding reaching back to a still-pending item: this item ${relation} `
+      + `"${toTitle}", which is still awaiting triage in the inbox.`,
+    context_anchor: `session ${sessionId}`,
+    evidence: {
+      relation,
+      relation_key: key,
+      from_id: fromId,
+      to_id: toId,
+      from_title: fromTitle,
+      to_title: toTitle,
+      session_id: sessionId,
+    },
+    options: [
+      { key: 'confirm', label: 'Confirm — the relation holds' },
+      { key: 'dismiss', label: 'Not related' },
+    ],
+    filed_by: 'ring3-close',
+    thread_ids: threadIds,
+  });
 }
 
 // modelRescues — the M1b rescue gate (DEFAULT-KEEP). The extraction model is
@@ -1350,27 +1775,47 @@ async function decisionExtraction(compressed, project, sessionId, transcriptPath
   // the full compressed transcript, not just the recent slice).
   const nearbyTitles = selectNearbyMemoryTitles(memoryTitles, compressed);
 
+  // Reach 1 (act:5182beda): the id-paired sibling of pendingTitles, so a
+  // model-proposed relation can resolve back to an actual pending item.
+  // SEPARATE fetch from buildExtractionCorpora's bare-string pendingTitles
+  // (that shape serves the deterministic dedup pass; this one needs ids).
+  let pendingItemsForRelation = [];
+  try {
+    pendingItemsForRelation = listPending({ project: project.name });
+  } catch (e) {
+    logError(`Phase 2d: pending-relation corpus failed (${e.message}) — continuing without it`);
+  }
+  const nearbyPending = selectNearbyPendingItems(pendingItemsForRelation, compressed);
+  const pendingByTitle = new Map(nearbyPending.map((p) => [p.title, p.id]));
+
   const systemPrompt = `You are extracting decisions, constraints, lessons, and user preferences from a Claude Code session transcript. For each item found, classify its home:
 
 - "memory" = a lesson, preference, or constraint worth remembering across sessions
 - "claude-md" = a convention or rule that should be added to CLAUDE.md
 - "pib-db-trigger" = a deferred action with a trigger condition
 - "upstream-feedback" = friction with Claude Code itself
+- "derivation" = the fact is DERIVABLE (see DERIVABLE below) — its home is the recomputation itself, not a written record
 
-Only extract items that represent NEW durable knowledge — things learned or decided in this session that aren't yet captured. Skip items that are routine, obvious, or just restating existing conventions.
+Only extract items that represent NEW knowledge — things learned or decided in this session that aren't yet captured. Skip items that are routine, obvious, or just restating existing conventions.
 
-Do NOT extract transient operational state: project completion status ("X has 0 open actions"), branch merge status ("branch Y was merged"), install success confirmations ("all rings working"), or other point-in-time observations that will be stale within days. These belong in state files, not the inbox.
+DERIVABLE: a fact is derivable when it can be recomputed on demand from a live source rather than remembered — a memory of a derivable fact is a stale cache that goes wrong the moment reality moves on. Examples: "prod is at commit 35a5d15" (recompute: check the deploy log or git log on the remote), "the census run already executed" (recompute: check the run log or the action's status in pib-db), "invoice #1's boundary is 95.25h through July 12" (recompute: re-run the timelog query). When an item is derivable, set "derivable": true and "derivation" to a short instruction for HOW to recompute it (a command, a query, a file to check), and set "home" to "derivation". NEVER omit a derivable item from the output — it is always included, just routed to its derivation instead of memory.
+
+SUBJECT: for every item, set "subject" to the actual project, tool, or system the knowledge is ABOUT. This is usually the same as the project you're working in, but flag it when it differs — a lesson about Claude Code itself learned while doing client work, or a lesson about a third-party API or service, belongs to THAT subject, not the filing project.
+
+UNCLASSIFIABLE: if an item is clearly worth surfacing but does not cleanly fit any type or home above, set "type" to "unclassifiable" and "unclassifiable_reason" to a one-line reason why — this makes your uncertainty visible instead of forcing a confident wrong label. Still include "title" and "content"; "home" and "derivable" are not required for an unclassifiable item.
 
 NOVELTY: an "ALREADY SAVED TO MEMORY" list may appear at the very end of the input. Use it as novelty context: OMIT an item ONLY when a saved title clearly and substantially covers the SAME specific knowledge. DEFAULT TO INCLUDING — when in doubt whether a saved title covers it, INCLUDE the item (re-proposing a near-duplicate is cheap; losing a novel lesson is not). For every item you DO output, set "covered_by" to the exact saved title that most covers it, or "none" if no saved title covers it.
+
+RELATION TO PENDING ITEMS: a "PENDING IN INBOX" list may also appear at the end of the input — these are drafts from earlier sessions still awaiting human triage, NOT yet believed or saved. If an item you output clearly relates to one of them, set "relates_to" to that pending item's exact title and "relation" to "pairs_with" (same topic, worth reading together), "answers" (this item answers a question the pending one raised), or "contradicts" (this item conflicts with what the pending one says). If no pending item relates, set "relates_to" to "none" and "relation" to "none". These are a SEPARATE judgment from "covered_by" — NEVER put a pending title in "covered_by" (covered_by is for MEMORY titles only; a pending item is not yet saved, so naming it there would wrongly suppress the item you're filing right now). And NEVER omit an item, or lower its urgency, on account of a pending item — relate to it, that is all; suppression on account of a pending draft is not something the system can see or undo.
 
 For each item, assess how time-sensitive routing is. Urgency means HOW FAST THE VALUE DECAYS if not routed — it is NOT importance:
 - "urgent" = the value evaporates within days if not routed (a trigger condition about to fire, a constraint someone will trip over THIS WEEK, a decision another active session needs right now). Apply the time-decay test: "if this sits in the inbox for a week, is most of its value gone?" If no, it is not urgent.
 - "normal" = worth routing but the value keeps (most decisions and constraints)
 - "low" = interesting but can wait indefinitely
 
-Lessons and preferences are durable knowledge — their value does not decay. They are almost NEVER urgent, no matter how important they are. An important-but-durable item is "normal".
+Lessons and preferences are almost NEVER urgent, no matter how important they are — an important-but-durable item is "normal", not "urgent".
 
-Output JSON array: [{"type":"decision|constraint|lesson|preference","home":"memory|claude-md|pib-db-trigger|upstream-feedback","urgency":"urgent|normal|low","title":"short title","content":"detailed description","covered_by":"exact already-saved title that covers this, or \\"none\\""}]
+Output JSON array: [{"type":"decision|constraint|lesson|preference|unclassifiable","home":"memory|claude-md|pib-db-trigger|upstream-feedback|derivation","urgency":"urgent|normal|low","title":"short title","content":"detailed description","covered_by":"exact already-saved title that covers this, or \\"none\\"","subject":"the actual project, tool, or system this is about","derivable":false,"derivation":null,"unclassifiable_reason":null,"relates_to":"exact pending title that this relates to, or \\"none\\"","relation":"pairs_with|answers|contradicts|none"}]
 Output ONLY the JSON array, no other text. If nothing found, output [].`;
 
   // M1b injection: show the model what's already saved so it self-filters dupes
@@ -1378,6 +1823,16 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
   // nearby set ⇒ no block ⇒ the prompt degrades to blind extraction (fail-open).
   const savedBlock = nearbyTitles.length
     ? `\n\nALREADY SAVED TO MEMORY (do NOT re-propose anything one of these substantially and specifically covers; when unsure, INCLUDE the item):\n${nearbyTitles.map(t => `- ${t}`).join('\n')}`
+    : '';
+
+  // Reach 1 injection (act:5182beda): show the model the pending inbox so it
+  // can propose a relation — the first instance of the retrospective-
+  // temporality motion (new understanding reaching back to what's still
+  // pending). A SEPARATE block from savedBlock, never merged into it — the
+  // never-omit-on-a-pending-item instruction above depends on the model
+  // being able to tell "saved" from "pending" apart at a glance.
+  const pendingBlock = nearbyPending.length
+    ? `\n\nPENDING IN INBOX (not yet saved or believed — candidates for a RELATION only; never a reason to omit or demote anything):\n${nearbyPending.map((p) => `- ${p.title}`).join('\n')}`
     : '';
 
   let extractions = [];
@@ -1396,7 +1851,7 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
       const perChunk = [];
       for (const window of windows) {
         try {
-          perChunk.push(await runExtractionCall(callFn, systemPrompt, `${window}${savedBlock}`));
+          perChunk.push(await runExtractionCall(callFn, systemPrompt, `${window}${savedBlock}${pendingBlock}`));
         } catch (e) {
           logError(`Phase 2d: M2-B chunk extraction failed (${e.message}) — continuing with the other windows`);
           perChunk.push([]);
@@ -1404,7 +1859,7 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
       }
       extractions = mergeChunkExtractions(perChunk);
     } else {
-      extractions = await runExtractionCall(callFn, systemPrompt, `${transcript}${savedBlock}`);
+      extractions = await runExtractionCall(callFn, systemPrompt, `${transcript}${savedBlock}${pendingBlock}`);
     }
   } catch (e) {
     logError(`Phase 2d: Claude extraction failed: ${e.message}`);
@@ -1418,10 +1873,14 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
   if (nearbyTitles.length) {
     log(`Phase 2d: M1b — injected ${nearbyTitles.length} nearby saved title(s) for novelty context`);
   }
+  if (nearbyPending.length) {
+    log(`Phase 2d: Reach 1 — injected ${nearbyPending.length} nearby pending item(s) for relation context`);
+  }
 
   let queued = 0;
   let deduped = 0;
   let rescued = 0;
+  let relationsProposed = 0;
 
   for (const item of extractions) {
     const fullTitle = `${item.type}: ${item.title}`;
@@ -1444,44 +1903,95 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
         recordSuppression({
           project: project.name, corpus: dup.corpus,
           suppressed_title: fullTitle, matched_against: dup.match,
-          session_id: sessionId,
+          session_id: sessionId, ts: reprocessTs,
         });
         continue;
       }
     }
 
     try {
-      const isMemory = item.home === 'memory';
-      createItem({
+      // Three routing shapes (act:471dd701, N2 of grp:retro-remeaning):
+      // unclassifiable (model uncertainty made visible, never a forced
+      // home guess), derivable (routed to its recomputation, never
+      // written to memory), and the four pre-existing homes.
+      const isUnclassifiable = item.type === 'unclassifiable';
+      const isDerivable = item.derivable === true;
+      const home = isDerivable ? 'derivation' : item.home;
+      const isMemory = !isUnclassifiable && !isDerivable && home === 'memory';
+
+      let options;
+      let draftArtifact = null;
+      let summary = item.content;
+      if (isUnclassifiable) {
+        options = [
+          { key: 'triage', label: 'Needs human triage' },
+          { key: 'dismiss', label: 'Dismiss' },
+        ];
+      } else if (isDerivable) {
+        options = [
+          { key: 'acknowledge', label: 'Acknowledge — derivable, no write needed' },
+          { key: 'dismiss', label: 'Dismiss' },
+        ];
+        summary = item.derivation ? `${item.content}\n\nDerivation: ${item.derivation}` : item.content;
+      } else if (isMemory) {
+        options = [
+          { key: 'write', label: 'Write to memory' },
+          { key: 'edit', label: 'Edit before writing' },
+          { key: 'dismiss', label: 'Dismiss' },
+        ];
+        draftArtifact = `# ${item.title}\n\n${item.content}`;
+      } else {
+        options = [
+          { key: `route-to-${home}`, label: `Write to ${home}` },
+          { key: 'dismiss', label: 'Dismiss' },
+        ];
+      }
+
+      const newId = createItem({
         project: project.name,
         project_path: projectPath,
         ...(project.unresolved ? { project_unresolved: true } : {}),
         category: 'knowledge-extraction',
         urgency: item.urgency || 'normal',
         title: fullTitle,
-        summary: item.content,
+        summary,
         context_anchor: `session ${sessionId}`,
         evidence: {
           type: item.type,
-          home: item.home,
+          ...(isUnclassifiable ? {} : { home }),
           session_id: sessionId,
+          ...(item.subject ? { subject: item.subject } : {}),
+          ...(isDerivable ? { derivable: true, derivation: item.derivation } : {}),
+          ...(isUnclassifiable ? { unclassifiable_reason: item.unclassifiable_reason } : {}),
         },
-        options: isMemory
-          ? [
-              { key: 'write', label: 'Write to memory' },
-              { key: 'edit', label: 'Edit before writing' },
-              { key: 'dismiss', label: 'Dismiss' },
-            ]
-          : [
-              { key: `route-to-${item.home}`, label: `Write to ${item.home}` },
-              { key: 'dismiss', label: 'Dismiss' },
-            ],
-        draft_artifact: isMemory ? `# ${item.title}\n\n${item.content}` : null,
+        options,
+        draft_artifact: draftArtifact,
         filed_by: 'ring3-close',
         transcript_ref: { path: transcriptPath, line_range: null },
         thread_ids: threadIds,
       });
       queued++;
+
+      // Reach 1 (act:5182beda): the model may propose that THIS fresh item
+      // relates to a still-PENDING one shown in pendingBlock. A relation
+      // proposal is filed as its OWN inbox item — it never changes anything
+      // about the item just created above (no suppression, no home change).
+      if (RELATION_VALUES.includes(item.relation)
+          && typeof item.relates_to === 'string' && item.relates_to.trim()) {
+        const relatedId = pendingByTitle.get(item.relates_to);
+        if (relatedId && relatedId !== newId) {
+          try {
+            fileRelationProposal({
+              project, fromId: newId, fromTitle: fullTitle,
+              toId: relatedId, toTitle: item.relates_to,
+              relation: item.relation, sessionId, threadIds,
+            });
+            relationsProposed++;
+          } catch (e) {
+            logError(`Phase 2d: Reach 1 relation proposal failed for "${fullTitle}" (${e.message})`);
+          }
+        }
+      }
     } catch (e) {
       logError(`Phase 2d: Failed to queue extraction: ${e.message}`);
     }
@@ -1489,6 +1999,7 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
 
   if (deduped > 0) log(`Phase 2d: ${deduped} extractions skipped (already in memory or inbox)`);
   if (rescued > 0) log(`Phase 2d: ${rescued} extraction(s) rescued from a lexical match (model judged novel)`);
+  if (relationsProposed > 0) log(`Phase 2d: Reach 1 — ${relationsProposed} relation(s) proposed against the pending inbox`);
   log(`Phase 2d: ${queued} extractions queued for review`);
   return { autoWritten: 0, queued };
 }
@@ -1810,7 +2321,7 @@ Output ONLY the JSON array, no other text.`;
         recordSuppression({
           project: project.name, corpus: dup.corpus,
           suppressed_title: fullTitle, matched_against: dup.match,
-          session_id: sessionId,
+          session_id: sessionId, ts: reprocessTs,
         });
         continue;
       }
@@ -1958,7 +2469,7 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
       recordSuppression({
         project: project.name, corpus: dup.corpus,
         suppressed_title: fullTitle, matched_against: dup.match,
-        session_id: sessionId,
+        session_id: sessionId, ts: reprocessTs,
       });
       continue;
     }
@@ -2053,7 +2564,7 @@ Skill candidates are durable — they are almost never urgent. Output ONLY the J
       recordSuppression({
         project: project.name, corpus: dup.corpus,
         suppressed_title: fullTitle, matched_against: dup.match,
-        session_id: sessionId,
+        session_id: sessionId, ts: reprocessTs,
       });
       continue;
     }
@@ -2425,6 +2936,42 @@ function markProcessed(sessionId, stats) {
     stats,
   };
   atomicWrite(markerPath, JSON.stringify(marker, null, 2) + '\n');
+}
+
+// --- Failed-session recovery markers (act:6fb2b7d1) -------------------------
+// When Ring 3 runs but captures NOTHING because the API was down, the session
+// is left UNMARKED (so it stays reprocessable) and a durable marker is written
+// here — the `--reprocess-failed` worklist. Written ONLY when Ring 3 actually
+// ran and failed, so it never targets an open/running session.
+
+function failedMarkerPath(sessionId) {
+  return join(WATCHTOWER_DIR, 'ring3', 'failed', `${sessionId}.json`);
+}
+
+function writeFailedMarker(sessionId, { transcriptPath, cwd, failureType } = {}) {
+  const p = failedMarkerPath(sessionId);
+  let prior = null;
+  try { if (existsSync(p)) prior = JSON.parse(readFileSync(p, 'utf8')); } catch { /* corrupt → treat as first */ }
+  const now = new Date().toISOString();
+  const marker = {
+    schema_version: 1,
+    session_id: sessionId,
+    // Preserve the original transcript/cwd across re-attempts (a reprocess may
+    // pass different values; the FIRST capture is the source of truth).
+    transcript_path: prior?.transcript_path || transcriptPath || null,
+    cwd: prior?.cwd || cwd || null,
+    failure_type: failureType || 'unknown',
+    first_failed_at: prior?.first_failed_at || now,
+    last_failed_at: now,
+    attempts: (prior?.attempts || 0) + 1,
+  };
+  atomicWrite(p, JSON.stringify(marker, null, 2) + '\n');
+  return marker;
+}
+
+function clearFailedMarker(sessionId) {
+  const p = failedMarkerPath(sessionId);
+  try { if (existsSync(p)) rmSync(p); } catch { /* best-effort; a stale marker self-heals on the next drain */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -2904,12 +3451,21 @@ async function main() {
     log('Phase 2a: skipped — cwd is the runner\'s environment, not this session\'s');
   }
 
+  // Reprocess mode: stamp backfilled suppressions with the session's ORIGINAL
+  // date so they land in their historical recall-canary window, not now()'s
+  // (act:6fb2b7d1). Set before any suppressing phase runs.
+  if (args.reprocess) {
+    reprocessTs = sessionStartFromTranscript(args.transcriptPath) || null;
+    log(`Reprocess mode: suppression ledger stamped ${reprocessTs || '(no session date — using now())'}`);
+  }
+
   // --- Preprocessing ---
   const { compressed, originalTokenEstimate, compressedTokenEstimate } = preprocessTranscript(args.transcriptPath);
 
   if (!compressed || compressed.trim().length === 0) {
     log('Empty transcript after preprocessing, exiting');
     markProcessed(args.sessionId, { empty: true, worktreeItemsFiled });
+    clearFailedMarker(args.sessionId); // an empty session captured all there was — no API needed
     writeHealth(args.sessionId, { itemsFiled: worktreeItemsFiled, actionsClosed: 0 }, project);
     process.exit(0);
   }
@@ -2943,7 +3499,7 @@ async function main() {
     log('Phase 2b2: skipped — unresolved identity; no thread key minted from a transcript-slug name');
   } else {
     try {
-      threadIds = await threadCapture(compressed, project.slug, args.sessionId, summary, args.transcriptPath);
+      threadIds = await threadCapture(compressed, project.slug, args.sessionId, summary, args.transcriptPath, { project });
       stats.threadsUpdated = threadIds.length;
     } catch (e) {
       logError(`Phase 2b2 failed: ${e.message}`);
@@ -3129,11 +3685,130 @@ async function main() {
     logError(`Phase 2l failed: ${e.message}`);
   }
 
-  // Step 4: Mark processed (prevent re-processing)
-  markProcessed(args.sessionId, stats);
+  // Step 4: Mark processed — but ONLY if capture actually happened. A systemic
+  // API outage (or every API-dependent phase throwing) means this session
+  // captured nothing; marking it processed would lose it permanently with no
+  // re-run (nothing scans transcripts). Instead leave it UNMARKED and drop a
+  // durable recovery marker — the `--reprocess-failed` worklist (act:6fb2b7d1).
+  const allApiFailed = apiCallsAttempted > 0 && apiCallsFailed === apiCallsAttempted;
+  const captureFailed = !!systemicApiFailure || allApiFailed;
+  if (captureFailed) {
+    const failureType = systemicApiFailure?.type || 'all-api-phases-failed';
+    writeFailedMarker(args.sessionId, {
+      transcriptPath: args.transcriptPath,
+      cwd: runnerCwd,
+      failureType,
+    });
+    logError(`Ring 3 CAPTURE FAILED for ${args.sessionId} (${failureType}, ${apiCallsFailed}/${apiCallsAttempted} API calls failed) — NOT marked processed; recovery marker written. Recover with: watchtower-ring3-close.mjs --reprocess-failed`);
+    process.exitCode = 3; // distinct signal for the --reprocess-failed parent; harmless in the live SessionEnd path
+  } else {
+    markProcessed(args.sessionId, stats);
+    clearFailedMarker(args.sessionId); // a successful (re)process clears any prior failure
+  }
 
   const duration = Date.now() - startTime;
   log(`Ring 3 close complete in ${duration}ms. Actions closed: ${stats.actionsClosed}, items filed: ${stats.itemsFiled}, memory written: ${stats.memoryWritten}, threads updated: ${stats.threadsUpdated || 0}${systemicApiFailure ? ` — DEGRADED (${systemicApiFailure.type})` : ''}`);
+}
+
+// ---------------------------------------------------------------------------
+// Reprocess drain — recover sessions the outage failed (act:6fb2b7d1)
+// PARENT mode (`--reprocess-failed`). Spawns ONE fresh `--reprocess`
+// subprocess per failed marker. An in-process loop is impossible: main() calls
+// process.exit, and the systemicApiFailure latch is one-per-process (a shared
+// process would let one session's failure poison the next). Never calls main().
+// ---------------------------------------------------------------------------
+
+const REPROCESS_BATCH = 10;        // markers per drain run (bounded)
+const REPROCESS_MAX_ATTEMPTS = 5;  // stop auto-retrying after this; leave for manual review
+
+// Count API-usage ledger records via the feature-detection namespace seam, so
+// a not-yet-merged export can't break module load. Gives the write-only usage
+// ledger its first reader — the drain reports its own spend (critic risk 5).
+function countApiUsage() {
+  try {
+    const fn = watchtowerLib.readApiUsageRecords;
+    if (typeof fn !== 'function') return null;
+    const recs = fn({ watchtowerDir: WATCHTOWER_DIR });
+    return Array.isArray(recs) ? recs.length : null;
+  } catch { return null; }
+}
+
+function reprocessHealthDegraded() {
+  // Don't spend on a down API: if the most recent Ring 3 health is degraded,
+  // the API is currently failing and a reprocess would only burn failed calls.
+  try {
+    const p = join(WATCHTOWER_DIR, 'state', 'ring3-health.json');
+    if (!existsSync(p)) return false;
+    return JSON.parse(readFileSync(p, 'utf8'))?.status === 'degraded';
+  } catch { return false; }
+}
+
+async function reprocessFailed() {
+  const failedDir = join(WATCHTOWER_DIR, 'ring3', 'failed');
+  if (!existsSync(failedDir)) { log('No ring3/failed/ dir — nothing to reprocess.'); return; }
+
+  // Lightweight PID lock (a future auto-trigger could fire concurrently).
+  const lockPath = join(WATCHTOWER_DIR, 'ring3', 'reprocess.lock');
+  let holdingLock = false;
+  try {
+    if (existsSync(lockPath)) {
+      const owner = parseInt(String(readFileSync(lockPath, 'utf8')).trim(), 10);
+      let alive = false;
+      try { if (owner) { process.kill(owner, 0); alive = true; } } catch { alive = false; }
+      if (alive) { log(`Reprocess drain already running (pid ${owner}) — skipping.`); return; }
+    }
+    writeFileSync(lockPath, String(process.pid));
+    holdingLock = true;
+  } catch (e) { logError(`Reprocess lock error: ${e.message} — proceeding without lock`); }
+
+  try {
+    if (reprocessHealthDegraded()) {
+      logError('Ring 3 health is DEGRADED (API currently failing) — skipping reprocess drain to avoid burning failed calls. Re-run when the API recovers.');
+      return;
+    }
+
+    let markers = [];
+    try { markers = readdirSync(failedDir).filter(f => f.endsWith('.json')); } catch { markers = []; }
+    if (markers.length === 0) { log('No failed sessions to reprocess.'); return; }
+
+    const selfPath = fileURLToPath(import.meta.url); // this script, however it was invoked (robust under a test runner)
+    const usageBefore = countApiUsage();
+    let recovered = 0, stillFailing = 0, alreadyDone = 0, atMax = 0, spawnErrors = 0;
+    const batch = markers.slice(0, REPROCESS_BATCH);
+    log(`Reprocessing ${batch.length} of ${markers.length} failed session(s)...`);
+
+    for (const file of batch) {
+      const sid = file.replace(/\.json$/, '');
+      let marker;
+      try { marker = JSON.parse(readFileSync(join(failedDir, file), 'utf8')); }
+      catch { logError(`Marker ${file} unreadable — skipping.`); continue; }
+
+      if (isProcessed(sid)) { clearFailedMarker(sid); alreadyDone++; continue; } // recovered elsewhere → self-heal
+      if ((marker.attempts || 0) >= REPROCESS_MAX_ATTEMPTS) {
+        logError(`Session ${sid} failed ${marker.attempts}x — leaving for manual review (not auto-retried).`);
+        atMax++; continue;
+      }
+      if (!marker.transcript_path || !existsSync(marker.transcript_path)) {
+        logError(`Session ${sid}: transcript missing (${marker.transcript_path || 'none'}) — cannot reprocess; leaving marker.`);
+        stillFailing++; continue;
+      }
+
+      const childArgs = [selfPath, '--session-id', sid, '--transcript', marker.transcript_path, '--reprocess'];
+      if (marker.cwd) childArgs.push('--cwd', marker.cwd);
+      const res = spawnSync(process.execPath, childArgs, { stdio: 'inherit' });
+      if (res.error) { logError(`Session ${sid}: spawn failed (${res.error.message})`); spawnErrors++; continue; }
+      if (res.status === 0) recovered++;            // child marked processed + cleared its marker
+      else if (res.status === 3) stillFailing++;    // child bumped attempts + kept the marker
+      else { logError(`Session ${sid}: reprocess exited ${res.status}`); spawnErrors++; }
+    }
+
+    const usageAfter = countApiUsage();
+    const callDelta = (usageBefore != null && usageAfter != null) ? (usageAfter - usageBefore) : null;
+    const remaining = markers.length - batch.length;
+    log(`Reprocess drain done: ${recovered} recovered, ${stillFailing} still failing, ${alreadyDone} already-processed, ${atMax} at max attempts, ${spawnErrors} spawn error(s). API calls spent this drain: ${callDelta != null ? callDelta : 'unknown'}.${remaining > 0 ? ` ${remaining} marker(s) remaining — re-run to continue.` : ''}`);
+  } finally {
+    if (holdingLock) { try { if (existsSync(lockPath)) rmSync(lockPath); } catch { /* best-effort */ } }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3154,8 +3829,10 @@ const isMain = (() => {
 })();
 
 if (isMain) {
-  main().catch(e => {
-    logError(`Fatal: ${e.message}`);
+  const routed = parseArgs();
+  const runner = routed.reprocessFailed ? reprocessFailed() : main();
+  runner.catch(e => {
+    logError(`Fatal${routed.reprocessFailed ? ' (reprocess)' : ''}: ${e.message}`);
     process.exit(1);
   });
 }
@@ -3168,6 +3845,14 @@ export {
   isDuplicate,
   parseMemoryTitles,
   selectNearbyMemoryTitles,
+  loadMemoryTitles,
+  // Dedup-hole fix (act:421a8ab2, N5 of grp:retro-remeaning)
+  extractMemoryFileTitle,
+  loadRegionPointerTitles,
+  // Reach 1 (act:5182beda, N3 of grp:retro-remeaning)
+  selectNearbyPendingItems,
+  relationKey,
+  fileRelationProposal,
   modelRescues,
   chunkWithOverlap,
   mergeChunkExtractions,
@@ -3194,4 +3879,9 @@ export {
   // these two are exported for the null-path guard tests.
   workItemClosure,
   methodologyCapture,
+  // Outage-robustness recovery (act:6fb2b7d1)
+  failedMarkerPath,
+  writeFailedMarker,
+  clearFailedMarker,
+  reprocessFailed,
 };

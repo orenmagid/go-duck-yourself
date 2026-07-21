@@ -30,7 +30,7 @@ import { execSync, execFileSync } from 'child_process';
 import { homedir } from 'os';
 import {
   atomicWrite, loadConfig, slugify, log as _log, logError as _logError,
-  getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
+  getWatchtowerDir, createItem, listPending, getItem, loadBetterSqlite3,
   writeProjectStatePreservingRing3, flushFeedbackOutbox, resolveCcSourceRepo,
   authoredClaudeDirs, claudeChurnIsDisposable, checkMemoryReachability,
   autoReconcileItem,
@@ -873,6 +873,100 @@ function autoReconcileCompletionReviews({ items, config, openDb }) {
     }
   }
 
+  return summary;
+}
+
+// ---------------------------------------------------------------------------
+// Pending-relation reconciliation (act:5182beda, N3/Reach 1 of grp:retro-remeaning)
+// ---------------------------------------------------------------------------
+//
+// A 'pending-relation' item proposes that TWO still-pending inbox items relate
+// (pairs_with / answers / contradicts) — new understanding reaching back to
+// recolor what's still in the inbox, at the earliest and safest reach (nothing
+// cited is believed yet). The retraction condition is purely queue-internal —
+// no project/pib-db lookup needed, unlike completion-review's — so this is a
+// simple two-id pending-check, not a per-project pass.
+//
+// Fail toward KEEPING (Detector Symmetry discipline): a cited id that no
+// longer resolves via getItem (deleted/migrated) is ambiguous, not evidence
+// the relation resolved, so it is kept, not retracted. Retraction requires a
+// POSITIVELY non-pending status on an item that still exists.
+function autoReconcilePendingRelations(items, { getItemFn = getItem } = {}) {
+  const summary = { retracted: 0, kept: 0 };
+  for (const item of items || []) {
+    const fromId = item.evidence?.from_id;
+    const toId = item.evidence?.to_id;
+    if (typeof fromId !== 'string' || typeof toId !== 'string') {
+      summary.kept++;
+      continue;
+    }
+    let fromItem;
+    let toItem;
+    try {
+      fromItem = getItemFn(fromId);
+      toItem = getItemFn(toId);
+    } catch (e) {
+      logError(`pending-relation reconciler: lookup failed for ${item.id}: ${e.message} — keeping`);
+      summary.kept++;
+      continue;
+    }
+    const fromLeftPending = !!fromItem && fromItem.status !== 'pending';
+    const toLeftPending = !!toItem && toItem.status !== 'pending';
+    if (!fromLeftPending && !toLeftPending) {
+      summary.kept++;
+      continue;
+    }
+    const which = fromLeftPending && toLeftPending ? 'both sides'
+      : fromLeftPending ? 'the "from" item' : 'the "to" item';
+    const result = autoReconcileItem(item.id, {
+      resolution: 'auto-reconciled',
+      notes: `${which} left pending — a relation between two open questions no longer applies once one resolves `
+        + `(from_id status: ${fromItem?.status ?? 'unknown'}, to_id status: ${toItem?.status ?? 'unknown'})`,
+      evidence: { retraction_reason: which },
+    });
+    if (result) summary.retracted++;
+    else summary.kept++; // raced — a human resolved this relation-proposal first
+  }
+  return summary;
+}
+
+// ---------------------------------------------------------------------------
+// Significance-change reconciliation (act:bcb7edd4, Reach 2 of grp:retro-remeaning)
+// ---------------------------------------------------------------------------
+//
+// A 'significance-change' item proposes that a session's new understanding
+// recolors an EARLIER cursor entry of a thread it touched. The one mechanical
+// retraction condition: the cited thread file is POSITIVELY gone from
+// state/threads/ — a recolor of deleted history is moot. Cursor history is
+// append-only, so the cited entry cannot vanish while the thread survives;
+// thread-file absence is the whole condition.
+//
+// Fail toward KEEPING (Detector Symmetry): retraction requires the threads
+// dir to be READABLE and the file verifiably absent — any read error keeps.
+function autoReconcileSignificanceItems(items, { threadsDir } = {}) {
+  const summary = { retracted: 0, kept: 0 };
+  const dir = threadsDir || join(WATCHTOWER_DIR, 'state', 'threads');
+  let dirListing = null;
+  try {
+    dirListing = new Set(readdirSync(dir));
+  } catch {
+    // Unreadable/missing threads dir is ambiguous (a mount hiccup must not
+    // mass-retract) — keep everything this tick.
+    summary.kept = (items || []).length;
+    return summary;
+  }
+  for (const item of items || []) {
+    const thread = item.evidence?.thread;
+    if (typeof thread !== 'string' || !thread) { summary.kept++; continue; }
+    if (dirListing.has(`${thread}.json`)) { summary.kept++; continue; }
+    const result = autoReconcileItem(item.id, {
+      resolution: 'auto-reconciled',
+      notes: `cited thread "${thread}" no longer exists in state/threads/ — a recolor proposal about deleted history is moot`,
+      evidence: { retraction_reason: 'thread-gone' },
+    });
+    if (result) summary.retracted++;
+    else summary.kept++; // raced — a human dispositioned it first
+  }
   return summary;
 }
 
@@ -1802,6 +1896,30 @@ function main() {
       logError(`completion-review reconciliation failed: ${e.message}`);
     }
 
+    // Pending-relation reconciliation — one global pass per tick (queue-
+    // internal, no per-project db access needed; act:5182beda).
+    try {
+      const pendingRelations = listPending({ category: 'pending-relation' });
+      const relRec = autoReconcilePendingRelations(pendingRelations);
+      if (relRec.retracted > 0) {
+        log(`pending-relation reconciler: ${relRec.retracted} retracted, ${relRec.kept} kept`);
+      }
+    } catch (e) {
+      logError(`pending-relation reconciliation failed: ${e.message}`);
+    }
+
+    // Significance-change reconciliation — one global pass per tick, fs-only
+    // (checks the cited thread file still exists; act:bcb7edd4).
+    try {
+      const pendingSignificance = listPending({ category: 'significance-change' });
+      const sigRec = autoReconcileSignificanceItems(pendingSignificance);
+      if (sigRec.retracted > 0) {
+        log(`significance-change reconciler: ${sigRec.retracted} retracted, ${sigRec.kept} kept`);
+      }
+    } catch (e) {
+      logError(`significance-change reconciliation failed: ${e.message}`);
+    }
+
     // Ensure output directories exist
     const stateDir = join(WATCHTOWER_DIR, 'state');
     const projectsDir = join(stateDir, 'projects');
@@ -1888,7 +2006,7 @@ function main() {
 // pure given an injectable `exec` — the inline call sites bind safeExec to a
 // cwd; the tests bind a runner against a temp git repo (act:6f36cbe2,
 // act:a136b362).
-export { resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState, branchExclusionMatcher, DEFAULT_LONG_LIVED_BRANCHES, createBranchDivergedItem, autoResolveBranchDivergedItems, autoResolveWorktreeItems, autoReconcileCompletionReviews, fileOrphanedWorktreeItem, isSafeRefName };
+export { resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState, branchExclusionMatcher, DEFAULT_LONG_LIVED_BRANCHES, createBranchDivergedItem, autoResolveBranchDivergedItems, autoResolveWorktreeItems, autoReconcileCompletionReviews, autoReconcilePendingRelations, autoReconcileSignificanceItems, fileOrphanedWorktreeItem, isSafeRefName };
 
 // Entry guard so tests (and other modules) can import this file's pure
 // helpers without executing main(). realpathSync matters: node
