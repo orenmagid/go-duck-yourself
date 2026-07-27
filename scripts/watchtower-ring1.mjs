@@ -1645,6 +1645,72 @@ function readRecallCanary() {
   } catch { return {}; }
 }
 
+// readRosterMetrics — the Ring 2 cabinet-roster measurement sidecar
+// (act:ea23b3a5). Same shape of relationship as the recall canary: the
+// measurement is Ring 2's, the render is Ring 1's, because Ring 1 owns the
+// per-project state file. Absent or corrupt yields {} — a project with no
+// entry renders nothing at all.
+function readRosterMetrics() {
+  const path = join(WATCHTOWER_DIR, 'state', 'roster-review.json');
+  if (!existsSync(path)) return {};
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')).metrics || {};
+  } catch { return {}; }
+}
+
+// Cap on skill names listed inline, matching FLAGGED_RENDER_CAP's discipline:
+// the COUNT is always true, only the enumeration is bounded.
+export const ROSTER_NAME_RENDER_CAP = 4;
+
+// renderRosterEntries — the ambient Standing Issues lines for a project's
+// roster measurement. Returns [] when there is nothing worth a line.
+//
+// RENDERS ON CHANGE ONLY. An unchanging number in a file the operator reads at
+// every briefing is furniture by the third read — the recall canary set this
+// precedent by rendering only on alert. The count still lives in
+// state/roster-review.json for anyone who goes looking; what earns a line here
+// is movement. (First measurement counts as movement: `previous` is null.)
+//
+// Pure (no I/O) for hermetic testing.
+export function renderRosterEntries(metrics, cap = ROSTER_NAME_RENDER_CAP) {
+  const lines = [];
+  if (!metrics || typeof metrics !== 'object') return lines;
+  const asOf = String(metrics.measured_at || '').slice(0, 10);
+  const stamp = asOf ? ` (measured ${asOf})` : '';
+
+  const d = metrics.dormant;
+  if (d && (d.dead_count > 0 || d.stale_count > 0)) {
+    const prev = metrics.previous;
+    const changed = !prev
+      || prev.dead_count !== d.dead_count
+      || prev.stale_count !== d.stale_count;
+    if (changed) {
+      const names = (Array.isArray(d.dead) ? d.dead : []).slice(0, cap);
+      const more = (d.dead_count || 0) - names.length;
+      const nameList = names.length
+        ? ` — ${names.join(', ')}${more > 0 ? `, +${more} more` : ''}`
+        : '';
+      const wasNote = prev ? ` (was ${prev.dead_count})` : '';
+      lines.push(
+        `dormant skills: ${d.dead_count} never invoked${wasNote}, `
+        + `${d.stale_count} stale >${d.days || 30}d${nameList}${stamp}`
+      );
+    }
+  }
+
+  const briefings = metrics.stale_briefings;
+  if (Array.isArray(briefings) && briefings.length > 0) {
+    const oldest = briefings.reduce((a, b) =>
+      (b.ageDaysBehind || 0) > (a.ageDaysBehind || 0) ? b : a);
+    lines.push(
+      `stale cabinet briefings: ${briefings.length}, `
+      + `oldest ~${oldest.ageDaysBehind}d behind the project${stamp}`
+    );
+  }
+
+  return lines;
+}
+
 function assembleProjectState(ps) {
   const now = new Date().toISOString();
   const lines = [];
@@ -1727,6 +1793,10 @@ function assembleProjectState(ps) {
       `sample (over-suppression only; recall-canary.json / see /briefing)`
     );
   }
+  // Cabinet-roster measurements (act:ea23b3a5) — ambient state, not queue
+  // items: a count describes a condition, it doesn't ask the operator to
+  // decide anything. Rendered on CHANGE only; see renderRosterEntries.
+  for (const line of renderRosterEntries(ps.roster)) issues.push(line);
   if (ps.divergedBranches && ps.divergedBranches.length > 0) {
     issues.push(`Diverged branches: ${ps.divergedBranches.join(', ')}`);
   }
@@ -1815,6 +1885,9 @@ function main() {
     // Ring 2 slow writes the recall-canary sidecar; Ring 1 renders an alerting
     // project's entry into its Standing Issues (the canary's named reader).
     const recallCanaryProjects = readRecallCanary();
+    // Ring 2's weekly cabinet-roster measurement, rendered by Ring 1 (which
+    // owns the per-project state file) — the recall-canary relationship.
+    const rosterMetrics = readRosterMetrics();
 
     // Branch-diverged reconciliation inputs, resolved ONCE per tick: the
     // exclusion matcher (config-driven) and one pending-items snapshot —
@@ -1845,6 +1918,7 @@ function main() {
         ccFeedbackArrival: checkCcFeedbackArrival(projectPath),
         memoryIntegrity: checkMemoryIntegrity(projectPath),
         recall: recallCanaryProjects[name] || null,
+        roster: rosterMetrics[name] || null,
         divergedBranches: [],
         hookResults: [],
       };

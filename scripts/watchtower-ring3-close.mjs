@@ -994,14 +994,14 @@ Rules:
 // Phase 2c: Work item closure
 // ---------------------------------------------------------------------------
 
+// `sessionStartIso` is accepted for call-site compatibility and is no longer
+// read: act:9eebbac4's create-vs-complete day-window filter — the only consumer
+// of the session's own date — was deleted in act:ea23b3a5 after measurement
+// showed it suppressed the highest-precision cohort and exempted the lowest.
+// See the calibration note on completionReviewEmitGuard.
 async function workItemClosure(compressed, project, threadIds = [], sessionStartIso = null) {
   const projectPath = project.path;
   log('Phase 2c: Work item closure');
-  // The transcript's own day — the create-vs-complete filter compares the
-  // action row's `created` date against the SESSION's date, so a reprocess
-  // of an old transcript filters against that day, never today.
-  const sessionDate = typeof sessionStartIso === 'string' && sessionStartIso
-    ? sessionStartIso.slice(0, 10) : null;
 
   // No resolved project directory (unresolved identity) — there is no
   // right pib.db to evaluate against; evaluating the RUNNER's would close
@@ -1058,10 +1058,16 @@ async function workItemClosure(compressed, project, threadIds = [], sessionStart
 
 An action that was merely CREATED during this session is NOT completed — creating or filing a work item is not doing it. Use "none" for actions whose only appearance is their own creation, unless the transcript also shows the work itself being done.
 
-Output JSON array: [{"fid":"act:XXXXXXXX","confidence":"high|medium|low|none","evidence":"brief reason"}]
+Also return "quote": a VERBATIM span copied from the session transcript that states this work is finished. Copy it exactly — do not paraphrase, summarize, or reconstruct it. Quote from the transcript itself, not from the list of open actions above. If no such span exists, return "" — an empty quote is a valid and useful answer, and inventing one is worse than none.
+
+Output JSON array: [{"fid":"act:XXXXXXXX","confidence":"high|medium|low|none","evidence":"brief reason","quote":"verbatim span or empty string"}]
 Output ONLY the JSON array, no other text.`;
 
-  const userMessage = `Open actions:\n${actionList}\n\nSession transcript:\n${recentSlice(compressed, COMPLETION_TRANSCRIPT_BUDGET)}`;
+  // The SAME slice is the model's haystack and the quote checker's — captured
+  // once so the two can never drift apart (a quote can only be verified against
+  // the text the model was actually shown).
+  const transcriptSlice = recentSlice(compressed, COMPLETION_TRANSCRIPT_BUDGET);
+  const userMessage = `Open actions:\n${actionList}\n\nSession transcript:\n${transcriptSlice}`;
 
   let evaluations = [];
   try {
@@ -1082,16 +1088,12 @@ Output ONLY the JSON array, no other text.`;
 
   // Emit guards (act:ec508dbe): one prepared status re-check statement,
   // reused across evaluations, and a per-fid dedup corpus built once from
-  // pending ∪ recently-closed completion-review items. Both setups FAIL OPEN
+  // pending ∪ recently-terminal completion-review items. Both setups FAIL OPEN
   // (distinct logError, empty guard) — never wholesale suppression.
-  // The SELECT also carries `created` for the create-vs-complete filter
-  // (act:9eebbac4): the mechanical "was this action born this session?"
-  // fact — the compressed transcript strips tool_result bodies, so a
-  // transcript scan cannot reliably see creations; the db row can.
   let statusStmt = null;
   try {
     statusStmt = db.prepare(
-      'SELECT status, created FROM actions WHERE fid = ? AND deleted_at IS NULL');
+      'SELECT status FROM actions WHERE fid = ? AND deleted_at IS NULL');
   } catch (e) {
     logError(`Phase 2c: could not prepare emit-time status re-check (${e.message}) — failing open`);
   }
@@ -1104,7 +1106,14 @@ Output ONLY the JSON array, no other text.`;
       ...listItems({
         project: project.name,
         category: 'completion-review',
-        statuses: ['resolved', 'dismissed'],
+        // `expired` and `superseded` are load-bearing since act:ea23b3a5 gave
+        // this category a 14d expiry EQUAL to COMPLETION_REVIEW_DEDUP_DAYS:
+        // without them a fid leaves every corpus at exactly the moment its
+        // item expires, and the next session refiles it — forever. That is
+        // Detector Symmetry §2's named failure ("dedup consults only pending
+        // items, so an excluded state that files at all refiles after every
+        // dismissal").
+        statuses: ['resolved', 'dismissed', 'expired', 'superseded'],
         since,
       }),
     ];
@@ -1112,13 +1121,20 @@ Output ONLY the JSON array, no other text.`;
     logError(`Phase 2c: could not load existing completion-review items (${e.message}) — failing open`);
   }
 
+  // Quote instrumentation (act:ea23b3a5) — counted for EVERY evaluation,
+  // including suppressed ones, because "would a gate have been safe?" is a
+  // question about the items we stop filing as much as the ones we file.
+  const quoteTally = { found: 0, 'not-found': 0, 'absent-or-too-short': 0, 'no-decodable-transcript': 0 };
+
   for (const evalItem of evaluations) {
     if (!evalItem.fid || evalItem.confidence === 'none') continue;
+
+    const quoteCheck = verifyCompletionQuote(evalItem.quote, transcriptSlice);
+    quoteTally[quoteCheck.reason] = (quoteTally[quoteCheck.reason] || 0) + 1;
 
     const guard = completionReviewEmitGuard(evalItem.fid, {
       statusStmt,
       existingItems: existingCompletionItems,
-      sessionDate,
       confidence: evalItem.confidence,
     });
     if (!guard.emit) {
@@ -1147,6 +1163,11 @@ Output ONLY the JSON array, no other text.`;
           fid: evalItem.fid,
           confidence: evalItem.confidence,
           reason: evalItem.evidence,
+          // Recorded, never acted on (act:ea23b3a5) — the corpus a future
+          // round needs to judge whether a real evidence gate is buildable.
+          quote: typeof evalItem.quote === 'string' ? evalItem.quote : null,
+          quote_verified: quoteCheck.verified,
+          quote_check: quoteCheck.reason,
           closed_by: 'ring3-close',
         },
         options: [
@@ -1164,6 +1185,10 @@ Output ONLY the JSON array, no other text.`;
 
   db.close();
   log(`Phase 2c: ${queued} completion candidates queued for review${skipped ? ` (${skipped} skipped by emit guards)` : ''}`);
+  // Positive confirmation, not silence: a run with no verified quotes must be
+  // distinguishable from a run where the instrumentation never fired.
+  log(`Phase 2c: quote check (instrumentation only, gates nothing) — `
+    + Object.entries(quoteTally).map(([k, n]) => `${k}=${n}`).join(', '));
   return { closed: 0, queued };
 }
 
@@ -1676,37 +1701,25 @@ function buildExtractionCorpora(project, { phase } = {}) {
 //      item emits anyway — a DB hiccup degrades to today's behavior, never to
 //      silent wholesale suppression. The try/catch is the guard's own so a
 //      throw can't abort the remaining evaluations.
-//   1b. Create-vs-complete filter (act:9eebbac4): skip when the action's db
-//      `created` date falls inside this session's DAY window (the session's
-//      start day, +1 for past-midnight spill — `created` is day-granular by
-//      schema) AND the model's confidence is below 'high' — an action born
-//      this session whose only
-//      evidence is its own creation is not a completion candidate (12 of 66
-//      live items were this). The conjunct keeps the legitimate
-//      create-then-complete flow: high confidence means the transcript shows
-//      the work itself done, and that still emits. Mechanical fact (db row,
-//      same prepared statement as the status re-check — the compressed
-//      transcript strips tool results and cannot show creations), model
-//      hallucination-proof, and FAIL-OPEN in every gap: no sessionDate, no
-//      created column, or a thrown lookup all emit.
-//   2. Per-fid dedup: skip when an existing completion-review item for the
-//      same fid is in `existingItems` (the caller builds that set from
-//      pending ∪ resolved/dismissed-within-COMPLETION_REVIEW_DEDUP_DAYS).
+//   2. Confidence inversion (act:ea23b3a5): skip when the model rated this fid
+//      'high'. The full calibration note sits on the check itself. This is the
+//      ONE fail-closed arm in the guard, and it REPLACED act:9eebbac4's
+//      create-vs-complete day-window filter, which encoded the opposite theory
+//      and measured net-negative.
+//   3. Per-fid dedup: skip when an existing completion-review item for the
+//      same fid is in `existingItems` (the caller builds that set from pending
+//      ∪ resolved/dismissed/expired/superseded within
+//      COMPLETION_REVIEW_DEDUP_DAYS — `expired` and `superseded` are
+//      load-bearing since the category's expiry became 14d, equal to the dedup
+//      window: without them an item drops out of every corpus at exactly the
+//      moment it expires and refiles forever).
 //
-// `sessionDate` is the transcript's own day (YYYY-MM-DD) — at reprocess the
-// SESSION's date, never today's. `confidence` is the model's for this fid.
-// New params are optional: callers/tests using the original shape are
-// untouched (both checks self-skip).
+// `confidence` is the model's rating for this fid. Every param is optional and
+// each check self-skips, so callers/tests using the original shape are
+// untouched.
 //
 // Returns { emit: true } or { emit: false, reason }.
-function dayAfter(dateStr) {
-  const t = Date.parse(`${dateStr}T00:00:00Z`);
-  return Number.isFinite(t)
-    ? new Date(t + 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
-    : null;
-}
-
-function completionReviewEmitGuard(fid, { statusStmt, existingItems = [], sessionDate = null, confidence = null } = {}) {
+function completionReviewEmitGuard(fid, { statusStmt, existingItems = [], confidence = null } = {}) {
   if (statusStmt) {
     try {
       const row = statusStmt.get(fid);
@@ -1714,31 +1727,35 @@ function completionReviewEmitGuard(fid, { statusStmt, existingItems = [], sessio
       if (status !== 'open' && status !== 'in-progress') {
         return { emit: false, reason: `status now '${status ?? 'gone'}'` };
       }
-      const created = row ? row.created : null;
-      // Day window [sessionDate, sessionDate+1]: pib-db `created` is
-      // day-granular (schema CHECK), so "born this session" is really "born
-      // on the session's day" (+1 covers a past-midnight spill). The upper
-      // bound matters at reprocess: an action created in a LATER session
-      // must not be suppressed by an old transcript's re-run. A sibling
-      // same-day session's creations do fall in the window — the below-high
-      // conjunct is the designed escape (real completion evidence emits).
-      // windowEnd is a REQUIRED conjunct: an unparseable-but-truthy
-      // sessionDate must self-skip the filter (fail OPEN), not silently drop
-      // the upper bound and lexically suppress everything below it.
-      const windowEnd = sessionDate ? dayAfter(sessionDate) : null;
-      if (sessionDate && windowEnd && created
-          && String(confidence).toLowerCase() !== 'high'
-          && String(created) >= sessionDate
-          && String(created) <= windowEnd) {
-        return {
-          emit: false,
-          reason: `created ${created}, within this session's day window (${sessionDate}/+1) — creation is not completion`,
-        };
-      }
     } catch (e) {
       // FAIL-OPEN: emit despite the failed re-check.
       logError(`Phase 2c: emit-time status re-check threw for ${fid} (${e.message}) — failing open, item will emit`);
     }
+  }
+  // CONFIDENCE IS ANTI-PREDICTIVE HERE — measured, not assumed (act:ea23b3a5,
+  // 2026-07-26, over all 223 items this category had ever filed, each joined
+  // against the cited action's OWN project db):
+  //
+  //     high        12 acted-on / 28 dismissed-noise    30% precision
+  //     medium+low  48 acted-on / 32 dismissed-noise    60% precision
+  //
+  // The model rates 'high' when a session TALKS about an action — files it,
+  // plans it, discusses it — not when it quietly finishes one. act:9eebbac4's
+  // create-vs-complete filter encoded the opposite theory (it exempted 'high'
+  // from the born-this-session skip), so it suppressed the BEST cohort
+  // (same-day creation + medium/low: 74% precision, 20 acted-on / 7 noise)
+  // while passing the worst (same-day + high: 33%). Split at that filter's
+  // 2026-07-12 ship date, the category went 0-for-23 — zero acted-on, 19
+  // dismissed as noise. The filter is deleted; this replaces it.
+  //
+  // CALIBRATION FENCE: this holds for the Phase 2c confidence rubric AS
+  // WRITTEN. Rewording that rubric changes what 'high' means and invalidates
+  // the measurement — re-run it before touching the prompt's confidence text.
+  if (String(confidence).toLowerCase() === 'high') {
+    return {
+      emit: false,
+      reason: "confidence 'high' is anti-predictive for completion (30% vs 60%) — see the calibration note",
+    };
   }
   const existing = existingItems.find(
     i => i.plan_fid === fid || i.evidence?.fid === fid);
@@ -1749,6 +1766,78 @@ function completionReviewEmitGuard(fid, { statusStmt, existingItems = [], sessio
     };
   }
   return { emit: true };
+}
+
+// ---------------------------------------------------------------------------
+// Completion-quote verification — INSTRUMENTATION ONLY (act:ea23b3a5)
+// ---------------------------------------------------------------------------
+//
+// Does the model's claimed completion span actually appear in the transcript it
+// was shown? This records an answer; it deliberately does NOT gate emission,
+// for two reasons worth keeping written down.
+//
+// (1) The haystack is not prose. `preprocessTranscript` ends with
+//     `kept.map(e => JSON.stringify(e)).join('\n')`, so a real newline inside a
+//     message is the two characters `\` + `n`, and a quote character is `\"`. A
+//     substring test against those bytes REJECTS ordinary multi-line prose —
+//     the shape most genuine completion statements take — while reliably
+//     ACCEPTING serialized tool arguments: every TodoWrite call leaves
+//     `{"todos":[{"content":"…","status":"completed"` in the haystack,
+//     pre-escaped and quotable verbatim. So the matcher decodes first, and
+//     `decodeTranscriptText` drops tool_use `input_summary` blobs on purpose.
+// (2) Even decoded, containment proves the SPAN EXISTS — never that the span
+//     means the work is done. The 2026-07-26 corpus contains a dismissal whose
+//     own reason quotes "act:a587b30f — filed (…)": a verbatim quote of a
+//     FILING. A gate built on this would launder that into evidence.
+//
+// So: measure first (the discipline act:de4a7020 stalled on and this program
+// finally ran). The stamped `evidence.quote_verified` plus the per-session
+// counts are the data a future round needs to decide whether a real gate —
+// semantic, not lexical — is worth building.
+
+const COMPLETION_QUOTE_MIN_CHARS = 20;
+
+function normalizeQuoteText(s) {
+  return typeof s === 'string' ? s.replace(/\s+/g, ' ').trim().toLowerCase() : '';
+}
+
+// decodeTranscriptText — recover human-readable text from a preprocessTranscript
+// haystack. Each line is one JSON message whose `content` is a string or an
+// array of blocks; only plain strings and `text` blocks count. Tool-use
+// summaries are EXCLUDED by design (see note 1 above). An unparseable line is
+// skipped, never raw-matched — matching the raw line would reintroduce the
+// escaped-bytes problem this function exists to remove.
+export function decodeTranscriptText(jsonl) {
+  if (typeof jsonl !== 'string' || !jsonl) return '';
+  const out = [];
+  for (const line of jsonl.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry;
+    try { entry = JSON.parse(trimmed); } catch { continue; }
+    const content = entry && entry.content;
+    if (typeof content === 'string') { out.push(content); continue; }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (typeof block === 'string') out.push(block);
+      else if (block && block.type === 'text' && typeof block.text === 'string') out.push(block.text);
+    }
+  }
+  return out.join('\n');
+}
+
+// Returns { verified: boolean, reason: 'found' | 'not-found' | 'absent-or-too-short'
+// | 'no-decodable-transcript' }. Never throws; never affects `emit`.
+export function verifyCompletionQuote(quote, transcriptJsonl) {
+  const needle = normalizeQuoteText(quote);
+  if (needle.length < COMPLETION_QUOTE_MIN_CHARS) {
+    return { verified: false, reason: 'absent-or-too-short' };
+  }
+  const haystack = normalizeQuoteText(decodeTranscriptText(transcriptJsonl));
+  if (!haystack) return { verified: false, reason: 'no-decodable-transcript' };
+  return haystack.includes(needle)
+    ? { verified: true, reason: 'found' }
+    : { verified: false, reason: 'not-found' };
 }
 
 // ---------------------------------------------------------------------------
@@ -1795,10 +1884,13 @@ async function decisionExtraction(compressed, project, sessionId, transcriptPath
 - "pib-db-trigger" = a deferred action with a trigger condition
 - "upstream-feedback" = friction with Claude Code itself
 - "derivation" = the fact is DERIVABLE (see DERIVABLE below) — its home is the recomputation itself, not a written record
+- "session-record" = the fact is PERISHABLE (see PERISHABLE below) — its only durable home is the record of the session that observed it, never memory
 
 Only extract items that represent NEW knowledge — things learned or decided in this session that aren't yet captured. Skip items that are routine, obvious, or just restating existing conventions.
 
 DERIVABLE: a fact is derivable when it can be recomputed on demand from a live source rather than remembered — a memory of a derivable fact is a stale cache that goes wrong the moment reality moves on. Examples: "prod is at commit 35a5d15" (recompute: check the deploy log or git log on the remote), "the census run already executed" (recompute: check the run log or the action's status in pib-db), "invoice #1's boundary is 95.25h through July 12" (recompute: re-run the timelog query). When an item is derivable, set "derivable": true and "derivation" to a short instruction for HOW to recompute it (a command, a query, a file to check), and set "home" to "derivation". NEVER omit a derivable item from the output — it is always included, just routed to its derivation instead of memory.
+
+PERISHABLE: a fact can be non-derivable and STILL not be durable — true at the moment of this session and destined to become false as work proceeds, with no live source to recompute it from. Examples: "phase 7 hasn't started yet" (false the day phase 7 starts), "usage this month is 42 runs" (a count that moves), "the fix is deployed but not yet verified" (a transition state). A perishable fact is a point-in-time snapshot, NOT a lesson or a durable decision — writing it to memory files a sentence that silently goes wrong. The durability test: would this sentence still be true a month from now if nobody touched anything? A durable lesson would; a snapshot would not. When an item is perishable, set "perishable": true and "perishes_when" to a short statement of WHAT event or time makes it false, and set "home" to "session-record". If a fact is BOTH recomputable and perishable (a deploy SHA is both), classify it DERIVABLE — the recomputation instruction is the better record. NEVER omit a perishable item from the output — it is always included, just routed to the session record instead of memory.
 
 SUBJECT: for every item, set "subject" to the actual project, tool, or system the knowledge is ABOUT. This is usually the same as the project you're working in, but flag it when it differs — a lesson about Claude Code itself learned while doing client work, or a lesson about a third-party API or service, belongs to THAT subject, not the filing project.
 
@@ -1815,7 +1907,7 @@ For each item, assess how time-sensitive routing is. Urgency means HOW FAST THE 
 
 Lessons and preferences are almost NEVER urgent, no matter how important they are — an important-but-durable item is "normal", not "urgent".
 
-Output JSON array: [{"type":"decision|constraint|lesson|preference|unclassifiable","home":"memory|claude-md|pib-db-trigger|upstream-feedback|derivation","urgency":"urgent|normal|low","title":"short title","content":"detailed description","covered_by":"exact already-saved title that covers this, or \\"none\\"","subject":"the actual project, tool, or system this is about","derivable":false,"derivation":null,"unclassifiable_reason":null,"relates_to":"exact pending title that this relates to, or \\"none\\"","relation":"pairs_with|answers|contradicts|none"}]
+Output JSON array: [{"type":"decision|constraint|lesson|preference|unclassifiable","home":"memory|claude-md|pib-db-trigger|upstream-feedback|derivation|session-record","urgency":"urgent|normal|low","title":"short title","content":"detailed description","covered_by":"exact already-saved title that covers this, or \\"none\\"","subject":"the actual project, tool, or system this is about","derivable":false,"derivation":null,"perishable":false,"perishes_when":null,"unclassifiable_reason":null,"relates_to":"exact pending title that this relates to, or \\"none\\"","relation":"pairs_with|answers|contradicts|none"}]
 Output ONLY the JSON array, no other text. If nothing found, output [].`;
 
   // M1b injection: show the model what's already saved so it self-filters dupes
@@ -1910,14 +2002,18 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
     }
 
     try {
-      // Three routing shapes (act:471dd701, N2 of grp:retro-remeaning):
+      // Four routing shapes (act:471dd701 N2 + act:a69c21f8 follow-up):
       // unclassifiable (model uncertainty made visible, never a forced
       // home guess), derivable (routed to its recomputation, never
-      // written to memory), and the four pre-existing homes.
+      // written to memory), perishable (a point-in-time snapshot routed
+      // to the session record, never written to memory; derivable WINS
+      // when both flags are set — the derivation is the better record),
+      // and the four pre-existing homes.
       const isUnclassifiable = item.type === 'unclassifiable';
       const isDerivable = item.derivable === true;
-      const home = isDerivable ? 'derivation' : item.home;
-      const isMemory = !isUnclassifiable && !isDerivable && home === 'memory';
+      const isPerishable = !isDerivable && item.perishable === true;
+      const home = isDerivable ? 'derivation' : isPerishable ? 'session-record' : item.home;
+      const isMemory = !isUnclassifiable && !isDerivable && !isPerishable && home === 'memory';
 
       let options;
       let draftArtifact = null;
@@ -1933,6 +2029,12 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
           { key: 'dismiss', label: 'Dismiss' },
         ];
         summary = item.derivation ? `${item.content}\n\nDerivation: ${item.derivation}` : item.content;
+      } else if (isPerishable) {
+        options = [
+          { key: 'acknowledge', label: 'Acknowledge — point-in-time snapshot, not durable' },
+          { key: 'dismiss', label: 'Dismiss' },
+        ];
+        summary = item.perishes_when ? `${item.content}\n\nPerishes: ${item.perishes_when}` : item.content;
       } else if (isMemory) {
         options = [
           { key: 'write', label: 'Write to memory' },
@@ -1962,6 +2064,7 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
           session_id: sessionId,
           ...(item.subject ? { subject: item.subject } : {}),
           ...(isDerivable ? { derivable: true, derivation: item.derivation } : {}),
+          ...(isPerishable ? { perishable: true, perishes_when: item.perishes_when } : {}),
           ...(isUnclassifiable ? { unclassifiable_reason: item.unclassifiable_reason } : {}),
         },
         options,
@@ -2008,6 +2111,22 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
 // Phase 2e: Audit pattern capture
 // ---------------------------------------------------------------------------
 
+// Exported so the hermetic suite can assert the exclusions survive edits
+// (act:09184ad7). Ring 2's shape gate (patternHasRequiredShape in
+// watchtower-ring2.mjs) enforces the Evidence/Gap half mechanically; the
+// three exclusions below are prompt-only — the 2026-07-26 consolidation
+// found all three classes filed as pattern promotions (no-gap positives,
+// truncated-transcript disclaimers, document echoes), and without the test
+// they are one refactor away from silently vanishing.
+export const QUALITY_PATTERN_SYSTEM_PROMPT = `You are analyzing a Claude Code session transcript for recurring quality patterns — issues, gaps, friction, or anti-patterns that surface during any kind of work (coding, debugging, planning, auditing, reviewing). Identify patterns worth learning from: things that keep going wrong, systematic gaps, workflow friction, or quality issues that a team member should watch for in future sessions.
+
+Only report PROBLEMATIC patterns:
+- Do NOT emit a section for behavior that was correct — a "no gap" observation is not a pattern.
+- Do NOT emit observations about the transcript artifact itself (truncated, compressed, or cut off mid-record); those describe the recording, not the work.
+- Do NOT reproduce document content the session merely read or wrote (status tables, wave ledgers, dependency graphs, checklists, setup recipes) as a pattern — a pattern is a recurring behavioral tendency, not a document excerpt.
+
+Output as markdown with ## headers for each pattern found. Include **Evidence:** (what you observed) and **Gap:** (what's missing or broken) for each — sections missing either block are discarded downstream. If no meaningful patterns, output "No recurring patterns detected."`;
+
 async function qualityPatternCapture(compressed, projectPath) {
   log('Phase 2e: Quality pattern capture');
 
@@ -2027,7 +2146,7 @@ async function qualityPatternCapture(compressed, projectPath) {
     }
   }
 
-  const systemPrompt = `You are analyzing a Claude Code session transcript for recurring quality patterns — issues, gaps, friction, or anti-patterns that surface during any kind of work (coding, debugging, planning, auditing, reviewing). Identify patterns worth learning from: things that keep going wrong, systematic gaps, workflow friction, or quality issues that a team member should watch for in future sessions. Output as markdown with ## headers for each pattern found. Include **Evidence:** (what you observed) and **Gap:** (what's missing or broken) for each. If no meaningful patterns, output "No recurring patterns detected."`;
+  const systemPrompt = QUALITY_PATTERN_SYSTEM_PROMPT;
 
   const userMessage = triageHistory
     ? `Session transcript:\n${recentSlice(compressed, 30000)}\n\nAudit triage history:\n${triageHistory.slice(0, 10000)}`
@@ -2130,19 +2249,47 @@ Output ONLY the JSON object.`,
 // Phase 2g: Upstream friction
 // ---------------------------------------------------------------------------
 
-async function upstreamFriction(compressed, project, threadIds = []) {
+// The closed vocabulary of actionable routes (act:ea23b3a5). A friction report
+// with no named party who could act on it is not a report, it is a mood: five
+// of the 2026-07-26 dismissals were observations like "Claude made iterative
+// browser tweaks without writing to file" — true, and addressed to nobody.
+//
+// This is Phase 2f's verification gate applied to a second lens. That gate
+// (act:3f3f9a31) files a methodology capture only when the claimed artifact
+// verifiably exists on disk, after 11 of 11 unverified captures were dismissed
+// over three weeks. Same shape here: file only when the finding names its route.
+export const FRICTION_ROUTES = ['cc-feedback', 'project-tracker', 'config-change'];
+
+export function frictionRouteIsActionable(route) {
+  return !!route
+    && FRICTION_ROUTES.includes(route.type)
+    && typeof route.detail === 'string'
+    && route.detail.trim().length > 0;
+}
+
+async function upstreamFriction(compressed, project, threadIds = [], { callFn = claudeCall } = {}) {
   const projectPath = project.path;
   log('Phase 2g: Upstream friction');
 
   const systemPrompt = `You are analyzing a Claude Code session transcript for friction with Claude Code itself (bugs, limitations, confusing behavior, missing features, workarounds). Only report genuine CC friction, not user errors or project-specific issues.
 
-If friction found, output JSON: [{"title":"short title","description":"what happened","severity":"high|medium|low"}]
+For each finding, decide what can actually be DONE about it, and route it:
+
+- "route": {"type":"cc-feedback","detail":"..."} — a fix belongs in the Claude Cabinet repo. detail names what would change there.
+- "route": {"type":"project-tracker","detail":"..."} — a fix belongs in THIS project. detail names the work.
+- "route": {"type":"config-change","detail":"..."} — a setting, hook, or doc the operator controls. detail names it.
+- "durable": true — no one can fix it (a platform constraint, an environment quirk), but the WORKAROUND is worth remembering next time. Say the workaround in "description".
+- Neither — a transient incident (a network blip, a credit limit, a one-off tool error) or a general observation about how Claude behaved. These are NOT upstream friction. Return them with no route and durable:false; they will be counted and dropped.
+
+An observation with no named party who could act on it and nothing durable to remember is not a report. Do not invent a route to make something filable.
+
+Output JSON: [{"title":"short title","description":"what happened","severity":"high|medium|low","route":{"type":"...","detail":"..."}|null,"durable":true|false}]
 If NO friction found, output exactly: []
 
 Be conservative. False positives waste time. Output ONLY the JSON array.`;
 
   try {
-    const response = await claudeCall(systemPrompt, recentSlice(compressed, 40000));
+    const response = await callFn(systemPrompt, recentSlice(compressed, 40000));
     const jsonMatch = response.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
       log('Phase 2g: No upstream friction (parse failure)');
@@ -2156,23 +2303,59 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
       return;
     }
 
+    const tally = { routed: 0, durable: 0, dropped: 0 };
+
     for (const item of frictionItems) {
-      createItem({
+      const base = {
         project: project.name,
         project_path: projectPath,
         ...(project.unresolved ? { project_unresolved: true } : {}),
-        category: 'upstream-friction',
-        urgency: item.severity === 'high' ? 'urgent' : 'normal',
-        title: item.title,
-        summary: item.description,
-        context_anchor: 'ring3-close friction scan',
-        evidence: { severity: item.severity },
         filed_by: 'ring3-close',
         thread_ids: threadIds,
-      });
+      };
+
+      if (frictionRouteIsActionable(item.route)) {
+        createItem({
+          ...base,
+          category: 'upstream-friction',
+          urgency: item.severity === 'high' ? 'urgent' : 'normal',
+          title: item.title,
+          summary: `${item.description}\n\nRoute: ${item.route.type} — ${item.route.detail}`,
+          context_anchor: 'ring3-close friction scan',
+          evidence: { severity: item.severity, route: item.route },
+        });
+        tally.routed++;
+        continue;
+      }
+
+      // The third arm, and it comes from the data: of the five friction items
+      // the operator KEPT, four exited as `captured-to-memory` — platform
+      // constraints with a durable workaround ("Claude-in-Chrome cannot connect
+      // while Claude Desktop is running"). Those have no upstream route and
+      // never will, and dropping them would discard the useful half of this
+      // lens. They are knowledge, so they go where knowledge goes.
+      if (item.durable === true) {
+        createItem({
+          ...base,
+          category: 'knowledge-extraction',
+          urgency: 'low',
+          title: item.title,
+          summary: item.description,
+          context_anchor: 'ring3-close friction scan (durable constraint, no upstream route)',
+          evidence: { type: 'constraint', home: 'memory', severity: item.severity, source: 'friction-lens' },
+        });
+        tally.durable++;
+        continue;
+      }
+
+      tally.dropped++;
     }
 
-    log(`Phase 2g: ${frictionItems.length} upstream friction item(s) queued`);
+    // All three counts, always. Silence here would be indistinguishable from
+    // the lens never running — and the drop count is the number this change
+    // exists to move, so it must be observable.
+    log(`Phase 2g: friction — ${tally.routed} routed, ${tally.durable} durable→knowledge, `
+      + `${tally.dropped} dropped (no route, nothing durable)`);
   } catch (e) {
     logError(`Phase 2g: Friction detection failed: ${e.message}`);
   }
@@ -3861,6 +4044,12 @@ export {
   threadCursorLines,
   buildExtractionCorpora,
   completionReviewEmitGuard,
+  // Exported for the quote-instrumentation suite (act:ea23b3a5): a fixture
+  // must be built by the REAL preprocessor, because its JSON-serialized output
+  // — not plain prose — is what the matcher actually faces.
+  preprocessTranscript,
+  // Friction actionability gate (act:ea23b3a5)
+  upstreamFriction,
   discoverSessionAdvisors,
   parseAdvisorFindings,
   advisorPass,

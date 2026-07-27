@@ -72,9 +72,9 @@ field_value() {
   printf '%s\n' "$fm" | awk -v f="$field" '
     $0 ~ "^" f ":" {
       sub("^" f ": *", "")
-      # If the value is a block scalar indicator, return empty so the
-      # caller falls through to field_block_scalar.
-      if ($0 == ">" || $0 == "|" || $0 == ">-" || $0 == "|-") { print ""; exit }
+      # If the value is a block scalar indicator (any of > | >- |- >+ |+),
+      # return empty so the caller falls through to field_block_scalar.
+      if ($0 ~ /^[>|][-+]?$/) { print ""; exit }
       gsub(/^["'\'']|["'\'']$/, "")
       print
       exit
@@ -91,7 +91,10 @@ field_block_scalar() {
     $0 ~ "^" f ":" {
       line = $0
       sub("^" f ": *", "", line)
-      if (line == ">" || line == "|") {
+      # Any block-scalar indicator (> | >- |- >+ |+) starts a block; the
+      # old bare-marker test returned ">-" itself as the field value, so
+      # every folded description counted 0 sentences (feedback 2026-07-26).
+      if (line ~ /^[>|][-+]?$/) {
         in_block = 1
         next
       }

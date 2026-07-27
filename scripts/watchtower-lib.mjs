@@ -104,8 +104,20 @@ export const INBOX_DETECTOR_REGISTRY = {
   'completion-review': {
     reconciler: 'autoReconcileCompletionReviews (ring1): resolves when the referenced '
       + 'action (plan_fid || evidence.fid) is verifiably closed in its OWN project db; '
-      + 'fid-not-found keeps (flow vestigial-db + misattribution protection); filing '
-      + 'exclusion: ring3 Phase 2c create-vs-complete guard (act:9eebbac4)',
+      + 'fid-not-found keeps (flow vestigial-db + misattribution protection). Filing '
+      + 'exclusions (act:ea23b3a5, all at ring3 Phase 2c): (a) confidence \'high\' is '
+      + 'SUPPRESSED — measured anti-predictive over all 223 items ever filed (high 30% '
+      + 'precision, medium+low 60%); (b) act:9eebbac4\'s create-vs-complete day-window '
+      + 'filter is DELETED — it exempted \'high\' from the born-this-session skip, so it '
+      + 'suppressed the best cohort (same-day + medium/low, 74%) and passed the worst, '
+      + 'and the category filed 0 true positives in the 23 items after it shipped; (c) '
+      + 'per-fid dedup across pending + resolved/dismissed/EXPIRED/SUPERSEDED. Category '
+      + 'expiry is 14d (expiryDaysFor), which is why the last two statuses are '
+      + 'load-bearing: the expiry equals COMPLETION_REVIEW_DEDUP_DAYS, so without them a '
+      + 'fid leaves every corpus exactly when its item expires and refiles forever. A '
+      + 'quoted-completion-evidence check runs as INSTRUMENTATION ONLY (evidence.'
+      + 'quote_verified) and gates nothing — the transcript haystack is JSON-serialized, '
+      + 'so a substring gate rejects real prose and accepts serialized tool arguments.',
   },
   // ring3-filed
   'coverage-warning': {
@@ -133,7 +145,12 @@ export const INBOX_DETECTOR_REGISTRY = {
   'advisor-finding': {
     exempt: 'advisory observation from the session advisor pass (ring2 briefing panel + '
       + 'ring3 Phase 2m); capped per member per session and deduped vs pending + '
-      + 'resolution corpora at filing; no mechanical truth condition.',
+      + 'resolution corpora at filing; no mechanical truth condition. The ring2 '
+      + 'cabinet-roster review files only ONE kind here now (act:ea23b3a5): '
+      + 'uncovered-tech, which proposes a cabinet seat and is therefore a decision. Its '
+      + 'siblings dormant-skill and stale-briefing were pure measurements and moved to '
+      + 'ambient state (state/roster-review.json → Ring 1 Standing Issues, rendered on '
+      + 'change); retireRosterFindingItems supersedes any that were still pending.',
   },
   'raised-unhandled': {
     exempt: 'session-historical fact — a loose end the session raised but neither did '
@@ -150,8 +167,44 @@ export const INBOX_DETECTOR_REGISTRY = {
       + 'reconciler: the referenced deferred action closed.',
   },
   'watchtower-health': {
-    exempt: 'notification of a stale/failing ring window; recovery is visible in the '
-      + 'ring health sidecars. Candidate future reconciler: health recovered ⇒ retract.',
+    reconciler: 'retractClearedMemoryBudgetItems (ring2 slow, act:ea23b3a5): the '
+      + 'memory-budget alarm retracts on the SAME pass that measures it — '
+      + 'runMemoryHygiene already shells every project\'s validate-memory (exit 0 = '
+      + 'pass) and already computes passProjects, so the retraction condition is in '
+      + 'hand. Deliberately NOT in Ring 1: a second memory-health producer is forbidden '
+      + 'by name in this doc, and at a 30-minute throttle against ring2\'s 30-minute '
+      + 'cadence it would buy zero freshness. Fails toward KEEPING — only a project '
+      + 'positively classified `pass` retracts; any nonzero exit maps to `violations`. '
+      + 'The selector matches BOTH the new evidence.debt_class and the legacy '
+      + '{violations, streak} title shape, because every item on disk when this shipped '
+      + 'carried the latter. Filing side: ONE accumulating item per project, keyed by '
+      + 'CALENDAR DAY (a per-run key would count ~48 cron ticks a day), appended via '
+      + 'annotateItemEvidence so filed_at is never bumped. Other watchtower-health '
+      + 'filings (stale/failing ring windows) remain exempt — recovery is visible in the '
+      + 'ring health sidecars.',
+  },
+  // ring4-filed (in the census since act:ea23b3a5; ring4 was outside it before)
+  'doc-drift': {
+    exempt: 'a documentary claim that no longer matches the tree, filed one item per '
+      + '(project, drift_key). Deliberately NOT aggregated into a per-project standing '
+      + 'debt: each item carries its own mutually-exclusive fix-doc / fix-code decision, '
+      + 'so one accumulated item would pose a question the operator cannot answer. No '
+      + 'mechanical retraction yet either — the weekly pass covers only 3 of 7 projects '
+      + 'per run, so "not reproduced this run" is not evidence a claim cleared, and a '
+      + 'reconciler built on it would mass-retract every item in the unscanned projects. '
+      + 'Candidate future reconciler: re-verify on the next pass that ACTUALLY scanned '
+      + 'that project, scoped to items with filed_by ring4. NOTE a second producer '
+      + 'exists outside the census — a consumer Plan-9 hook files doc-drift with no '
+      + 'drift_key at all (live: flow ring2-slow-post/10-pulse-mechanical.mjs).',
+  },
+  // routines-filed (in the census since act:ea23b3a5)
+  'routine': {
+    exempt: 'a declared interactive routine that fired. The dispatch engine owns the '
+      + 'whole lifecycle, so there is nothing for a Ring 1 reconciler to re-check: a '
+      + 'pending item blocks refiring, a stale one is superseded at the next due firing, '
+      + 'and since act:ea23b3a5 a time-of-day routine self-supersedes at END OF ITS '
+      + 'FILING DAY on Ring 1\'s tick — its moment is over. Terminal exits clear the mux '
+      + 'dispatch descriptor via DISPATCHED_CATEGORIES, so the desk badge follows.',
   },
   'stale-project': {
     exempt: 'staleness notification. Candidate future reconciler: project activity '

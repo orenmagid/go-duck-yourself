@@ -274,6 +274,99 @@ export function dispatchRoutine({ projectName, projectPath, routine, filedBy, de
 }
 
 // ---------------------------------------------------------------------------
+// Moment expiry — a daily routine's value is bound to its day (act:ea23b3a5)
+// ---------------------------------------------------------------------------
+//
+// A `time-of-day` routine only self-superseded at its NEXT firing, which for a
+// daily routine is 24 hours later. So a morning briefing nobody ran occupied
+// the queue and lit the desk badge all day and into the night. The 2026-07-26
+// triage dismissed six such firings.
+//
+// The window is END OF THE FILING DAY, not a fixed number of hours. That is the
+// measured choice, not a taste: across six weeks the portfolio's one
+// time-of-day routine (flow/morning-briefing at 08:00) had ten real pickups —
+// eight within four hours and two after, at 4.4h and 8.6h. A four-hour window
+// would have destroyed two genuine pickups to clear one stale item. End-of-day
+// preserves every observed pickup, needs no tuning constant, and matches what a
+// daily routine actually means to a person: you can still want your morning
+// briefing at 4pm; you do not want it tomorrow.
+//
+// Scope is deliberately narrow. `interval`, `path-nonempty`, and
+// `session-close` routines have no moment — they keep the existing
+// `stale_after_hours` behaviour untouched.
+//
+// KNOWN GAP, named not hidden: the sweep has no in-flight awareness, so a
+// routine picked up by `mux qa drain` very late at night could in principle be
+// superseded mid-run (its closing resolveItem would then no-op). End-of-day
+// narrows that window to minutes; a fixed-hour window would have opened it to
+// hours.
+//
+// CONSEQUENCE, also deliberate: a missed briefing is no longer re-delivered by
+// the SessionStart missed-routine section on a LATER day. Its moment passed; it
+// refires at tomorrow's slot.
+
+/** End of the local calendar day containing `iso`, or null if unparseable. */
+export function endOfFilingDay(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  const d = new Date(t);
+  d.setHours(23, 59, 59, 999);
+  return d;
+}
+
+/**
+ * Supersede pending time-of-day routine items whose day has ended.
+ * Deps injectable for hermetic tests. Never throws.
+ * @returns {{swept: string[], skipped: number}}
+ */
+export function sweepExpiredMoments({ now = new Date(), deps = {} } = {}) {
+  const listPendingFn = deps.listPending || listPending;
+  const supersedeFn = deps.supersedeItem || supersedeItem;
+  const swept = [];
+  let skipped = 0;
+
+  let items = [];
+  try {
+    items = listPendingFn({ category: 'routine' });
+  } catch (e) {
+    _logError('routines', `moment sweep could not list pending routines: ${e.message}`);
+    return { swept, skipped };
+  }
+
+  for (const item of items) {
+    // Read the trigger from the ITEM, not from config. dispatchRoutine persists
+    // it at filing (evidence.trigger), so a routine whose declaration was later
+    // removed from config still classifies correctly — a config lookup would
+    // silently treat it as unknown and leave it pending forever.
+    if (item?.evidence?.trigger?.type !== 'time-of-day') continue;
+
+    const dayEnd = endOfFilingDay(item.filed_at);
+    if (!dayEnd) {
+      // Deliberate abstention. The existing stale path treats an unparseable
+      // filed_at as stale (NaN comparisons fall through to supersede); this one
+      // refuses. Two mechanisms disagreeing silently is worse than one
+      // abstaining loudly, and abstaining keeps the item visible.
+      skipped++;
+      _logError('routines', `moment sweep: item ${item.id} has an unparseable filed_at (${item.filed_at}) — leaving it pending`);
+      continue;
+    }
+    if (now <= dayEnd) continue;
+
+    try {
+      supersedeFn(item.id, {
+        reason: `moment window passed — this time-of-day routine was filed ${String(item.filed_at).slice(0, 10)} and its day has ended; it refires at the next slot`,
+      });
+      swept.push(item.id);
+      _log('routines', `moment expired ${item.evidence?.routine_key || item.id} (filed ${String(item.filed_at).slice(0, 10)})`);
+    } catch (e) {
+      _logError('routines', `moment sweep could not supersede ${item.id}: ${e.message}`);
+    }
+  }
+
+  return { swept, skipped };
+}
+
+// ---------------------------------------------------------------------------
 // The pass — evaluate every declared routine against one event
 // ---------------------------------------------------------------------------
 
@@ -287,12 +380,25 @@ export function dispatchRoutine({ projectName, projectPath, routine, filedBy, de
  * @param {Date} [params.now]
  * @returns {{fired: Array, skipped: Array, invalid: Array}}
  */
-export function runRoutinePass({ config, event, filedBy, now = new Date() }) {
+export function runRoutinePass({ config, event, filedBy, now = new Date(), deps = {} }) {
   const fired = [];
   const skipped = [];
   const invalid = [];
   const state = loadRoutineState();
   let stateDirty = false;
+
+  // Moment expiry, on Ring 1's PORTFOLIO tick only (act:ea23b3a5). Ring 3 also
+  // calls this function, with a single-project session-close event — an
+  // unscoped sweep there would have every session close in any project
+  // superseding every OTHER project's routine items, and during a
+  // --reprocess-failed drain that is one portfolio sweep per replayed session.
+  if (event.type === 'tick') {
+    try {
+      sweepExpiredMoments({ now, deps });
+    } catch (e) {
+      _logError('routines', `moment sweep failed: ${e.message}`);
+    }
+  }
 
   const projects = config?.projects || {};
   for (const [projectName, entry] of Object.entries(projects)) {

@@ -39,9 +39,10 @@ import {
   recordApiUsage, computeActivitySignature, shouldRunIdlePass, markIdlePassRan,
 } from './watchtower-lib.mjs';
 import {
-  expireItem, listItems,
-  proposeFolds, annotateItemEvidence,
+  expireItem, listItems, expiryDaysFor,
+  proposeFolds, annotateItemEvidence, supersedeItem,
 } from './watchtower-queue.mjs';
+import { autoReconcileItem } from './watchtower-lib.mjs';
 
 // Shared thread-file reader (single source of truth in watchtower-lib.mjs).
 // Re-exported so ring2's existing tests (ring2-thread-context.test.mjs) keep
@@ -60,7 +61,9 @@ const FAST_TRIGGER_EVAL_CAP = 5;
 const FAST_ENRICHMENT_CAP = 2;
 const FAST_ENRICHMENT_MIN_AGE_MS = 10 * 60 * 1000; // 10 minutes
 const ESCALATION_WARN_DAYS = 14;
-const ESCALATION_EXPIRE_DAYS = 30;
+// The expire threshold moved to watchtower-queue's expiryDaysFor (act:ea23b3a5)
+// — it is per-category now, and two engines read it. Do not reintroduce a local
+// copy here; that divergence is the bug the consolidation removed.
 // Urgency = value decay, not importance (decision_ring3_urgency_value_based).
 // An urgent item whose decay window has passed is by definition no longer
 // urgent — de-escalate so the SessionStart urgent count stays trustworthy.
@@ -539,13 +542,17 @@ async function escalateQueueItems() {
     const ageMs = now - new Date(item.filed_at).getTime();
     const ageDays = ageMs / (24 * 60 * 60 * 1000);
 
-    if (ageDays >= ESCALATION_EXPIRE_DAYS && item.category !== 'qa-handoff') {
-      // 30+ days: expire. qa-handoff items are exempt — they never expire
-      // (recipient-gate contract: expireItem THROWS on them); they fall
-      // through to the [AGING] path below and stay surfaced as QA debt.
+    // Per-category age policy, single-sourced in watchtower-queue
+    // (act:ea23b3a5). A null means never — today only qa-handoff, whose
+    // exemption is structural (expireItem THROWS on it, per the recipient-gate
+    // contract); those fall through to the [AGING] path below and stay
+    // surfaced as QA debt. The other engine (runExpiry, called by /inbox and
+    // /briefing) reads the same table, so the two cannot disagree.
+    const expireDays = expiryDaysFor(item.category);
+    if (expireDays !== null && ageDays >= expireDays) {
       expireItem(item.id);
       expired++;
-      log(`Fast: expired queue item ${item.id} (${Math.floor(ageDays)}d old)`);
+      log(`Fast: expired queue item ${item.id} (${Math.floor(ageDays)}d old, ${item.category} policy ${expireDays}d)`);
       continue;
     }
 
@@ -737,14 +744,80 @@ async function runMemoryHygiene(config) {
     logError(`Slow: memory violation surfacing failed: ${e.message}`);
   }
 
+  // The other half of the same truth: a project that now PASSES retracts its
+  // standing alarm on this very pass (act:ea23b3a5). Detector symmetry — a
+  // detector that files must also retract, and the retraction condition is
+  // already computed two lines up.
+  try {
+    const retracted = retractClearedMemoryBudgetItems(passProjects);
+    if (retracted > 0) log(`Slow: retracted ${retracted} memory-budget alarm(s) whose condition cleared`);
+  } catch (e) {
+    logError(`Slow: memory-budget retraction failed: ${e.message}`);
+  }
+
   log(`Slow: memory hygiene — ${passProjects.length} pass, ${violationProjects.length} violations, ${skippedProjects.length} skipped`);
   return results;
 }
 
 const MEMORY_VIOLATION_STREAK_THRESHOLD = 3; // consecutive slow runs
-const MEMORY_VIOLATION_REFILE_DAYS = 7;
 
-function surfacePersistentViolations(violationProjects, projects, stateDir) {
+// ---------------------------------------------------------------------------
+// Memory-budget standing debt (act:ea23b3a5)
+// ---------------------------------------------------------------------------
+//
+// This alarm is now ONE accumulating item per project, not a fresh filing every
+// N days. The old 7-day refile throttle produced the live specimen: a maginnis
+// budget violation restated three times, in three categories, by three filers —
+// and the `title.startsWith('Memory budget violation')` pending check that was
+// supposed to prevent it is fragile against Ring 2's own `[AGING]` prefix
+// rewrite, which happens at 14 days.
+//
+// Occurrences are counted in CALENDAR DAYS, not slow-run timestamps. Ring 2
+// slow runs roughly 48 times a day: a per-run key would make the replay guard
+// dead code, grow the key list by ~17,500 entries a year inside a single JSON
+// file, and render a "3,412 runs" count that means nothing to a person. "This
+// has stood for 6 days" is the fact the operator actually acts on.
+//
+// The append routes through `annotateItemEvidence` — fresh read, pending fence
+// checked at WRITE time, deep-equal skip — rather than a direct item write.
+// That deliberately leaves title, urgency, and `filed_at` alone: the item does
+// not strip its own `[AGING]` prefix, does not pin itself to the top of every
+// pending list, and cannot become structurally un-expirable. If the debt
+// outlives the 30-day policy it expires and refiles fresh through the streak
+// gate, which is an honest signal reset rather than an immortal alarm.
+const MEMORY_BUDGET_DEBT_CLASS = 'memory-budget';
+const LEGACY_MEMORY_BUDGET_TITLE = /^(\[AGING\] )?Memory budget violation/;
+
+// BOTH selectors, always. Every memory-budget item on disk when this shipped
+// carries `evidence: { violations, streak }` and no `debt_class`, so matching
+// on the new field alone would silently miss the exact pile that motivated the
+// fix — and would leave it with no code path that ever touches it again.
+export function isMemoryBudgetItem(item) {
+  return item?.category === 'watchtower-health'
+    && (item?.evidence?.debt_class === MEMORY_BUDGET_DEBT_CLASS
+      || LEGACY_MEMORY_BUDGET_TITLE.test(String(item?.title || '')));
+}
+
+function findMemoryBudgetItems(projectName, listPendingFn) {
+  return (listPendingFn || listPending)({ project: projectName, category: 'watchtower-health' })
+    .filter(isMemoryBudgetItem)
+    .sort((a, b) => String(a.filed_at).localeCompare(String(b.filed_at)));
+}
+
+// deps are injectable so the suite stays hermetic; production callers omit them.
+export function surfacePersistentViolations(violationProjects, projects, stateDir, deps = {}) {
+  const listPendingFn = deps.listPending || listPending;
+  // Named `file`, not `createItemFn`: the detector-registry census binds a
+  // `category:` literal to its NEAREST preceding call opener and only
+  // recognises `createItem(` and `file(` as FILING owners. A wrapper under any
+  // other name reads as a query filter and the category silently drops out of
+  // the census — act:c2f06955 item 5 predicted this evasion, and the suite
+  // caught it live when this dep was first written as `createItemFn`.
+  const file = deps.createItem || createItem;
+  const annotateFn = deps.annotateItemEvidence || annotateItemEvidence;
+  const supersedeFn = deps.supersedeItem || supersedeItem;
+  const today = deps.today || new Date().toISOString().slice(0, 10);
+
   const streakPath = join(stateDir, 'memory-violation-streaks.json');
   let streaks = {};
   if (existsSync(streakPath)) {
@@ -753,7 +826,9 @@ function surfacePersistentViolations(violationProjects, projects, stateDir) {
 
   const violatingNames = new Set(violationProjects.map(p => p.project));
 
-  // Reset streaks for projects that now pass
+  // Reset streaks for projects that now pass. This is also the anti-oscillation
+  // floor: after a retraction the project must fail three consecutive runs
+  // again before anything refiles, so retract-then-refile cannot cycle.
   for (const name of Object.keys(streaks)) {
     if (!violatingNames.has(name)) delete streaks[name];
   }
@@ -763,24 +838,65 @@ function surfacePersistentViolations(violationProjects, projects, stateDir) {
     entry.count += 1;
 
     if (entry.count >= MEMORY_VIOLATION_STREAK_THRESHOLD) {
-      const pending = listPending({ project: p.project, category: 'watchtower-health' });
-      const alreadyPending = pending.some(i => i.title.startsWith('Memory budget violation'));
-      const daysSinceFiled = entry.last_filed
-        ? (Date.now() - new Date(entry.last_filed).getTime()) / 86400000
-        : Infinity;
+      const pending = findMemoryBudgetItems(p.project, listPendingFn);
+      const target = pending[0] || null;
 
-      if (!alreadyPending && daysSinceFiled >= MEMORY_VIOLATION_REFILE_DAYS) {
+      // Race residue or a pre-aggregation pile: the oldest accumulates and
+      // every other exits through the sanctioned verb naming its successor.
+      for (const extra of pending.slice(1)) {
+        try {
+          supersedeFn(extra.id, {
+            reason: `absorbed into the standing memory-budget item ${target.id} for ${p.project}`,
+          });
+        } catch (e) {
+          logError(`Slow: could not supersede duplicate memory-budget item ${extra.id} (${e.message})`);
+        }
+      }
+
+      if (target) {
+        const prior = target.evidence || {};
+        const priorDays = Array.isArray(prior.days) ? prior.days : [];
+        // Replay guard: a second violating run on a day already recorded is a
+        // no-op (annotateItemEvidence's deep-equal skip makes it a true no-write).
+        const days = [...new Set([...priorDays, today])].sort();
+        try {
+          annotateFn(target.id, {
+            debt_class: MEMORY_BUDGET_DEBT_CLASS,
+            days,
+            // `session_count` is the spelling itemSessionWeight (watchtower-
+            // inbox-assessment) already reads and which has zero producers
+            // today — so backlog-rot weighs this debt correctly with no
+            // consumer change and no migration of anything on disk.
+            session_count: days.length,
+            first_seen: days[0],
+            last_seen: days[days.length - 1],
+            violations: p.violations || [],
+            streak: entry.count,
+          });
+          log(`Slow: memory-budget debt for ${p.project} now spans ${days.length} day(s) (item ${target.id})`);
+        } catch (e) {
+          logError(`Slow: could not append memory-budget evidence to ${target.id} (${e.message})`);
+        }
+      } else {
         const projectPath = projects[p.project]?.path || projects[p.project] || '';
-        createItem({
+        file({
           project: p.project,
           project_path: projectPath,
           filed_by: 'ring2-slow',
           category: 'watchtower-health',
           urgency: 'normal',
           title: `Memory budget violation: ${p.project}`,
-          summary: `MEMORY.md has failed validation for ${entry.count} consecutive Ring 2 runs:\n${(p.violations || []).map(v => `- ${v}`).join('\n')}\n\nOver-budget MEMORY.md only partially loads at session start — memories past the cap are invisible.`,
+          summary: `MEMORY.md has failed validation for ${entry.count} consecutive Ring 2 runs:\n${(p.violations || []).map(v => `- ${v}`).join('\n')}\n\nOver-budget MEMORY.md only partially loads at session start — memories past the cap are invisible. This item accumulates while the condition stands and retracts automatically once validate-memory passes.`,
           context_anchor: 'state/memory-health.md',
-          evidence: { violations: p.violations || [], streak: entry.count },
+          evidence: {
+            debt_class: MEMORY_BUDGET_DEBT_CLASS,
+            days: [today],
+            session_count: 1,
+            first_seen: today,
+            last_seen: today,
+            violations: p.violations || [],
+            streak: entry.count,
+          },
           options: [
             { key: 'trim', label: 'Trim MEMORY.md now' },
             { key: 'defer', label: 'Defer — file a pib-db action' },
@@ -796,6 +912,46 @@ function surfacePersistentViolations(violationProjects, projects, stateDir) {
   }
 
   atomicWrite(streakPath, JSON.stringify(streaks, null, 2));
+}
+
+// Validator-backed retraction (act:ea23b3a5). Three memory-budget alarms sat
+// pending for days after the condition cleared — maginnis MEMORY.md validates
+// PASS at 74 lines / 16.6 KB against a 200-line / 25 KB budget — because
+// nothing consulted the validator that Ring 2 slow ALREADY runs for every
+// project on this same pass. The truth was sitting in `passProjects`.
+//
+// This lives here rather than in Ring 1 deliberately: Ring 1 shelling
+// `validate-memory.mjs` itself would fork a second memory-health producer,
+// which watchtower-contracts.md forbids by name, and at a 30-minute throttle
+// against Ring 2's 30-minute cadence it would buy exactly zero freshness.
+//
+// FAIL TOWARD KEEPING: only a project this pass positively classified `pass`
+// retracts. `violations`, `skipped`, and every error path leave the alarm
+// standing — runMemoryHygiene maps any nonzero validator exit to `violations`,
+// so an ambiguous failure can never be mistaken for a pass.
+export function retractClearedMemoryBudgetItems(passProjects, deps = {}) {
+  const listPendingFn = deps.listPending || listPending;
+  const reconcile = deps.autoReconcileItem || autoReconcileItem;
+  let retracted = 0;
+  for (const p of passProjects || []) {
+    for (const item of findMemoryBudgetItems(p.project, listPendingFn)) {
+      try {
+        const res = reconcile(item.id, {
+          resolution: 'validator-passes',
+          notes: `Auto-resolved by Ring 2 slow: ${p.project}'s validate-memory now passes — the budget violation this alarm reported no longer holds.`,
+          actor: 'ring2-slow',
+          evidence: { validator: 'scripts/validate-memory.mjs', validator_status: 'pass' },
+        });
+        if (res) {
+          retracted++;
+          log(`Slow: retracted memory-budget item ${item.id} — ${p.project} validates clean`);
+        }
+      } catch (e) {
+        logError(`Slow: could not retract memory-budget item ${item.id} (${e.message}) — keeping it pending`);
+      }
+    }
+  }
+  return retracted;
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,7 +1302,22 @@ function simpleHash(text) {
   return 'ph_' + Math.abs(h).toString(36);
 }
 
-function parseAuditPatterns(content) {
+// Shape gate for pattern-promotion filing (act:09184ad7). Phase 2e's prompt
+// (QUALITY_PATTERN_SYSTEM_PROMPT in watchtower-ring3-close.mjs) mandates an
+// **Evidence:** and a **Gap:** block per pattern; model output that ignores
+// the format is reliably NOT a behavioral pattern but a document echo —
+// status tables, wave ledgers, dependency graphs, setup recipes, raw
+// transcript fragments re-emitted as "patterns". Calibrated against the
+// 2026-07-26 consolidation corpus: 120/120 legitimate ring2-filed bodies
+// pass, 17/17 misfiled ledger fragments fail. Pure; exported for the
+// hermetic suite.
+export function patternHasRequiredShape(body) {
+  return typeof body === 'string'
+    && body.includes('**Evidence:**')
+    && body.includes('**Gap:**');
+}
+
+export function parseAuditPatterns(content) {
   const patterns = [];
   let currentDate = null;
   const lines = content.split('\n');
@@ -1215,14 +1386,21 @@ async function routePatternToMember(pattern, members) {
   return members.find(m => m.name === memberName) || null;
 }
 
-async function scanAuditPatterns(config) {
-  const patternsPath = join(WATCHTOWER_DIR, 'state', 'audit-patterns.md');
+export async function scanAuditPatterns(config, deps = {}) {
+  const {
+    watchtowerDir = WATCHTOWER_DIR,
+    membersFn = collectCabinetMembers,
+    routeFn = routePatternToMember,
+    createItemFn = createItem,
+    listPendingFn = listPending,
+  } = deps;
+  const patternsPath = join(watchtowerDir, 'state', 'audit-patterns.md');
   if (!existsSync(patternsPath)) {
     log('Slow: no audit-patterns.md, skipping pattern detection');
     return;
   }
 
-  const statePath = join(WATCHTOWER_DIR, 'state', 'pattern-detection.json');
+  const statePath = join(watchtowerDir, 'state', 'pattern-detection.json');
   let state = { last_scan: null, audit_patterns_mtime: 0, processed_hashes: [] };
   if (existsSync(statePath)) {
     try { state = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* reset */ }
@@ -1245,7 +1423,7 @@ async function scanAuditPatterns(config) {
     return;
   }
 
-  const members = collectCabinetMembers(config);
+  const members = membersFn(config);
   if (members.length === 0) {
     log('Slow: no cabinet members found, skipping pattern routing');
     return;
@@ -1254,17 +1432,30 @@ async function scanAuditPatterns(config) {
   const batch = newPatterns.slice(0, SLOW_PATTERN_SCAN_CAP);
   log(`Slow: routing ${batch.length} of ${newPatterns.length} new audit patterns`);
 
+  let rejectedMalformed = 0;
   for (const pattern of batch) {
     try {
-      const routing = await routePatternToMember(pattern, members);
+      // Shape gate (act:09184ad7): reject BEFORE routing, so a document echo
+      // never costs a Claude routing call. Rejected candidates are counted
+      // loudly (per-item log + persisted counters below), never silently
+      // dropped, and their hashes are marked processed so the scanner does
+      // not retry them every run.
+      if (!patternHasRequiredShape(pattern.body)) {
+        rejectedMalformed++;
+        processedSet.add(pattern.hash);
+        log(`Slow: pattern rejected (missing Evidence/Gap shape): ${pattern.title.slice(0, 60)}`);
+        continue;
+      }
+
+      const routing = await routeFn(pattern, members);
       if (!routing) { processedSet.add(pattern.hash); continue; }
 
-      const existing = listPending({ category: 'pattern-promotion' }).some(qi =>
+      const existing = listPendingFn({ category: 'pattern-promotion' }).some(qi =>
         qi.evidence?.pattern_hash === pattern.hash
       );
 
       if (!existing) {
-        createItem({
+        createItemFn({
           project: routing.project,
           project_path: routing.project_path,
           filed_by: 'ring2-slow',
@@ -1300,7 +1491,13 @@ async function scanAuditPatterns(config) {
   state.audit_patterns_mtime = currentMtime;
   state.last_scan = new Date().toISOString();
   state.processed_hashes = [...processedSet];
+  state.rejected_malformed_total = (state.rejected_malformed_total || 0) + rejectedMalformed;
+  state.last_scan_rejected = rejectedMalformed;
   atomicWrite(statePath, JSON.stringify(state, null, 2));
+  if (rejectedMalformed > 0) {
+    log(`Slow: ${rejectedMalformed} malformed pattern(s) rejected this scan `
+      + `(${state.rejected_malformed_total} total since install)`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,8 +1636,17 @@ export function detectStaleBriefings(briefingFiles, referenceMtimeMs, staleDays 
     .sort((a, b) => b.ageDaysBehind - a.ageDaysBehind);
 }
 
-/** Normalize the dead-skill reader's --json into the dormant-skill finding
- *  shape: dead names + stale {skill, ageDays}, each capped. Pure for tests. */
+/** Normalize the dead-skill reader's --json into the dormant-skill shape:
+ *  TRUE counts plus capped name lists. Pure for tests.
+ *
+ *  The cap is a DISPLAY bound and must never be the count (act:ea23b3a5). It
+ *  used to be both: the title was built from `dead.length` AFTER slicing to
+ *  ROSTER_DORMANT_LIST_CAP, so every project ever measured reported exactly
+ *  "12 dead" — go-duck-yourself, claude-cabinet, article-rewriter, reflow,
+ *  maginnis, flow, theater-cheater, all identical, forever. A saturated
+ *  constant wearing the costume of a measurement is worse than no number, and
+ *  moving one into seven per-project state files would have given it the
+ *  authority of a fact. */
 export function parseDormantSkills(readerJson, opts = {}) {
   const cap = opts.cap ?? ROSTER_DORMANT_LIST_CAP;
   const obj = readerJson && typeof readerJson === 'object' ? readerJson : {};
@@ -1451,6 +1657,8 @@ export function parseDormantSkills(readerJson, opts = {}) {
     .map(s => (s && s.skill ? { skill: s.skill, ageDays: s.ageDays } : null))
     .filter(Boolean);
   return {
+    dead_count: dead.length,
+    stale_count: stale.length,
     dead: dead.slice(0, cap),
     stale: stale.slice(0, cap),
     days: obj.days || 30,
@@ -1561,53 +1769,83 @@ async function reviewOneProjectRoster({ projectName, projectPath, members, ask, 
     logError(`Roster coverage check failed for ${projectName}: ${e.message}`);
   }
 
-  // 2. Stale briefings
+  // 2 + 3. Stale briefings and dormant skills are MEASUREMENTS, not decisions
+  // (act:ea23b3a5). Both used to file `advisor-finding` queue items; both are
+  // now ambient state on the per-project state file. A queue item asks the
+  // operator to decide something — `uncovered-tech` above proposes a cabinet
+  // seat, which is a real decision, so it stays queued. "12 skills are dormant"
+  // is a condition, and conditions describe rather than ask. See the "Queue
+  // items require a decision; ambient state describes conditions" contract.
+  //
+  // Metrics are RETURNED, never written here: reviewCabinetRoster reads the
+  // state file once and rewrites it wholesale at the end of the pass, so a
+  // write from inside this per-project function would be silently clobbered.
+  const metrics = { measured_at: new Date(now).toISOString() };
+
   try {
-    if (!rosterFindingPending(projectName, 'stale-briefing')) {
-      const briefingFiles = collectBriefingFiles(projectPath);
-      const stale = detectStaleBriefings(briefingFiles, projectReferenceMtime(projectPath, now));
-      if (stale.length > 0) {
-        const summary = `Cabinet briefing file(s) haven't been refreshed while the project moved on:\n${stale.map(s => `- ${s.name} (~${s.ageDaysBehind}d behind the project)`).join('\n')}\n\nConsider re-running /onboard or updating the briefings so members reason from current context.`;
-        fileRosterFinding({
-          projectName, projectPath, kind: 'stale-briefing',
-          title: `Stale cabinet briefings: ${projectName} (${stale.length})`,
-          summary,
-          evidence: { stale_briefings: stale },
-        });
-      }
-    }
+    const briefingFiles = collectBriefingFiles(projectPath);
+    const stale = detectStaleBriefings(briefingFiles, projectReferenceMtime(projectPath, now));
+    if (stale.length > 0) metrics.stale_briefings = stale;
   } catch (e) {
     logError(`Roster briefing check failed for ${projectName}: ${e.message}`);
   }
 
-  // 3. Dormant skills (reuses the dead-skill reader — see section header note)
   try {
-    if (!rosterFindingPending(projectName, 'dormant-skill')) {
-      const readerJson = await runSkillUsage(projectPath);
-      if (readerJson) {
-        const dormant = parseDormantSkills(readerJson);
-        if (dormant.hasFindings) {
-          const deadLine = dormant.dead.length ? `Never invoked: ${dormant.dead.join(', ')}` : '';
-          const staleLine = dormant.stale.length
-            ? `Stale (>${dormant.days}d): ${dormant.stale.map(s => `${s.skill} (${s.ageDays}d)`).join(', ')}`
-            : '';
-          const summary = [
-            'The dead-skill reader flags operator-invocable skills that are dormant:',
-            deadLine, staleLine, '',
-            'Consider retiring, consolidating, or adding triggers. (Cabinet members are spawned as agents and do not write skill-invoke telemetry, so this signal is the skill ecosystem, not advisor members.)',
-          ].filter(Boolean).join('\n');
-          fileRosterFinding({
-            projectName, projectPath, kind: 'dormant-skill',
-            title: `Dormant skills: ${projectName} (${dormant.dead.length} dead, ${dormant.stale.length} stale)`,
-            summary,
-            evidence: { dead: dormant.dead, stale: dormant.stale },
-          });
-        }
+    const readerJson = await runSkillUsage(projectPath);
+    if (readerJson) {
+      const dormant = parseDormantSkills(readerJson);
+      if (dormant.hasFindings) {
+        metrics.dormant = {
+          dead_count: dormant.dead_count,
+          stale_count: dormant.stale_count,
+          // The NAMES are the actionable half — "12 dead" tells the operator
+          // nothing they can act on; "audit, retire-me, verify-learn" does.
+          dead: dormant.dead,
+          stale: dormant.stale,
+          days: dormant.days,
+        };
       }
     }
   } catch (e) {
     logError(`Roster dormant-skill check failed for ${projectName}: ${e.message}`);
   }
+
+  return metrics;
+}
+
+// One-shot retraction (act:ea23b3a5). `fileRosterFinding` and its dedup were
+// the ONLY code that ever touched a dormant-skill / stale-briefing item. With
+// the filing removed, any such item still pending has nothing left to
+// supersede, refresh, or retract it — it would display a stale count for up to
+// 30 days beside a live ambient line saying something different. That is the
+// dual-existence failure, so the change carries its own migration.
+export function retireRosterFindingItems(deps = {}) {
+  const listPendingFn = deps.listPending || listPending;
+  const supersedeFn = deps.supersedeItem || supersedeItem;
+  const retired = [];
+  let items = [];
+  try {
+    items = listPendingFn({ category: 'advisor-finding' });
+  } catch (e) {
+    logError(`Slow: could not list advisor-finding items for retirement (${e.message})`);
+    return retired;
+  }
+  for (const item of items) {
+    const kind = item?.evidence?.roster_kind;
+    if (kind !== 'dormant-skill' && kind !== 'stale-briefing') continue;
+    try {
+      supersedeFn(item.id, {
+        reason: `${kind} is now ambient state, not a queue item (act:ea23b3a5) — the live counts are in the project's Standing Issues, sourced from state/roster-review.json`,
+      });
+      retired.push(item.id);
+    } catch (e) {
+      logError(`Slow: could not retire roster finding ${item.id} (${e.message})`);
+    }
+  }
+  if (retired.length > 0) {
+    log(`Slow: retired ${retired.length} roster finding(s) superseded by ambient state`);
+  }
+  return retired;
 }
 
 /** Orchestrator. deps.{ask, runSkillUsage, now} are injectable so tests stay
@@ -1639,20 +1877,45 @@ export async function reviewCabinetRoster(config, deps = {}) {
     return;
   }
 
+  // Migration, once per pass and idempotent: dormant-skill / stale-briefing
+  // items filed by the previous shape have no code left that touches them.
+  try {
+    retireRosterFindingItems(deps);
+  } catch (e) {
+    logError(`Slow: roster-finding retirement failed: ${e.message}`);
+  }
+
   const checked = state.projects_checked || {};
   const selected = selectRosterProjects([...byProject.keys()], checked);
   log(`Slow: cabinet-roster review — ${selected.length} of ${byProject.size} project(s)`);
 
+  // Ambient metrics (act:ea23b3a5) — merged into the ONE trailing write below.
+  // `previous` carries the prior measurement forward so Ring 1 can render on
+  // CHANGE rather than unconditionally: a number that never moves is furniture
+  // in a file read at every briefing, and the recall canary set the precedent
+  // (Ring 1 renders it only on alert).
+  const metrics = { ...(state.metrics || {}) };
+
   for (const projectName of selected) {
     const { project_path: projectPath, members } = byProject.get(projectName);
     try {
-      await reviewOneProjectRoster({ projectName, projectPath, members, ask, runSkillUsage, now });
+      const measured = await reviewOneProjectRoster({ projectName, projectPath, members, ask, runSkillUsage, now });
+      if (measured) {
+        const prior = metrics[projectName]?.dormant;
+        metrics[projectName] = {
+          ...measured,
+          previous: prior
+            ? { dead_count: prior.dead_count, stale_count: prior.stale_count }
+            : null,
+        };
+      }
     } catch (e) {
       logError(`Roster review failed for ${projectName}: ${e.message}`);
     }
     checked[projectName] = now;
   }
 
+  state.metrics = metrics;
   state.projects_checked = checked;
   state.last_run = new Date(now).toISOString();
   atomicWrite(statePath, JSON.stringify(state, null, 2));
@@ -2051,12 +2314,18 @@ export function runDraftAnnotationSweep(config, deps = {}) {
     projects_scanned: 0,
     items_scanned: 0,
     fold_annotated: 0,
+    // Pattern-promotion folds (act:09184ad7): same recipe, second corpus.
+    pattern_items_scanned: 0,
+    pattern_fold_annotated: 0,
+    loose_end_items_scanned: 0,
+    loose_end_fold_annotated: 0,
     skipped_projects: [],
     // Drafts filed under a project NOT in config.projects (incl.
     // project_unresolved items) are never swept — they stay batch-eligible
     // with no chance of demotion, so the exclusion must be COUNTED, never
     // invisible.
     unscanned_items: 0,
+    unscanned_pattern_items: 0,
     errors: 0,
   };
   const projects = (config && config.projects) || {};
@@ -2064,7 +2333,30 @@ export function runDraftAnnotationSweep(config, deps = {}) {
     summary.unscanned_items = listPendingFn({ category: 'knowledge-extraction' })
       .filter((i) => typeof i.draft_artifact === 'string' && i.draft_artifact.trim()
         && !Object.prototype.hasOwnProperty.call(projects, i.project)).length;
+    summary.unscanned_pattern_items = listPendingFn({ category: 'pattern-promotion' })
+      .filter((i) => i.evidence && i.evidence.target_member
+        && !Object.prototype.hasOwnProperty.call(projects, i.project)).length;
   } catch { /* visibility only — never blocks the sweep */ }
+
+  // Shared fold-annotation step: proposeFolds pairs → reciprocal dup map →
+  // additive possible_duplicate_of annotations. Returns the changed count.
+  const annotateFoldPairs = (group) => {
+    const pairs = proposeFolds(group);
+    const dupMap = new Map();
+    for (const { a, b } of pairs) {
+      if (!dupMap.has(a)) dupMap.set(a, new Set());
+      if (!dupMap.has(b)) dupMap.set(b, new Set());
+      dupMap.get(a).add(b);
+      dupMap.get(b).add(a); // reciprocal by construction
+    }
+    let annotated = 0;
+    for (const [id, partners] of dupMap) {
+      const res = annotateFn(id, { possible_duplicate_of: [...partners].sort() });
+      if (res && res.changed) annotated++;
+    }
+    return annotated;
+  };
+
   for (const [name] of Object.entries(projects)) {
     let drafts = [];
     try {
@@ -2075,7 +2367,14 @@ export function runDraftAnnotationSweep(config, deps = {}) {
       summary.errors++;
       continue;
     }
-    if (drafts.length === 0) continue;
+    let patternItems = [];
+    try {
+      patternItems = listPendingFn({ project: name, category: 'pattern-promotion' });
+    } catch (e) {
+      logError(`Draft sweep ${name}: pattern listPending failed: ${e.message}`);
+      summary.errors++;
+    }
+    if (drafts.length === 0 && patternItems.length === 0) continue;
     summary.projects_scanned++;
     summary.items_scanned += drafts.length;
 
@@ -2091,21 +2390,80 @@ export function runDraftAnnotationSweep(config, deps = {}) {
 
     // Folds: pure similarity pass within this project's pending drafts.
     try {
-      const pairs = proposeFolds(drafts);
-      const dupMap = new Map();
-      for (const { a, b } of pairs) {
-        if (!dupMap.has(a)) dupMap.set(a, new Set());
-        if (!dupMap.has(b)) dupMap.set(b, new Set());
-        dupMap.get(a).add(b);
-        dupMap.get(b).add(a); // reciprocal by construction
-      }
-      for (const [id, partners] of dupMap) {
-        const res = annotateFn(id, { possible_duplicate_of: [...partners].sort() });
-        if (res && res.changed) summary.fold_annotated++;
-      }
+      if (drafts.length > 0) summary.fold_annotated += annotateFoldPairs(drafts);
     } catch (e) {
       logError(`Draft sweep ${name}: fold pass failed: ${e.message}`);
       summary.errors++;
+    }
+
+    // Pattern-promotion folds (act:09184ad7): near-duplicate pattern
+    // variants arrive pre-annotated for the next consolidation pass instead
+    // of being folded by hand. Grouped per evidence.target_member — folding
+    // is only meaningful within one member's prospective patterns section,
+    // and cross-member similarity is not a duplicate.
+    if (patternItems.length > 0) {
+      summary.pattern_items_scanned += patternItems.length;
+      const byMember = new Map();
+      for (const it of patternItems) {
+        const member = it.evidence && it.evidence.target_member;
+        if (!member) continue;
+        if (!byMember.has(member)) byMember.set(member, []);
+        byMember.get(member).push({
+          id: it.id,
+          title: (it.evidence && it.evidence.pattern_title) || it.title || '',
+          draft_artifact: (it.evidence && it.evidence.pattern_text) || '',
+        });
+      }
+      try {
+        for (const group of byMember.values()) {
+          if (group.length < 2) continue;
+          summary.pattern_fold_annotated += annotateFoldPairs(group);
+        }
+      } catch (e) {
+        logError(`Draft sweep ${name}: pattern fold pass failed: ${e.message}`);
+        summary.errors++;
+      }
+    }
+
+    // Loose-end recurrence folds (act:ea23b3a5) — the THIRD corpus, same
+    // machinery, grouped per project (cross-project similarity is never a
+    // duplicate, exactly as cross-member similarity isn't for patterns).
+    //
+    // This is what the standing-debt aggregation was NOT allowed to become. The
+    // 2026-07-26 triage found one timelog gap restated five times as separate
+    // raised-unhandled items, and the obvious fix — auto-merge them on lexical
+    // similarity — fails on contact with the real numbers: proposeFolds scores
+    // with `overlapCoefficient` (act:421a8ab2 retired unigramJaccard), whose
+    // min() denominator lets two three-token titles sharing ONE word clear the
+    // 0.22 threshold. Against the six live loose-end titles that produces four
+    // false folds in fifteen pairs. The threshold was calibrated for ADVISORY
+    // retrieval, not for a destructive merge, and those five items were
+    // resolved `deferred` — real work the operator postponed, spanning two
+    // projects and three different date ranges. Merging them would have buried
+    // which gaps remain.
+    //
+    // So the recipe stays where it belongs: propose, annotate both sides,
+    // demote out of batch sign-off, and let the operator dispose the group in
+    // one pass. A lexical matcher may propose; it may never silently suppress.
+    let looseEnds = [];
+    try {
+      looseEnds = listPendingFn({ project: name, category: 'raised-unhandled' });
+    } catch (e) {
+      logError(`Draft sweep ${name}: loose-end listPending failed: ${e.message}`);
+      summary.errors++;
+    }
+    if (looseEnds.length > 1) {
+      summary.loose_end_items_scanned += looseEnds.length;
+      try {
+        summary.loose_end_fold_annotated += annotateFoldPairs(looseEnds.map((it) => ({
+          id: it.id,
+          title: it.title || '',
+          draft_artifact: it.summary || '',
+        })));
+      } catch (e) {
+        logError(`Draft sweep ${name}: loose-end fold pass failed: ${e.message}`);
+        summary.errors++;
+      }
     }
   }
 
@@ -2118,10 +2476,13 @@ export function runDraftAnnotationSweep(config, deps = {}) {
   } catch (e) {
     logError(`Draft sweep: sidecar write failed: ${e.message}`);
   }
-  log(`Draft sweep: ${summary.items_scanned} drafts across ${summary.projects_scanned} projects — `
-    + `${summary.freshness_annotated} freshness, ${summary.fold_annotated} fold annotations`
+  log(`Draft sweep: ${summary.items_scanned} drafts + ${summary.pattern_items_scanned} patterns `
+    + `+ ${summary.loose_end_items_scanned} loose ends across ${summary.projects_scanned} projects — `
+    + `${summary.fold_annotated} draft + ${summary.pattern_fold_annotated} pattern `
+    + `+ ${summary.loose_end_fold_annotated} loose-end fold annotations`
     + (summary.skipped_projects.length ? `; skipped dbs: ${summary.skipped_projects.join(', ')}` : '')
     + (summary.unscanned_items ? `; ${summary.unscanned_items} draft(s) outside config never swept` : '')
+    + (summary.unscanned_pattern_items ? `; ${summary.unscanned_pattern_items} pattern(s) outside config never swept` : '')
     + (summary.errors ? `; ${summary.errors} errors` : ''));
   return summary;
 }

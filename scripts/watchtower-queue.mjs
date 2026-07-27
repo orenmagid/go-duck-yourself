@@ -149,7 +149,7 @@ const KNOWLEDGE_CATEGORY = 'knowledge-extraction';
 // is ALWAYS filed (never dropped) — home becomes the recomputation itself,
 // not a written record.
 export const KNOWLEDGE_EXTRACTION_TYPES = ['decision', 'constraint', 'lesson', 'preference', 'unclassifiable'];
-export const KNOWLEDGE_EXTRACTION_HOMES = ['memory', 'claude-md', 'pib-db-trigger', 'upstream-feedback', 'derivation'];
+export const KNOWLEDGE_EXTRACTION_HOMES = ['memory', 'claude-md', 'pib-db-trigger', 'upstream-feedback', 'derivation', 'session-record'];
 
 // Categories whose items carry a structural recipient gate: they may never be
 // included in a batch disposition — each leaves the queue only through its own
@@ -917,6 +917,13 @@ export function createItem({
     if (evidence.derivable === true && (typeof evidence.derivation !== 'string' || !evidence.derivation.trim())) {
       throw new Error('createItem: derivable:true requires evidence.derivation naming how to recompute it — a derivable fact is routed to its derivation, never filed as an opaque flag');
     }
+    // The perishable twin (act:a69c21f8): a fact that is true at a moment and
+    // will become false, with no live source to recompute it from. perishes_when
+    // is to perishable what derivation is to derivable — the flag is never
+    // filed opaque.
+    if (evidence.perishable === true && (typeof evidence.perishes_when !== 'string' || !evidence.perishes_when.trim())) {
+      throw new Error('createItem: perishable:true requires evidence.perishes_when naming what event or time makes it false — a perishable fact is filed as a dated snapshot, never as an opaque flag');
+    }
   }
   // A 'merged' handoff must reference work actually on main. merge_state
   // replaced the old hand-flagged `merged_into: "PENDING — not yet merged"`
@@ -1161,11 +1168,46 @@ export function releaseHold(id) {
  * @param {string} id
  * @returns {object} The updated item
  */
+// ---------------------------------------------------------------------------
+// Category expiry — the ONE age policy (act:ea23b3a5)
+// ---------------------------------------------------------------------------
+//
+// There are TWO expiry engines: Ring 2's `escalateQueueItems` (the 5-minute
+// cron) and `runExpiry` below (called by /inbox and /briefing). Before this,
+// each hardcoded 30 days and each inlined its own qa-handoff carve-out — so a
+// per-category policy set in one would be silently violated by whichever engine
+// reached the item first. Both now delegate here.
+//
+// `categoryNeverExpires` lives beside `expireItem`'s throw deliberately: the
+// carve-out is STRUCTURAL, not a preference. `expireItem` throws on a
+// qa-handoff, so returning anything but null for it would crash the caller's
+// loop. One fact, one place, no drift.
+export const DEFAULT_EXPIRE_DAYS = 30;
+
+// Per-category overrides. completion-review at 14d: the category's whole value
+// is time-bound — a completion candidate nobody confirmed in two weeks is not
+// going to be confirmed, and a real completion re-detects when the action is
+// next touched. NOTE the coupling to COMPLETION_REVIEW_DEDUP_DAYS (also 14) in
+// ring3-close: because the two are equal, that phase's dedup corpus MUST
+// include `expired` and `superseded`, or a fid leaves every corpus at exactly
+// the moment its item expires and refiles forever.
+export const CATEGORY_EXPIRE_DAYS = { 'completion-review': 14 };
+
+export function categoryNeverExpires(category) {
+  return category === QA_CATEGORY;
+}
+
+/** Days before an item of this category expires; null = never. */
+export function expiryDaysFor(category) {
+  if (categoryNeverExpires(category)) return null;
+  return CATEGORY_EXPIRE_DAYS[category] ?? DEFAULT_EXPIRE_DAYS;
+}
+
 export function expireItem(id) {
   const fp = itemPath(id);
   const item = readItem(fp);
   if (item.status !== 'pending') return null;
-  if (item.category === QA_CATEGORY) {
+  if (categoryNeverExpires(item.category)) {
     throw gateError(item, 'qa-handoff items never expire — QA debt stays surfaced until a stamped verdict resolves it (or a typed dismissal waives it)');
   }
   item.status = 'expired';
@@ -1359,10 +1401,12 @@ export function getEnrichment(id) {
  * @param {object} params
  * @returns {object} { warned: [], expired: [] }
  */
-export function runExpiry({ warnDays = 14, expireDays = 30 } = {}) {
+// `expireDays` is the DEFAULT, not a blanket: per-category overrides come from
+// expiryDaysFor (act:ea23b3a5), so this engine and Ring 2's cron cannot give
+// two different answers for the same item.
+export function runExpiry({ warnDays = 14, expireDays = DEFAULT_EXPIRE_DAYS } = {}) {
   const now = Date.now();
   const warnMs = warnDays * 24 * 60 * 60 * 1000;
-  const expireMs = expireDays * 24 * 60 * 60 * 1000;
   const pending = listPending();
   const warned = [];
   const expired = [];
@@ -1371,13 +1415,16 @@ export function runExpiry({ warnDays = 14, expireDays = 30 } = {}) {
     const age = now - new Date(item.filed_at).getTime();
     // qa-handoff items never auto-expire: an expired handoff is exactly the
     // silent QA gap the recipient gate forbids. They warn (by item) instead.
-    if (item.category === QA_CATEGORY) {
+    const days = categoryNeverExpires(item.category)
+      ? null
+      : (CATEGORY_EXPIRE_DAYS[item.category] ?? expireDays);
+    if (days === null) {
       if (age >= warnMs) warned.push(item);
       continue;
     }
-    if (age >= expireMs) {
+    if (age >= days * 24 * 60 * 60 * 1000) {
       item.status = 'expired';
-      item.resolution_notes = `Auto-expired after ${expireDays} days. If still relevant, re-file with updated context.`;
+      item.resolution_notes = `Auto-expired after ${days} days. If still relevant, re-file with updated context.`;
       atomicWrite(itemPath(item.id), item);
       if (DISPATCHED_CATEGORIES.has(item.category)) clearDispatchEntries(item);
       expired.push(item);
