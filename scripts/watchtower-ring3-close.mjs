@@ -2,6 +2,17 @@
 
 // Watchtower Ring 3 — Close mode (post-session transcript processing).
 //
+// CORRECTNESS INVARIANT — end-of-transcript capture only. Every extraction
+// phase reads the COMPLETE transcript once, after the session has ended.
+// Nothing captures incrementally mid-session. This is deliberate, not
+// incidental: in a live conversation decisions get reversed ("do X" …
+// "actually Y" … "drop both"), and only the end of the transcript knows
+// what survived. Incremental/streaming capture would record intermediate
+// and abandoned states as if they were conclusions — wrong memories, which
+// are worse than missing ones because at read time they are
+// indistinguishable from right ones. A refactor toward streaming capture
+// must preserve final-state-only semantics (see feedback 2026-07-29).
+//
 // Runs OUTSIDE of Claude Code, spawned by watchtower-session-end.sh via
 // nohup/disown. Processes the session transcript through invariant phases:
 //
@@ -46,7 +57,7 @@ import {
   updateThreadFile, currentCursor, resolveProjectIdentity, VERIFY_UI_PATHS,
   projectThreadCursorLines, authoredClaudeDirs, claudeChurnIsDisposable,
   buildLastSessionBlock, upsertLastSessionSection, recordSuppression, recordApiUsage,
-  recentSlice, parseMemoryIndex, parseMemoryRegionPointers, memoryGlobToRegex,
+  recentSlice,
   recordSignificanceEvent,
 } from './watchtower-lib.mjs';
 // Namespace view of the same module record — feature-detection seam for lib
@@ -59,6 +70,10 @@ import * as watchtowerLib from './watchtower-lib.mjs';
 // Direct queue import (precedent: ring2 imports expireItem this way) —
 // watchtower-lib deliberately not extended for this (lane separation).
 import { listItems, supersedeItem } from './watchtower-queue.mjs';
+// Shared prospective-commitment seam (act:aa554774) — /close files them
+// forward as actions; Phase 2d uses the SAME definition to decline to
+// duplicate what the sweep already filed.
+import { detectCommitments, findFiledCommitment } from './watchtower-commitments.mjs';
 import { runRoutinePass } from './watchtower-routines.mjs';
 
 const require = createRequire(import.meta.url);
@@ -1033,8 +1048,11 @@ async function workItemClosure(compressed, project, threadIds = [], sessionStart
 
   let openActions;
   try {
+    // `notes` joined in for the acceptance-criteria gate (act:86226720) — the
+    // measurement showed Phase 2c had never been shown an action's definition
+    // of done, which is why it could only answer "did something change".
     openActions = db.prepare(
-      "SELECT fid, text, status FROM actions WHERE status IN ('open', 'in-progress') AND deleted_at IS NULL"
+      "SELECT fid, text, status, notes FROM actions WHERE status IN ('open', 'in-progress') AND deleted_at IS NULL"
     ).all();
   } catch (e) {
     db.close();
@@ -1048,7 +1066,13 @@ async function workItemClosure(compressed, project, threadIds = [], sessionStart
     return { closed: 0, queued: 0 };
   }
 
-  const actionList = openActions.map(a => `- ${a.fid}: ${a.text} (${a.status})`).join('\n');
+  // Each action is presented WITH its acceptance criteria, so the model can be
+  // asked whether they are met rather than only whether activity occurred.
+  const actionList = openActions.map((a) => {
+    const excerpt = acceptanceCriteriaExcerpt(a.notes);
+    const acBlock = excerpt ? `\n  acceptance criteria:\n${excerpt.split('\n').map(l => `    ${l}`).join('\n')}` : '';
+    return `- ${a.fid}: ${a.text} (${a.status})${acBlock}`;
+  }).join('\n');
 
   const systemPrompt = `You are evaluating which work items appear completed based on a session transcript. For each action, assess confidence:
 - "high" = clearly completed in the transcript (code written, committed, tests passing, etc.)
@@ -1060,7 +1084,13 @@ An action that was merely CREATED during this session is NOT completed — creat
 
 Also return "quote": a VERBATIM span copied from the session transcript that states this work is finished. Copy it exactly — do not paraphrase, summarize, or reconstruct it. Quote from the transcript itself, not from the list of open actions above. If no such span exists, return "" — an empty quote is a valid and useful answer, and inventing one is worse than none.
 
-Output JSON array: [{"fid":"act:XXXXXXXX","confidence":"high|medium|low|none","evidence":"brief reason","quote":"verbatim span or empty string"}]
+ACCEPTANCE CRITERIA. Some actions above carry an "acceptance criteria" block — the action's own statement of what finished means. The operator does not want to know whether an action saw activity; they want to know whether it is FINISHED. So for each action return "ac_status":
+- "unmet" = the criteria are stated and at least one is clearly NOT satisfied — the work cannot be closed yet. This is the common and useful answer for an action that is blocked on something that has not happened (a session that has not occurred, a device that has not arrived, a review nobody has run).
+- "met" = the criteria are stated and all of them appear satisfied by what the transcript shows.
+- "unstated" = no acceptance criteria are given for this action, so there is nothing to judge against.
+When and ONLY when ac_status is "unmet", also return "ac_unmet": the specific unsatisfied criterion, copied VERBATIM from the acceptance criteria block above. Do not paraphrase it and do not invent one — an "unmet" with no verbatim criterion is discarded and the action is treated as unjudged. Quoting the criterion is what makes the judgment checkable.
+
+Output JSON array: [{"fid":"act:XXXXXXXX","confidence":"high|medium|low|none","evidence":"brief reason","quote":"verbatim span or empty string","ac_status":"met|unmet|unstated","ac_unmet":"verbatim unsatisfied criterion, or empty string"}]
 Output ONLY the JSON array, no other text.`;
 
   // The SAME slice is the model's haystack and the quote checker's — captured
@@ -1125,6 +1155,13 @@ Output ONLY the JSON array, no other text.`;
   // including suppressed ones, because "would a gate have been safe?" is a
   // question about the items we stop filing as much as the ones we file.
   const quoteTally = { found: 0, 'not-found': 0, 'absent-or-too-short': 0, 'no-decodable-transcript': 0 };
+  // Acceptance-criteria instrumentation (act:86226720) — the same discipline,
+  // for a gate that IS live. Counted for every evaluation and stamped on every
+  // emitted item, so the next calibration has a corpus. The model arm ships
+  // unmeasured by necessity (the model was never asked this question before),
+  // and these counters are how that gets fixed rather than assumed.
+  const acTally = { met: 0, unmet: 0, unstated: 0, unknown: 0, 'unmet-uncited': 0 };
+  const notesByFid = new Map(openActions.map((a) => [a.fid, a.notes || '']));
 
   for (const evalItem of evaluations) {
     if (!evalItem.fid || evalItem.confidence === 'none') continue;
@@ -1132,14 +1169,27 @@ Output ONLY the JSON array, no other text.`;
     const quoteCheck = verifyCompletionQuote(evalItem.quote, transcriptSlice);
     quoteTally[quoteCheck.reason] = (quoteTally[quoteCheck.reason] || 0) + 1;
 
+    const acVerdict = normalizeAcVerdict(evalItem);
+    acTally[acVerdict.status] = (acTally[acVerdict.status] || 0) + 1;
+    // An "unmet" with no verbatim criterion is counted separately and does NOT
+    // suppress — visible rather than silently downgraded.
+    if (acVerdict.status === 'unmet' && !acVerdict.criterion) acTally['unmet-uncited']++;
+    const unmetAcBoxes = hasUnmetAcceptanceCriteria(notesByFid.get(evalItem.fid));
+
     const guard = completionReviewEmitGuard(evalItem.fid, {
       statusStmt,
       existingItems: existingCompletionItems,
       confidence: evalItem.confidence,
+      unmetAcBoxes,
+      acVerdict,
     });
     if (!guard.emit) {
       skipped++;
-      log(`Phase 2c: skip ${evalItem.fid} — ${guard.reason}`);
+      // Per-suppressed-candidate log line naming WHICH arm fired — the
+      // acceptance criterion this action asks for: the filter's behavior must
+      // be observable, not silent.
+      log(`Phase 2c: skip ${evalItem.fid} — ${guard.reason}`
+        + (guard.suppressed_by ? ` [${guard.suppressed_by}]` : ''));
       continue;
     }
 
@@ -1168,6 +1218,13 @@ Output ONLY the JSON array, no other text.`;
           quote: typeof evalItem.quote === 'string' ? evalItem.quote : null,
           quote_verified: quoteCheck.verified,
           quote_check: quoteCheck.reason,
+          // Stamped on every EMITTED item too (act:86226720) — an item that
+          // got past the gate still carries what the model said about its
+          // acceptance criteria, which is the join key for the next
+          // precision measurement.
+          ac_status: acVerdict.status,
+          ac_unmet: acVerdict.criterion,
+          ac_boxes_present: hasAcceptanceCriteriaBoxes(notesByFid.get(evalItem.fid)),
           closed_by: 'ring3-close',
         },
         options: [
@@ -1189,6 +1246,10 @@ Output ONLY the JSON array, no other text.`;
   // distinguishable from a run where the instrumentation never fired.
   log(`Phase 2c: quote check (instrumentation only, gates nothing) — `
     + Object.entries(quoteTally).map(([k, n]) => `${k}=${n}`).join(', '));
+  // Positive confirmation for the AC gate: "no suppressions" must be
+  // distinguishable from "the model never answered".
+  log(`Phase 2c: acceptance-criteria verdicts — `
+    + Object.entries(acTally).map(([k, n]) => `${k}=${n}`).join(', '));
   return { closed: 0, queued };
 }
 
@@ -1257,69 +1318,120 @@ function extractMemoryFileTitle(content, maxLines = 10) {
   return last;
 }
 
-// loadRegionPointerTitles — the dedup-hole fix (act:421a8ab2). A region
-// pointer (`- region \`lesson_*.md\` → …`) makes a whole class of memory
-// files reachable from MEMORY.md WITHOUT a per-file index line — that is
-// the point of a region pointer (bounded working-set budget) — but it also
-// made those files invisible to isDuplicate, which only ever parsed direct
-// `[Title](file.md)` links. Both the 2026-07-12 outage-recovery reprocess
-// and the 2026-07-14 read-pass wrote bulk memory files this way, with "zero
-// new MEMORY.md index lines" by design, and both created a ~50% duplicate
-// layer the dedup couldn't see. This expands each region-pointer glob
-// against the files ACTUALLY on disk and reads each matched file's own
-// title, so a future bulk/manual write is visible to extraction dedup
-// without paying the index-line budget cost region pointers exist to avoid.
-// Files already covered by a direct index line are skipped (already in the
-// corpus via parseMemoryTitles). Fails open at every step — a missing dir,
-// an unreadable index, or one unreadable file degrades the corpus, never
-// throws.
-function loadRegionPointerTitles(memDir, indexText) {
-  const titles = [];
-  let regexes;
-  try {
-    regexes = parseMemoryRegionPointers(indexText).map(memoryGlobToRegex);
-  } catch {
-    return titles;
-  }
-  if (regexes.length === 0) return titles;
-  let referenced;
-  try {
-    referenced = parseMemoryIndex(indexText);
-  } catch {
-    referenced = new Set();
-  }
-  let files;
-  try {
-    files = readdirSync(memDir).filter((f) => f.endsWith('.md'));
-  } catch {
-    return titles;
-  }
-  for (const f of files) {
-    if (referenced.has(f)) continue; // already reachable via a direct index line
-    if (!regexes.some((re) => re.test(f))) continue; // not region-pointer-reachable
-    try {
-      const title = extractMemoryFileTitle(readFileSync(join(memDir, f), 'utf8'));
-      if (title) titles.push(title.toLowerCase());
-    } catch {
-      // one unreadable file degrades the corpus, never aborts the load
+// loadRegionPointerTitles was DELETED here (act:471941c9 part 4). It existed
+// (act:421a8ab2) to make region-pointer-reachable memory files visible to
+// dedup without a per-file index line. loadMemoryCorpus below reads EVERY
+// memory file on disk, which is a strict superset of that — including the true
+// orphan the region-pointer version deliberately skipped. Keeping both would
+// have left a live-looking function that production no longer calls.
+
+// --- Dedup against the EXISTING memory corpus (act:471941c9, part 4) ---
+//
+// The 2026-07-30 reflow drain found 74 "genuine" lessons that collapsed to 8
+// themes: each session re-learns and re-files the same disciplines, and
+// nothing stopped it. The reported cause was "dedup compares against pending
+// items, not memory". The real cause, visible in reflow's own index, is
+// narrower and worse: the memory corpus was built from MEMORY.md's INDEX
+// LINES, and a consolidated memory's index title is SLUG-DERIVED — "Lesson
+// Verification Discipline On This Platform" — while the knowledge itself lives
+// in the description tail ("a green write proves nothing") and the file body.
+// A re-learned draft ("verify every write by independent read") shares zero
+// meaningful tokens with the slug title, so the memory pass could never fire.
+//
+// So the corpus is now read from the FILES, not the index — but the two halves
+// of what it feeds are deliberately calibrated in OPPOSITE directions, because
+// measuring the obvious version killed it:
+//
+//   MEASUREMENT (2026-07-30, against the live queue). Feeding every on-disk
+//   memory title + description into the ordinary 3-token overlap pass
+//   suppressed 72% of maginnis's 134 untriaged drafts, up from 17%. Reading the
+//   matches settled it: ~2 of 14 sampled were real duplicates; the rest were
+//   topically adjacent and distinct ("Email recolor migration: freeze target
+//   hex values" blocked by "{{firm_name}} in stored email template bodies bakes
+//   at build time"). Raising the token threshold did not help — it destroyed
+//   true positives faster than false ones (30%→11% of known re-files caught
+//   while maginnis only fell 72%→30%). Normalizing to an overlap RATIO did not
+//   separate them either: over 76 known re-files and 141 presumed-novel drafts
+//   the two distributions overlap almost entirely, and the NEGATIVES score
+//   higher on median (0.38 vs 0.25) — because a consolidated theme memory is
+//   deliberately not a lexical twin of any one specimen that fed it.
+//
+//   The conclusion is the house rule this system has already paid for twice: a
+//   lexical matcher over a large corpus may PROPOSE, never silently SUPPRESS.
+//
+//   promptLines — `title — description` per memory file, plus index titles.
+//              This is where the corpus expansion actually pays: the M1b
+//              injection shows the extraction model the nearest saved memories
+//              and asks whether one covers the item, and the model is the
+//              semantic engine that CAN tell "verify every write by independent
+//              read" is covered by "verification discipline — a green write
+//              proves nothing". Before this it was shown slug-derived index
+//              titles carrying almost no content tokens, which is why reflow
+//              re-learned eight themes for four days.
+//   entries  — the suppression corpus, high-precision only. Index titles keep
+//              the calibrated OVERLAP_THRESHOLD behavior unchanged. File-
+//              derived titles and descriptions additionally require NEAR
+//              IDENTITY (MEMORY_FILE_MIN_RATIO) — the same 0.8-of-the-shorter
+//              bar mergeChunkExtractions already uses for "the same lesson
+//              worded twice", which is exactly the re-file case. Measured at
+//              that bar: 8 known re-files blocked, 2 of 141 presumed-novel
+//              drafts touched.
+//   titles   — the bare-title view kept for the existing suites and any caller
+//              that wants titles without description tails.
+//
+// Every entry carries a `label` — the memory FILE it came from — so a
+// suppression log line names the memory that blocked the draft, rather than
+// echoing a title the operator would have to go find.
+const MEMORY_INDEX_FILES = new Set(['MEMORY.md', 'MEMORY-archive.md']);
+// A description is one long sentence; five shared meaningful tokens is the
+// count floor before the ratio gate below is even consulted.
+const MEMORY_BODY_OVERLAP_THRESHOLD = 5;
+// Near-identity: shared tokens as a fraction of the SHORTER side's token count.
+const MEMORY_FILE_MIN_RATIO = 0.8;
+const MEMORY_DESCRIPTION_MAX_CHARS = 400;
+
+// A memory file's one-line description: the frontmatter `description:` value
+// when present (the /cc-remember shape), else the first real prose line —
+// skipping headings, the `_Captured:` stamp, and frontmatter fences.
+export function extractMemoryDescription(content) {
+  if (typeof content !== 'string') return null;
+  const lines = content.split('\n');
+  let inFrontmatter = false;
+  for (let i = 0; i < Math.min(lines.length, 40); i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (i === 0 && trimmed === '---') { inFrontmatter = true; continue; }
+    if (inFrontmatter) {
+      if (trimmed === '---') { inFrontmatter = false; continue; }
+      const m = trimmed.match(/^description:\s*(.+)$/i);
+      if (m) return m[1].replace(/^["']|["']$/g, '').trim().slice(0, MEMORY_DESCRIPTION_MAX_CHARS);
+      continue;
     }
+    if (!trimmed) continue;
+    if (trimmed.startsWith('#')) continue;
+    if (/^_Captured:/i.test(trimmed)) continue;
+    if (/^[-*>|]/.test(trimmed)) continue;
+    return trimmed.slice(0, MEMORY_DESCRIPTION_MAX_CHARS);
   }
-  return titles;
+  return null;
 }
 
-function loadMemoryTitles(projectPath) {
-  // Unresolved identities carry no path — no memory dir to consult; the
-  // dedup corpora degrade to empty (nullish guard, never a TypeError).
-  if (!projectPath) return [];
+// loadMemoryCorpus — { titles, entries } for one project's memory dir.
+// Fails open at every step: a missing dir, an unreadable index, or one
+// unreadable file degrades the corpus, never throws.
+export function loadMemoryCorpus(projectPath) {
+  const empty = { titles: [], entries: [], promptLines: [] };
+  // Unresolved identities carry no path — no memory dir to consult.
+  if (!projectPath) return empty;
   const encoded = projectPath.replace(/\//g, '-');
   const memDir = join(homedir(), '.claude', 'projects', encoded, 'memory');
   const indexPath = join(memDir, 'MEMORY.md');
-  if (!existsSync(indexPath)) return [];
+  if (!existsSync(indexPath)) return empty;
   let indexText;
   try {
     indexText = readFileSync(indexPath, 'utf8');
   } catch {
-    return [];
+    return empty;
   }
   let directTitles;
   try {
@@ -1327,7 +1439,70 @@ function loadMemoryTitles(projectPath) {
   } catch {
     directTitles = [];
   }
-  return [...directTitles, ...loadRegionPointerTitles(memDir, indexText)];
+
+  const titles = [];
+  const entries = [];
+  const promptLines = [];
+  const seenTitles = new Set();
+
+  // Index titles: the calibrated corpus, count-threshold only — behavior here
+  // is byte-for-byte what it was before this change.
+  for (const raw of directTitles) {
+    if (!raw) continue;
+    const t = String(raw).toLowerCase();
+    if (seenTitles.has(t)) continue;
+    seenTitles.add(t);
+    titles.push(t);
+    entries.push({ text: t, label: t });
+    promptLines.push(t);
+  }
+
+  let files = [];
+  try {
+    files = readdirSync(memDir).filter((f) => f.endsWith('.md') && !MEMORY_INDEX_FILES.has(f));
+  } catch {
+    files = [];
+  }
+  for (const f of files) {
+    let content;
+    try {
+      content = readFileSync(join(memDir, f), 'utf8');
+    } catch {
+      continue; // one unreadable file degrades the corpus, never aborts the load
+    }
+    const rawTitle = extractMemoryFileTitle(content);
+    const title = rawTitle ? rawTitle.toLowerCase() : null;
+    const description = extractMemoryDescription(content);
+    if (title && !seenTitles.has(title)) {
+      seenTitles.add(title);
+      titles.push(title);
+      // File-derived: near-identity gate. See the MEASUREMENT note above.
+      entries.push({ text: title, label: f, minRatio: MEMORY_FILE_MIN_RATIO });
+    }
+    if (description) {
+      entries.push({
+        text: description.toLowerCase(),
+        label: f,
+        threshold: MEMORY_BODY_OVERLAP_THRESHOLD,
+        minRatio: MEMORY_FILE_MIN_RATIO,
+      });
+    }
+    // The model-facing line carries BOTH — the title names the memory, the
+    // description carries the knowledge. A slug-derived title alone was the
+    // reason the novelty gate could not see what the project already knew.
+    const line = title && description ? `${title} — ${description.toLowerCase()}`
+      : title || (description ? description.toLowerCase() : null);
+    if (line) promptLines.push(line);
+  }
+  return { titles, entries, promptLines };
+}
+
+// loadMemoryTitles — the bare-string title view, for the M1b prompt injection
+// (selectNearbyMemoryTitles) and the existing suites. The dedup pass consumes
+// `loadMemoryCorpus().entries` instead, which additionally carries per-file
+// descriptions and labels.
+function loadMemoryTitles(projectPath) {
+  return loadMemoryCorpus(projectPath).titles;
 }
 
 function tokenize(text) {
@@ -1378,6 +1553,49 @@ function meaningfulTokens(text) {
   return tokenize(text).filter(t => !STOPWORDS.has(t));
 }
 
+// Tokenizing a corpus entry is pure, and the memory corpus is now file-derived
+// (act:471941c9 part 4) — on the largest project that is ~2200 entries, each
+// re-tokenized once per candidate without this. Ring 3 is a short-lived
+// process, so a plain Map is the whole cache; the size guard is a defensive
+// bound, not a working limit.
+const MEANINGFUL_TOKEN_MEMO_MAX = 20_000;
+const _meaningfulTokenMemo = new Map();
+function meaningfulTokenSet(text) {
+  if (typeof text !== 'string') return new Set();
+  let set = _meaningfulTokenMemo.get(text);
+  if (!set) {
+    set = new Set(meaningfulTokens(text));
+    if (_meaningfulTokenMemo.size < MEANINGFUL_TOKEN_MEMO_MAX) {
+      _meaningfulTokenMemo.set(text, set);
+    }
+  }
+  return set;
+}
+
+// A dedup corpus entry is either a bare string (every corpus but memory) or
+// { text, label, threshold } — the memory corpus carries the FILE it came from
+// as `label`, so a suppression names the memory that blocked the draft, and a
+// per-entry `threshold` so long prose (a description line) can require more
+// overlap than a short title without moving the global bar.
+function corpusEntryText(e) {
+  if (typeof e === 'string') return e;
+  return e && typeof e.text === 'string' ? e.text : '';
+}
+function corpusEntryLabel(e) {
+  if (typeof e === 'string') return e;
+  return (e && e.label) || corpusEntryText(e);
+}
+function corpusEntryThreshold(e) {
+  return e && typeof e.threshold === 'number' ? e.threshold : OVERLAP_THRESHOLD;
+}
+// An optional NEAR-IDENTITY gate on top of the count threshold: shared tokens
+// as a fraction of the shorter side. Entries that carry it (the file-derived
+// memory corpus) only fire on "the same thing worded twice"; entries that don't
+// keep the calibrated count-only behavior.
+function corpusEntryMinRatio(e) {
+  return e && typeof e.minRatio === 'number' ? e.minRatio : 0;
+}
+
 // isDuplicate — meaningful-token overlap dedup across all corpora (M1a).
 //
 // FIVE title/prose corpora, all matched the SAME way — whole-token overlap of
@@ -1419,9 +1637,11 @@ function isDuplicate(title, content, memoryTitles, pendingTitles,
   // tokens. (Also the empty-token guard.)
   if (allTokens.length < OVERLAP_THRESHOLD) return false;
 
-  const overlap = (other) => {
-    const otherTokens = meaningfulTokens(other);
-    return allTokens.filter(t => otherTokens.includes(t)).length;
+  const score = (other) => {
+    const otherTokens = meaningfulTokenSet(other);
+    if (otherTokens.size === 0) return { shared: 0, ratio: 0 };
+    const shared = allTokens.filter(t => otherTokens.has(t)).length;
+    return { shared, ratio: shared / Math.min(allTokens.length, otherTokens.size) };
   };
 
   const passes = [
@@ -1433,9 +1653,10 @@ function isDuplicate(title, content, memoryTitles, pendingTitles,
   ];
   for (const [corpus, entries] of passes) {
     for (const entry of (entries || [])) {
-      if (overlap(entry) >= OVERLAP_THRESHOLD) {
-        return { corpus, match: entry };
-      }
+      const { shared, ratio } = score(corpusEntryText(entry));
+      if (shared < corpusEntryThreshold(entry)) continue;
+      if (ratio < corpusEntryMinRatio(entry)) continue;
+      return { corpus, match: corpusEntryLabel(entry) };
     }
   }
   return false;
@@ -1667,7 +1888,16 @@ function threadCursorLines(threadsDir, projectSlug) {
 // -matched together. They are both whole-token-matched by isDuplicate now.
 function buildExtractionCorpora(project, { phase } = {}) {
   const tag = phase || 'lens';
-  const memoryTitles = loadMemoryTitles(project.path);
+  // act:471941c9 part 4: `memoryCorpus.entries` is what isDuplicate consumes
+  // (file-derived, labelled, per-entry thresholds); `titles` stays the bare
+  // string view the M1b prompt injection needs.
+  let memoryCorpus = { titles: [], entries: [] };
+  try {
+    memoryCorpus = loadMemoryCorpus(project.path);
+  } catch (e) {
+    logError(`${tag}: memory corpus failed (${e.message}) — continuing without it`);
+  }
+  const memoryTitles = memoryCorpus.titles;
   let cursorLines = [];
   try {
     cursorLines = threadCursorLines(
@@ -1688,7 +1918,126 @@ function buildExtractionCorpora(project, { phase } = {}) {
   } catch (e) {
     logError(`${tag}: resolution corpus failed (${e.message}) — continuing without it`);
   }
-  return { memoryTitles, threadCursorLines: cursorLines, pendingTitles, resolutionTitles };
+  return {
+    memoryTitles,
+    memoryEntries: memoryCorpus.entries,
+    memoryPromptLines: memoryCorpus.promptLines,
+    threadCursorLines: cursorLines,
+    pendingTitles,
+    resolutionTitles,
+  };
+}
+
+// --- Unmet acceptance criteria (act:86226720) --------------------------------
+//
+// The reported failure (2026-07-30): ten completion-review items arrived, one
+// per action with recent work. All ten were open/in-progress with completed=0
+// and all ten were blocked on the same external event. None closeable, none
+// ambiguous. The detector answers "did something change here" when the
+// operator needs "is something finished here."
+//
+// THE MEASUREMENT CAME FIRST, AND IT REFUTED THE PROPOSED FIX. The report
+// suggested suppressing while the action carries unchecked `- [ ]` AC lines,
+// "that signal already sits in the notes". Measured against the live queue:
+//
+//   * ZERO of the reporting ten cite an action with an unchecked box. That
+//     project writes its acceptance criteria as PROSE. The proposed mechanism
+//     does not exist in its own motivating corpus.
+//   * Portfolio-wide, only 8 of 247 completion-review items ever filed cite an
+//     action with unchecked boxes at all. Of those 8: 5 noise, 3 real
+//     completions — a 62% noise rate against a 73% baseline. The checkbox
+//     cohort is BETTER than average, so suppressing on it is mildly
+//     ANTI-predictive, the same shape act:ea23b3a5 found for confidence:high.
+//   * Every other mechanical signal measured flat: model confidence
+//     (high 20% / medium 32% / low 26% against a 26% baseline), an explicit
+//     `blocked` status (zero actions in the whole corpus use it), and an
+//     external-blocker phrase in the notes (23% vs 27%).
+//
+// THE ACTUAL GAP, found by reading the prompt: Phase 2c sends the model
+// `fid: text (status)` and nothing else. It has never been shown an action's
+// NOTES, so it has never been shown the acceptance criteria. It cannot answer
+// "is this finished" because it is not told what finished means. The report's
+// intent was right; its assumed encoding was wrong.
+//
+// So the gate reads unmet acceptance criteria HOWEVER THEY ARE EXPRESSED:
+//   arm 1 (mechanical) — unchecked `- [ ]` boxes, the literal acceptance
+//          criterion this action asks for, cheap and deterministic;
+//   arm 2 (model)      — the AC section is now included in the prompt and the
+//          model returns `ac_status` with a VERBATIM cited criterion. Only a
+//          cited `unmet` suppresses; an uncited one is not an answer.
+//
+// WHY GATING IS SAFE HERE, WHERE IT WASN'T FOR QUOTE VERIFICATION: this file's
+// own budget comment states the asymmetry — "a missed completion is
+// recoverable next session, a missed lesson is not." Phase 2c re-runs every
+// session against still-open actions, so an over-suppressed candidate returns.
+// That is why act:ea23b3a5 shipped quote verification as instrumentation only
+// and this ships as a gate.
+//
+// CALIBRATION FENCE: the act:ea23b3a5 confidence measurement is fenced to "the
+// Phase 2c confidence rubric AS WRITTEN". The confidence text below is
+// UNCHANGED, byte for byte; `ac_status` is an ADDITIONAL field. Do not reword
+// the confidence lines without re-running that measurement.
+
+// Unchecked markdown task boxes in an action's notes.
+const UNMET_AC_BOX_RE = /^[ \t]*[-*][ \t]+\[[ ]\]/m;
+const MET_AC_BOX_RE = /^[ \t]*[-*][ \t]+\[[xX]\]/m;
+
+/**
+ * Does this action's notes carry at least one UNCHECKED acceptance-criteria
+ * box? Returns false when there are no boxes at all — "no checklist" is not
+ * "unmet checklist", and treating it as such would suppress the whole corpus.
+ */
+export function hasUnmetAcceptanceCriteria(notes) {
+  if (typeof notes !== 'string' || !notes) return false;
+  return UNMET_AC_BOX_RE.test(notes);
+}
+
+/** Does this action's notes carry a checklist at all (checked or not)? */
+export function hasAcceptanceCriteriaBoxes(notes) {
+  if (typeof notes !== 'string' || !notes) return false;
+  return UNMET_AC_BOX_RE.test(notes) || MET_AC_BOX_RE.test(notes);
+}
+
+// How much of an action's notes to show the model. The AC section is what
+// matters, so prefer it; fall back to the head of the notes when no section
+// header is found. Bounded because Phase 2c sends every open action.
+const AC_EXCERPT_MAX_CHARS = 1200;
+const AC_HEADING_RE = /^#{1,6}\s*(acceptance criteria|acceptance|success criteria|definition of done)\b/im;
+
+/**
+ * Extract the acceptance-criteria excerpt to show the model for one action.
+ * Returns '' when the notes carry nothing worth sending.
+ */
+export function acceptanceCriteriaExcerpt(notes) {
+  if (typeof notes !== 'string' || !notes.trim()) return '';
+  const m = notes.match(AC_HEADING_RE);
+  if (m) {
+    const start = notes.indexOf(m[0]);
+    const rest = notes.slice(start + m[0].length);
+    // Stop at the next heading of the same-or-higher level, so one section is
+    // sent rather than the whole tail of the notes.
+    const next = rest.search(/\n#{1,6}\s+\S/);
+    const body = next === -1 ? rest : rest.slice(0, next);
+    return `${m[0]}${body}`.trim().slice(0, AC_EXCERPT_MAX_CHARS);
+  }
+  return notes.trim().slice(0, AC_EXCERPT_MAX_CHARS);
+}
+
+/**
+ * The model's acceptance-criteria verdict, normalized. Only an explicit
+ * 'unmet' carrying a non-empty verbatim citation can suppress — an uncited
+ * verdict is an assertion, not an answer, and the whole point of this gate is
+ * that the model is now being SHOWN the criteria it is judging.
+ * @returns {{status: string, criterion: string|null, suppresses: boolean}}
+ */
+export function normalizeAcVerdict(evalItem) {
+  const raw = evalItem && typeof evalItem.ac_status === 'string'
+    ? evalItem.ac_status.trim().toLowerCase() : '';
+  const status = ['met', 'unmet', 'unstated'].includes(raw) ? raw : 'unknown';
+  const criterionRaw = evalItem && typeof evalItem.ac_unmet === 'string'
+    ? evalItem.ac_unmet.trim() : '';
+  const criterion = criterionRaw.length > 0 ? criterionRaw : null;
+  return { status, criterion, suppresses: status === 'unmet' && criterion !== null };
 }
 
 // completionReviewEmitGuard — emit-time guards for Phase 2c (one call per
@@ -1719,7 +2068,29 @@ function buildExtractionCorpora(project, { phase } = {}) {
 // untouched.
 //
 // Returns { emit: true } or { emit: false, reason }.
-function completionReviewEmitGuard(fid, { statusStmt, existingItems = [], confidence = null } = {}) {
+function completionReviewEmitGuard(fid, {
+  statusStmt, existingItems = [], confidence = null,
+  unmetAcBoxes = false, acVerdict = null,
+} = {}) {
+  // Unmet acceptance criteria (act:86226720). Checked FIRST because it is the
+  // most specific answer available to "is this finished": the action itself
+  // says what finished means, and it says no. Two arms, mechanical then model
+  // — see the block comment above for why the mechanical arm alone was
+  // measured insufficient and why the model arm requires a citation.
+  if (unmetAcBoxes) {
+    return {
+      emit: false,
+      reason: 'unmet acceptance criteria — the action notes carry unchecked "- [ ]" boxes',
+      suppressed_by: 'unmet-ac-boxes',
+    };
+  }
+  if (acVerdict && acVerdict.suppresses) {
+    return {
+      emit: false,
+      reason: `unmet acceptance criteria — model cites "${acVerdict.criterion}"`,
+      suppressed_by: 'unmet-ac-model',
+    };
+  }
   if (statusStmt) {
     try {
       const row = statusStmt.get(fid);
@@ -1841,11 +2212,202 @@ export function verifyCompletionQuote(quote, transcriptJsonl) {
 }
 
 // ---------------------------------------------------------------------------
+// Bookkeeping suppression (act:471941c9, part 1)
+// ---------------------------------------------------------------------------
+//
+// A fifth of one project's 105-item extraction drain (2026-07-30) was
+// BOOKKEEPING: "decision: X merged to main at faf335e", "decision: core
+// v0.1.12 committed and merged, not yet published", "decision: skill filed as
+// act:6f79ddc4". Git and pib-db already hold those facts, more reliably and
+// with less drift — a memory draft of them is a stale cache with a triage
+// cost. The four substance classes named by the report are the four rules
+// below: a commit sha, a merge event, a version bump, a filed-as-record.
+//
+// DESIGN CONSTRAINTS, all learned the expensive way by the recall-fix program:
+//
+//  - TITLE-GATED. Every specimen in the corpus is bookkeeping *in its title*;
+//    a genuine lesson that merely MENTIONS a sha in its body is not
+//    bookkeeping. Matching on content would suppress real lessons about
+//    merges, versions, and filing — the exact over-suppression this system
+//    has already paid for once (act:3975348f).
+//  - A HEX RUN NEEDS A DIGIT. `\b[0-9a-f]{7,40}\b` alone matches ordinary
+//    English ("defaced", "cabbaged"). Requiring at least one digit removes
+//    the whole word class without weakening sha detection.
+//  - A HEX RUN NEEDS GIT CONTEXT. A bare hex token is only a commit sha when
+//    the title also talks about committing/merging/branching. Otherwise it is
+//    an id of some other kind and this rule has no opinion.
+//  - A FID NEEDS FILING GRAMMAR. "filed AS act:…" / "deferred TO new action
+//    act:…" is a record of filing. "automations skill filed and built
+//    (act:1866b723) — how Lily creates her own scheduled automations" is a
+//    real decision that happens to cite its action, and the operator KEPT it.
+//    The preposition, and the fid sitting at the very end of the title, are
+//    what separate the two.
+//
+// Returns null (not bookkeeping) or { rule, matched } — the caller logs the
+// rule name so every suppression is attributable to a named cause.
+
+// A hex run of sha length that contains at least one digit.
+const SHA_RUN_RE = /\b(?=[0-9a-f]{7,40}\b)[a-f0-9]*[0-9][0-9a-f]*\b/i;
+// Fid tokens are stripped before the sha test. An `act:29687e65` is a work-item
+// citation, not a commit — and its 8-hex tail is indistinguishable from a short
+// sha once the prefix is out of frame. Measured: leaving fids in made every
+// title that cited an action AND used the word "merge" read as a commit record,
+// including "…send-time merge is a deferred follow-up (act:29687e65)", a real
+// decision the operator kept.
+const ANY_FID_TOKEN_RE = /\b(?:act|dec|prj|grp):[0-9a-z-]{4,}/gi;
+// Words that make a hex run a COMMIT sha rather than some other identifier.
+const GIT_CONTEXT_RE = /\b(commit|commits|committed|merge|merged|merging|branch|sha|fast-forward|pushed|landed|cherry-pick|rebased?)\b/i;
+// "merged to main" — the merge-event record. PAST TENSE ONLY: "merging to main
+// requires a merge commit, not fast-forward" is a lesson ABOUT merging, and the
+// present participle is what separates the two.
+const MERGE_EVENT_RE = /\bmerged\s+(?:in)?to\s+(?:main|master|trunk)\b/i;
+// "two commits on branch mux/…" — a commit-count record with no sha in it.
+const COMMIT_COUNT_RE = /\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+commits?\s+on\s+(?:the\s+)?branch\b/i;
+// A semver-shaped version anywhere in the title.
+const VERSION_RE = /\bv?\d+\.\d+\.\d+\b/;
+// The verbs that turn a version mention into a release-bookkeeping record.
+const RELEASE_VERB_RE = /\b(bump(?:ed)?|shipped|released?|publish(?:ed)?|committed|merged|tagged)\b/i;
+// "filed as act:…", "stored in act:…", "deferred to new action act:…".
+const FILED_AS_RE = /\b(?:filed|stored|tracked|logged|queued|captured|recorded|deferred|moved|split)\s+(?:as|in|to|under)\s+(?:a\s+|the\s+|new\s+|another\s+)*(?:action\s+|item\s+|handoff\s+)?(?:act|dec|prj|grp):[0-9a-z-]{4,}/i;
+// A trailing "(act:…)" parenthetical on a title whose verb is a filing verb —
+// the other half of the filed-as shape, where the fid is the citation rather
+// than the object of the preposition.
+const TRAILING_FID_RE = /\((?:act|dec|prj|grp):[0-9a-z-]{4,}\)\s*$/i;
+// The routing PREPOSITION is required, not just the verb: "deferred TO Phase 4
+// build gate (act:…)" is a filing record; "…send-time merge is a deferred
+// follow-up (act:…)" is a real decision that cites its action, and the operator
+// kept it.
+const FILING_VERB_RE = /\b(?:filed|deferred|tracked|queued|split|moved|superseded|stored)\s+(?:as|to|in|into|under)\b/i;
+// A queue-item disposition record ("Resolve two inbox items as addressed"). The
+// QUANTIFIER is load-bearing: it separates a record of dispositioning N actual
+// items from a lesson about the mechanism ("Dismissed inbox items refile on
+// next tick — dedup only checks pending items", which the operator kept).
+const QUEUE_BOOKKEEPING_RE = /\b(?:resolve[ds]?|dismiss(?:ed)?|supersede[ds]?|flipped)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|all|the)\b[^.]{0,40}\b(?:inbox|queue)\s+items?\b/i;
+
+export function bookkeepingRule(title) {
+  if (typeof title !== 'string' || !title.trim()) return null;
+  const t = title;
+  const deFidded = t.replace(ANY_FID_TOKEN_RE, ' ');
+  if (SHA_RUN_RE.test(deFidded) && GIT_CONTEXT_RE.test(t)) {
+    return { rule: 'commit-sha', matched: (deFidded.match(SHA_RUN_RE) || [''])[0] };
+  }
+  if (MERGE_EVENT_RE.test(t)) {
+    return { rule: 'merge-event', matched: (t.match(MERGE_EVENT_RE) || [''])[0] };
+  }
+  if (COMMIT_COUNT_RE.test(t)) {
+    return { rule: 'merge-event', matched: (t.match(COMMIT_COUNT_RE) || [''])[0] };
+  }
+  if (VERSION_RE.test(t) && RELEASE_VERB_RE.test(t)) {
+    return { rule: 'version-bump', matched: (t.match(VERSION_RE) || [''])[0] };
+  }
+  if (FILED_AS_RE.test(t)) {
+    return { rule: 'filed-as-record', matched: (t.match(FILED_AS_RE) || [''])[0] };
+  }
+  if (TRAILING_FID_RE.test(t) && FILING_VERB_RE.test(t)) {
+    return { rule: 'filed-as-record', matched: (t.match(TRAILING_FID_RE) || [''])[0].trim() };
+  }
+  if (QUEUE_BOOKKEEPING_RE.test(t)) {
+    return { rule: 'queue-bookkeeping', matched: (t.match(QUEUE_BOOKKEEPING_RE) || [''])[0] };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Authority-path routing (act:471941c9, part 2)
+// ---------------------------------------------------------------------------
+//
+// A project can designate a single file as THE authority on a class of
+// knowledge — reflow makes `docs/cowork-capabilities.md` the one place
+// platform limits live, enforced by its own validator. Ring 3 was minting the
+// same facts into memory in parallel, which is precisely the drift the
+// authority file exists to prevent (4 of 10 extracted constraints had been
+// written there the day before).
+//
+// Declared in watchtower config as either a per-project or a defaults-level
+// map from extraction TYPE to a repo-relative path:
+//
+//   "authority_paths": { "constraint": "docs/cowork-capabilities.md" }
+//
+// The routing is a ROUTING, not a suppression: the item is still filed, still
+// triaged, still carries its full draft. Only its home changes — from
+// "memory" to "authority-file", with the path named in the option label so
+// the operator's one click says where it goes. Nothing is written to the
+// authority file automatically; a file with a validator behind it is not
+// something a cron job should edit.
+export function resolveAuthorityPath(config, projectName, type) {
+  if (!config || typeof type !== 'string' || !type) return null;
+  const perProject = config.projects
+    && config.projects[projectName]
+    && config.projects[projectName].authority_paths;
+  const fromDefaults = config.defaults && config.defaults.authority_paths;
+  for (const map of [perProject, fromDefaults]) {
+    if (!map || typeof map !== 'object') continue;
+    const p = map[type];
+    if (typeof p === 'string' && p.trim()) return p.trim();
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Commitment dedup — the other side of /close's sweep (act:aa554774)
+// ---------------------------------------------------------------------------
+//
+// /close now files prospective, dated obligations as ACTIONS while the
+// operator is still at the terminal (a dated commitment cannot wait in a
+// 275-item inbox). Minutes later Ring 3 processes the same transcript and
+// would extract those same commitments as inbox items — the operator's
+// explicit requirement when this was filed: "the watchtower must not create
+// duplicates of what the sweep files."
+//
+// So Phase 2d loads the actions this project created on the session's date and
+// declines to file a commitment-shaped extraction that one of them already
+// covers. The window is the session's calendar DAY, not the session itself,
+// because pib-db's `actions.created` is a date (`GLOB '????-??-??'`) with no
+// time component — coarser than ideal, and adequate: the sweep files minutes
+// before the ring runs. Sessions that cross midnight are covered by taking
+// everything created on or after the session-start date.
+//
+// This is the same seam as bookkeeping suppression (act:471941c9) from the
+// other side. Bookkeeping says "pib-db already owns this event"; this says
+// "pib-db already owns this obligation, as of ninety seconds ago."
+function loadSessionFiledActions(project, sessionStartIso) {
+  const projectPath = project && project.path;
+  if (!projectPath) return [];
+  const dbPath = join(projectPath, 'pib.db');
+  if (!existsSync(dbPath)) return [];
+  const Database = loadBetterSqlite3(projectPath);
+  if (!Database) return [];
+  // Fail OPEN at every step: a db hiccup means Ring 3 may file a duplicate the
+  // operator dismisses in a second. Failing CLOSED would mean silently
+  // dropping a commitment, which is the failure this action exists to fix.
+  let db;
+  try {
+    db = new Database(dbPath, { readonly: true, timeout: 5000 });
+  } catch (e) {
+    logError(`Phase 2d: cannot open pib.db for commitment dedup (${e.message}) — continuing without it`);
+    return [];
+  }
+  try {
+    const day = (sessionStartIso && /^\d{4}-\d{2}-\d{2}/.test(sessionStartIso))
+      ? sessionStartIso.slice(0, 10)
+      : new Date().toISOString().slice(0, 10);
+    return db.prepare(
+      "SELECT fid, text FROM actions WHERE created >= ? AND deleted_at IS NULL"
+    ).all(day);
+  } catch (e) {
+    logError(`Phase 2d: cannot query same-day actions for commitment dedup (${e.message}) — continuing without it`);
+    return [];
+  } finally {
+    try { db.close(); } catch { /* already closed or never opened cleanly */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 2d: Knowledge extraction → inbox
 // ---------------------------------------------------------------------------
 
 async function decisionExtraction(compressed, project, sessionId, transcriptPath,
-  threadIds = [], { callFn = claudeCall } = {}) {
+  threadIds = [], { callFn = claudeCall, config = null, sessionStartIso = null } = {}) {
   const projectPath = project.path;
   log('Phase 2d: Knowledge extraction');
 
@@ -1856,13 +2418,20 @@ async function decisionExtraction(compressed, project, sessionId, transcriptPath
   // tail), thread cursors are their own whole-token corpus; every builder fails
   // open. Queried by the resolved project NAME (the old basename query looked
   // up a phantom project, so dedup never matched and dups re-filed).
-  const { memoryTitles, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
-    buildExtractionCorpora(project, { phase: 'Phase 2d' });
+  const { memoryTitles, memoryEntries, memoryPromptLines, threadCursorLines: cursorLines,
+    pendingTitles, resolutionTitles } = buildExtractionCorpora(project, { phase: 'Phase 2d' });
+  // Positive confirmation, not silence: "no suppressions" must be
+  // distinguishable from "the memory corpus never loaded".
+  log(`Phase 2d: memory corpus — ${memoryTitles.length} title(s), ${memoryEntries.length} dedup entr(ies), ${memoryPromptLines.length} novelty line(s)`);
 
   const transcript = recentSlice(compressed, SINGLE_CALL_TRANSCRIPT_BUDGET);
   // M1b prefilter: the saved titles most relevant to THIS session (scored over
   // the full compressed transcript, not just the recent slice).
-  const nearbyTitles = selectNearbyMemoryTitles(memoryTitles, compressed);
+  // act:471941c9 part 4: scored over `memoryPromptLines` (title — description),
+  // not bare index titles. A consolidated memory's index title is slug-derived
+  // and carries almost no content tokens, so the old prefilter could neither
+  // FIND the relevant memory nor SHOW the model anything it could judge against.
+  const nearbyTitles = selectNearbyMemoryTitles(memoryPromptLines, compressed);
 
   // Reach 1 (act:5182beda): the id-paired sibling of pendingTitles, so a
   // model-proposed relation can resolve back to an actual pending item.
@@ -1887,6 +2456,8 @@ async function decisionExtraction(compressed, project, sessionId, transcriptPath
 - "session-record" = the fact is PERISHABLE (see PERISHABLE below) — its only durable home is the record of the session that observed it, never memory
 
 Only extract items that represent NEW knowledge — things learned or decided in this session that aren't yet captured. Skip items that are routine, obvious, or just restating existing conventions.
+
+NEVER EXTRACT BOOKKEEPING. Git and the work tracker already hold these facts, more reliably and with less drift, so a memory of them is a stale copy with a triage cost. Do not emit an item whose substance is any of: a commit sha or what landed at it; a merge event ("X merged to main"); a version bump, release, or publish record; or a record that something was filed, deferred, or tracked as an action ("filed as act:1234abcd"). If a session ALSO produced a durable lesson while doing one of those things, extract the lesson and leave the event out of it.
 
 DERIVABLE: a fact is derivable when it can be recomputed on demand from a live source rather than remembered — a memory of a derivable fact is a stale cache that goes wrong the moment reality moves on. Examples: "prod is at commit 35a5d15" (recompute: check the deploy log or git log on the remote), "the census run already executed" (recompute: check the run log or the action's status in pib-db), "invoice #1's boundary is 95.25h through July 12" (recompute: re-run the timelog query). When an item is derivable, set "derivable": true and "derivation" to a short instruction for HOW to recompute it (a command, a query, a file to check), and set "home" to "derivation". NEVER omit a derivable item from the output — it is always included, just routed to its derivation instead of memory.
 
@@ -1973,12 +2544,67 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
   let deduped = 0;
   let rescued = 0;
   let relationsProposed = 0;
+  let bookkept = 0;
+  let authorityRouted = 0;
+  let commitmentDeduped = 0;
+
+  // act:aa554774: the actions /close's commitment sweep could have filed for
+  // this session. Loaded once, outside the loop.
+  const sessionFiledActions = loadSessionFiledActions(project, sessionStartIso);
+  if (sessionFiledActions.length) {
+    log(`Phase 2d: commitment dedup — ${sessionFiledActions.length} action(s) filed on this session's date are in scope`);
+  }
 
   for (const item of extractions) {
     const fullTitle = `${item.type}: ${item.title}`;
 
+    // Bookkeeping suppression (act:471941c9 part 1) runs BEFORE dedup: an
+    // event git or pib-db already owns is not knowledge, so there is nothing
+    // for the dedup corpora to adjudicate. Logged and ledgered under its own
+    // corpus name so the rule that fired is attributable and the recall canary
+    // can see it. Note this also swallows a commitment stated inside a
+    // bookkeeping title ("v0.1.1 merged but not yet reinstalled — reinstall
+    // still owed"); that is deliberate, and the reason /close now runs a
+    // prospective-commitment sweep of its own (act:aa554774) rather than
+    // leaving dated obligations to the extraction path.
+    const bk = bookkeepingRule(fullTitle);
+    if (bk) {
+      bookkept++;
+      log(`Phase 2d: suppressed "${fullTitle}" — bookkeeping [${bk.rule}] matched "${bk.matched}" (git/pib-db already own this)`);
+      recordSuppression({
+        project: project.name, corpus: `bookkeeping:${bk.rule}`,
+        suppressed_title: fullTitle, matched_against: bk.matched,
+        session_id: sessionId, ts: reprocessTs,
+      });
+      continue;
+    }
+
+    // Commitment dedup (act:aa554774). Scoped to COMMITMENT-SHAPED items only
+    // — a pib-db-trigger home, or a title/content that trips the shared
+    // detector — because a general "does any action created today share words
+    // with this lesson" test would suppress ordinary knowledge. When it fires,
+    // the log names the action that already covers it, which is the evidence
+    // the acceptance criterion asks for.
+    if (sessionFiledActions.length) {
+      const commitmentShaped = item.home === 'pib-db-trigger'
+        || detectCommitments(`${item.title}\n${item.content || ''}`).length > 0;
+      if (commitmentShaped) {
+        const filed = findFiledCommitment(item.title, sessionFiledActions);
+        if (filed) {
+          commitmentDeduped++;
+          log(`Phase 2d: suppressed "${fullTitle}" — commitment already filed as ${filed.fid} ("${filed.text}") during this session`);
+          recordSuppression({
+            project: project.name, corpus: 'commitment-already-filed',
+            suppressed_title: fullTitle, matched_against: `${filed.fid}: ${filed.text}`,
+            session_id: sessionId, ts: reprocessTs,
+          });
+          continue;
+        }
+      }
+    }
+
     const dup = isDuplicate(
-      fullTitle, item.content || '', memoryTitles, pendingTitles,
+      fullTitle, item.content || '', memoryEntries, pendingTitles,
       { ...resolutionTitles, threadCursorLines: cursorLines });
     if (dup) {
       // M1b rescue gate: a lexical flag the model AFFIRMATIVELY judged novel is
@@ -2012,13 +2638,37 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
       const isUnclassifiable = item.type === 'unclassifiable';
       const isDerivable = item.derivable === true;
       const isPerishable = !isDerivable && item.perishable === true;
-      const home = isDerivable ? 'derivation' : isPerishable ? 'session-record' : item.home;
-      const isMemory = !isUnclassifiable && !isDerivable && !isPerishable && home === 'memory';
+      // Authority-path routing (act:471941c9 part 2). A project that has
+      // designated one file as THE authority for this knowledge class gets the
+      // item routed THERE instead of into memory — filed and triaged exactly as
+      // before, only its home and its one option label change. Applies to the
+      // memory-bound arm only: a derivable/perishable/unclassifiable item has
+      // already been routed away from memory for a stronger reason.
+      const authorityPath = (!isUnclassifiable && !isDerivable && !isPerishable
+        && (item.home === 'memory' || item.home === 'claude-md'))
+        ? resolveAuthorityPath(config, project.name, item.type)
+        : null;
+      const home = isDerivable ? 'derivation'
+        : isPerishable ? 'session-record'
+          : authorityPath ? 'authority-file'
+            : item.home;
+      const isMemory = !isUnclassifiable && !isDerivable && !isPerishable
+        && !authorityPath && home === 'memory';
 
       let options;
       let draftArtifact = null;
       let summary = item.content;
-      if (isUnclassifiable) {
+      if (authorityPath) {
+        authorityRouted++;
+        log(`Phase 2d: routed "${fullTitle}" to authority file ${authorityPath} (type "${item.type}") instead of memory`);
+        options = [
+          { key: 'route-to-authority', label: `Add to ${authorityPath}` },
+          { key: 'write', label: 'Write to memory instead' },
+          { key: 'dismiss', label: 'Dismiss' },
+        ];
+        draftArtifact = `# ${item.title}\n\n${item.content}`;
+        summary = `${item.content}\n\nAuthority for "${item.type}" in this project: ${authorityPath}`;
+      } else if (isUnclassifiable) {
         options = [
           { key: 'triage', label: 'Needs human triage' },
           { key: 'dismiss', label: 'Dismiss' },
@@ -2066,6 +2716,7 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
           ...(isDerivable ? { derivable: true, derivation: item.derivation } : {}),
           ...(isPerishable ? { perishable: true, perishes_when: item.perishes_when } : {}),
           ...(isUnclassifiable ? { unclassifiable_reason: item.unclassifiable_reason } : {}),
+          ...(authorityPath ? { authority_path: authorityPath } : {}),
         },
         options,
         draft_artifact: draftArtifact,
@@ -2100,6 +2751,9 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
     }
   }
 
+  if (bookkept > 0) log(`Phase 2d: ${bookkept} extraction(s) suppressed as bookkeeping (git/pib-db already own them)`);
+  if (commitmentDeduped > 0) log(`Phase 2d: ${commitmentDeduped} commitment(s) suppressed — already filed as actions during this session`);
+  if (authorityRouted > 0) log(`Phase 2d: ${authorityRouted} extraction(s) routed to a declared authority file instead of memory`);
   if (deduped > 0) log(`Phase 2d: ${deduped} extractions skipped (already in memory or inbox)`);
   if (rescued > 0) log(`Phase 2d: ${rescued} extraction(s) rescued from a lexical match (model judged novel)`);
   if (relationsProposed > 0) log(`Phase 2d: Reach 1 — ${relationsProposed} relation(s) proposed against the pending inbox`);
@@ -2193,7 +2847,7 @@ async function methodologyCapture(compressed, project, threadIds = []) {
     const response = await claudeCall(
       `You are checking whether a Claude Code session established a NEW reusable methodology — a new skill, convention, workflow pattern, or rule that should be codified for future sessions. Routine work, bug fixes, and using existing patterns do NOT count. Only report genuinely new methodology that was created or established in this session.
 
-VERIFICATION REQUIREMENT: a methodology only counts if the session produced a durable artifact for it — a file that was created or edited to encode the methodology (a SKILL.md, a rules file, a convention doc, a template). Merely discussing or following a pattern does not count. Name the artifact path relative to the project root.
+VERIFICATION REQUIREMENT: a methodology only counts if the session produced a durable artifact for it — a file that was created or edited to encode the methodology (a SKILL.md, a rules file, a convention doc, a template, or a test/harness file whose header documents the procedure). Merely discussing or following a pattern does not count. Name the artifact path relative to the project root.
 
 If a new methodology was established, output JSON: {"found": true, "title": "short description", "content": "what the methodology is and how to apply it", "artifact_path": "relative/path/to/the/file"}
 If nothing new was established, output JSON: {"found": false}
@@ -2637,14 +3291,14 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
     return { queued: 0 };
   }
 
-  const { memoryTitles, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
+  const { memoryEntries, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
     buildExtractionCorpora(project, { phase: 'Phase 2n' });
 
   let queued = 0;
   let suppressed = 0;
   for (const f of findings) {
     const fullTitle = `unhandled: ${f.title}`;
-    const dup = isDuplicate(fullTitle, f.summary, memoryTitles, pendingTitles,
+    const dup = isDuplicate(fullTitle, f.summary, memoryEntries, pendingTitles,
       { ...resolutionTitles, threadCursorLines: cursorLines });
     if (dup) {
       suppressed++;
@@ -2732,14 +3386,14 @@ Skill candidates are durable — they are almost never urgent. Output ONLY the J
     return { queued: 0 };
   }
 
-  const { memoryTitles, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
+  const { memoryEntries, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
     buildExtractionCorpora(project, { phase: 'Phase 2o' });
 
   let queued = 0;
   let suppressed = 0;
   for (const f of findings) {
     const fullTitle = `skill-candidate: ${f.title}`;
-    const dup = isDuplicate(fullTitle, f.summary, memoryTitles, pendingTitles,
+    const dup = isDuplicate(fullTitle, f.summary, memoryEntries, pendingTitles,
       { ...resolutionTitles, threadCursorLines: cursorLines });
     if (dup) {
       suppressed++;
@@ -3705,7 +4359,7 @@ async function main() {
 
   // Phase 2d: Decision/lesson extraction
   try {
-    const result = await decisionExtraction(compressed, project, args.sessionId, args.transcriptPath, threadIds);
+    const result = await decisionExtraction(compressed, project, args.sessionId, args.transcriptPath, threadIds, { config, sessionStartIso });
     stats.memoryWritten = result.autoWritten;
     stats.extractionsQueued = result.queued;
     stats.itemsFiled += result.queued;
@@ -4031,7 +4685,9 @@ export {
   loadMemoryTitles,
   // Dedup-hole fix (act:421a8ab2, N5 of grp:retro-remeaning)
   extractMemoryFileTitle,
-  loadRegionPointerTitles,
+  // Extraction-noise umbrella (act:471941c9) — bookkeepingRule,
+  // resolveAuthorityPath, loadMemoryCorpus, and extractMemoryDescription are
+  // exported inline at their declarations.
   // Reach 1 (act:5182beda, N3 of grp:retro-remeaning)
   selectNearbyPendingItems,
   relationKey,

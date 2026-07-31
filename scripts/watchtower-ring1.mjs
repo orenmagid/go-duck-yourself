@@ -35,6 +35,10 @@ import {
   authoredClaudeDirs, claudeChurnIsDisposable, checkMemoryReachability,
   autoReconcileItem,
 } from './watchtower-lib.mjs';
+// listItems for the dismissal-aware worktree dedup (act:6dcb8015) — the
+// pending-only corpus is what let a git-evidenced dismissal be re-litigated
+// fourteen hours later. Direct queue import, the same precedent ring2/ring3 use.
+import { listItems } from './watchtower-queue.mjs';
 import { runRoutinePass } from './watchtower-routines.mjs';
 import { analyze, resolveRoots } from './watchtower-sync.mjs';
 
@@ -1133,14 +1137,38 @@ function autoResolveWorktreeItems(projectName, projectPath) {
   }
 }
 
+// How far back a resolved/dismissed worktree item suppresses a refile of the
+// SAME branch in the SAME register. Shorter than the category's 30-day expiry
+// so an item can never leave every corpus at the moment it expires.
+const WORKTREE_DEDUP_DAYS = 14;
+
+// The empty coverage report — returned by every early exit, so a caller can
+// always distinguish "scanned, found nothing" from "never scanned".
+function emptyWorktreeCoverage(reason) {
+  return {
+    listed: 0, scanned: 0, filed: 0,
+    skipped: { bare: 0, foreign: 0, main: 0, detached: 0, unsafe_name: 0, active_window: 0 },
+    // Worktrees carrying REAL unmerged commits that were not filed because a
+    // window is open on them. Not an inbox item (someone is working there),
+    // but never silent either — this is the coverage hole act:6dcb8015 was
+    // filed for, and the whole point is that silence must not read as safety.
+    active_with_unmerged: [],
+    not_scanned_reason: reason || null,
+  };
+}
+
 function scanWorktrees(projectName, projectPath) {
-  if (!existsSync(join(projectPath, '.git'))) return [];
+  if (!existsSync(join(projectPath, '.git'))) {
+    return { orphaned: [], coverage: emptyWorktreeCoverage('no .git directory') };
+  }
 
   // Retract stale alarms before looking for new ones
   autoResolveWorktreeItems(projectName, projectPath);
 
   const wtList = safeExec('git worktree list --porcelain', { cwd: projectPath });
-  if (!wtList) return [];
+  if (!wtList) {
+    return { orphaned: [], coverage: emptyWorktreeCoverage('git worktree list failed') };
+  }
 
   const worktrees = [];
   let current = {};
@@ -1168,22 +1196,45 @@ function scanWorktrees(projectName, projectPath) {
   const exec = (cmd) => safeExec(cmd, { cwd: projectPath });
   const { compareRef, hasRemote } = resolveMainRef(exec);
   if (!hasRemote && !safeExec(`git rev-parse --verify --quiet ${compareRef}`, { cwd: projectPath })) {
-    return []; // No comparison ref at all — nothing to measure against.
+    // No comparison ref at all — nothing to measure against. Reported, not
+    // silently returned as "clean".
+    return { orphaned: [], coverage: emptyWorktreeCoverage(`no comparison ref (${compareRef})`) };
   }
 
+  const coverage = emptyWorktreeCoverage(null);
+  coverage.listed = worktrees.length;
+
+  // Activity probe, resolved ONCE per project. Two signals, cheapest-precise
+  // first (act:6dcb8015):
+  //   1. a tmux pane whose current path is inside the worktree — unambiguous,
+  //      and immune to the name collision below;
+  //   2. the window-name match this code has always used. mux names a window
+  //      from the worktree basename with the project prefix stripped, and
+  //      `tmux list-windows -a` is GLOBAL — so `reflow-internal-notes` and
+  //      `maginnis-internal-notes` both yield `internal-notes`, and a window
+  //      open in ANY desk suppresses the item in EVERY project.
+  const paneRaw = safeExec('tmux list-panes -a -F "#{pane_current_path}" 2>/dev/null');
+  const panePaths = paneRaw ? paneRaw.split('\n').map(p => p.trim()).filter(Boolean) : [];
+  const windowRaw = safeExec('tmux list-windows -a -F "#{window_name}" 2>/dev/null');
+  const windowNames = new Set(
+    windowRaw ? windowRaw.split('\n').map(w => w.trim()).filter(Boolean) : []);
+
   for (const wt of worktrees) {
-    if (wt.bare || !wt.path.startsWith(muxDir)) continue;
-    if (wt.path === projectPath) continue;
+    if (wt.bare) { coverage.skipped.bare++; continue; }
+    if (!wt.path.startsWith(muxDir)) { coverage.skipped.foreign++; continue; }
+    if (wt.path === projectPath) { coverage.skipped.main++; continue; }
     // Detached / branch-less worktree — no branch to content-compare. Skip
     // rather than let the merge-tree call fail toward flagging an
     // "undefined"-branch worktree (act:a152cf6c).
-    if (!wt.branch) continue;
+    if (!wt.branch) { coverage.skipped.detached++; continue; }
     // worktree-list output is git-controlled but the NAME is repo-author
     // data — same interpolation gate as every other branch-name path.
     if (!isSafeRefName(wt.branch)) {
+      coverage.skipped.unsafe_name++;
       logError(`scanWorktrees ${projectPath}: skipping unsafe branch name ${JSON.stringify(wt.branch)}`);
       continue;
     }
+    coverage.scanned++;
 
     // Flag on CONTENT, not ahead-count: a squash-merged branch is a
     // non-ancestor with phantom "ahead" commits but no real unmerged content
@@ -1198,12 +1249,26 @@ function scanWorktrees(projectName, projectPath) {
 
     if (!unmerged && uncommittedCount === 0) continue;
 
-    // Check if there's an active tmux window for this worktree
+    // Is somebody working in this worktree right now? A pane sitting inside it
+    // is proof; a matching window name is a weaker, collision-prone signal
+    // kept for compatibility (see the probe comment above).
     const windowName = basename(wt.path).replace(/^[^-]+-/, '');
-    const tmuxWindows = safeExec('tmux list-windows -a -F "#{window_name}" 2>/dev/null');
-    const hasWindow = tmuxWindows && tmuxWindows.split('\n').some(w => w.trim() === windowName);
+    const hasPane = panePaths.some(p => p === wt.path || p.startsWith(`${wt.path}/`));
+    const hasWindow = hasPane || windowNames.has(windowName);
 
-    if (hasWindow) continue; // Active window exists, not orphaned
+    if (hasWindow) {
+      // An active worktree is not orphaned, so it does not become an inbox
+      // item — nagging about work in progress is the noise this check exists
+      // to prevent. But REAL UNMERGED COMMITS behind an open window are
+      // exactly the coverage hole this action was filed for: a six-commit
+      // branch sat unreported for days while a one-commit branch nagged,
+      // because this `continue` was silent. It is no longer silent.
+      coverage.skipped.active_window++;
+      if (unmerged) {
+        coverage.active_with_unmerged.push({ branch: wt.branch, path: wt.path, ahead });
+      }
+      continue;
+    }
 
     orphaned.push({
       path: wt.path,
@@ -1222,8 +1287,20 @@ function scanWorktrees(projectName, projectPath) {
   for (const wt of orphaned) {
     fileOrphanedWorktreeItem(projectName, projectPath, wt);
   }
+  coverage.filed = orphaned.length;
 
-  return orphaned;
+  // POSITIVE CONFIRMATION (act:6dcb8015). "No worktree warnings" must be
+  // distinguishable from "the scan never ran" — the findings-are-not-a-
+  // coverage-map failure, mechanized: a partial warning reads as a complete
+  // answer, so the operator treats everything unflagged as safe.
+  log(`Worktree coverage ${projectName}: checked ${coverage.scanned} of ${coverage.listed} listed `
+    + `(${coverage.filed} filed, ${coverage.skipped.active_window} active, `
+    + `${coverage.skipped.foreign} outside the mux dir, ${coverage.skipped.detached} detached)`);
+  for (const w of coverage.active_with_unmerged) {
+    log(`Worktree coverage ${projectName}: "${w.branch}" has ${w.ahead} unmerged commit(s) but an open window — surfaced, not filed`);
+  }
+
+  return { orphaned, coverage };
 }
 
 // Files (or re-registers) the inbox item for one orphaned worktree.
@@ -1250,6 +1327,59 @@ function fileOrphanedWorktreeItem(projectName, projectPath, wt) {
       item.evidence?.branch === wt.branch &&
       item.evidence?.worktree_path === wt.path
     );
+
+    // DISMISSAL IS SUPPRESSION INPUT (act:6dcb8015, the 2026-07-30 evidence).
+    //
+    // The dedup above consults PENDING items only, so a dismissal removed the
+    // item from the corpus and the next tick filed it again. Measured on the
+    // live queue: dec-1d7706dd ("Orphaned worktree mux/…-w-12 has uncommitted
+    // files") was dismissed 2026-07-29T23:05:39 after the operator verified by
+    // hand that the branch was an ancestor of main; dec-59afb639 refiled the
+    // BYTE-IDENTICAL title 2026-07-30T13:16:46. Five branches, same shape,
+    // same drain. That is Detector Symmetry §2's named failure — the one
+    // completion-review already fixed and this detector did not.
+    //
+    // Why it matters more than the noise: a detector that re-litigates a
+    // dismissal carrying first-hand git evidence teaches the operator to stop
+    // reading the category, and that is how a genuinely unmerged branch gets
+    // missed later.
+    //
+    // The suppression is CONDITIONAL ON UNCHANGED STATE. A register escalation
+    // (a merged-but-dirty worktree that later gains real unmerged commits)
+    // files regardless of any dismissal — a dismissal answers the question it
+    // was asked, not every future question about the same branch.
+    if (!match) {
+      const since = new Date(Date.now() - WORKTREE_DEDUP_DAYS * 24 * 60 * 60 * 1000).toISOString();
+      let recentlyClosed = [];
+      try {
+        recentlyClosed = listItems({
+          category: 'worktree-unmerged',
+          // `expired` and `superseded` included for the same reason
+          // completion-review needs them: an item that leaves every corpus at
+          // the moment it expires refiles forever.
+          statuses: ['resolved', 'dismissed', 'expired', 'superseded'],
+          since,
+        });
+      } catch (e) {
+        // FAIL OPEN — a corpus hiccup costs one re-filed item, never a
+        // silently dropped warning about real unmerged work.
+        logError(`worktree dedup: could not load recently-closed items (${e.message}) — failing open`);
+      }
+      const closedMatch = recentlyClosed.find(item =>
+        item.evidence?.branch === wt.branch
+        && item.evidence?.worktree_path === wt.path
+        // Same register, i.e. the same question. `unmerged` is absent on
+        // pre-split items, which read as the alarming register (matching the
+        // render-site fail-toward-alarm default).
+        && (item.evidence?.unmerged !== false) === fresh
+      );
+      if (closedMatch) {
+        log(`Worktree "${wt.branch}": not refiling — ${closedMatch.status} as ${closedMatch.id} on `
+          + `${String(closedMatch.resolved_at || closedMatch.filed_at).slice(0, 10)} and the state is unchanged `
+          + `(${fresh ? 'unmerged work' : 'uncommitted files only'})`);
+        return;
+      }
+    }
     if (match) {
       const filedRegister = match.evidence?.unmerged !== false;
       if (filedRegister === fresh) return; // duplicate, same register
@@ -1711,6 +1841,41 @@ export function renderRosterEntries(metrics, cap = ROSTER_NAME_RENDER_CAP) {
   return lines;
 }
 
+// Render the worktree-coverage Standing Issues entries (act:6dcb8015).
+//
+// Two lines at most, and only when they carry information:
+//   1. the coverage count — "checked N of M worktrees" — so silence is
+//      distinguishable from not-scanned. Suppressed when there is nothing to
+//      scan, because a permanent "checked 0 of 0" is furniture by the third
+//      read (the same reasoning that made the roster metrics render on change).
+//   2. any worktree carrying REAL unmerged commits that was not filed because
+//      a window is open on it. This is the reported coverage hole: a
+//      six-commit branch never surfaced while a one-commit branch nagged for
+//      days, because the active-window skip was silent.
+//
+// Exported for the hermetic suite.
+function renderWorktreeCoverage(coverage) {
+  if (!coverage || typeof coverage !== 'object') return [];
+  const lines = [];
+  if (coverage.not_scanned_reason) {
+    return [`Worktree scan did NOT run: ${coverage.not_scanned_reason}`];
+  }
+  if (coverage.scanned > 0 || coverage.listed > 0) {
+    const parts = [`checked ${coverage.scanned} of ${coverage.listed} worktree(s)`];
+    if (coverage.filed > 0) parts.push(`${coverage.filed} flagged`);
+    if (coverage.skipped && coverage.skipped.active_window > 0) {
+      parts.push(`${coverage.skipped.active_window} in active use`);
+    }
+    lines.push(`Worktree coverage: ${parts.join(', ')}`);
+  }
+  for (const w of (coverage.active_with_unmerged || [])) {
+    lines.push(
+      `Worktree "${w.branch}" has ${w.ahead} unmerged commit(s) but an open window `
+      + '— not filed as an inbox item while it is in use, but it is NOT merged');
+  }
+  return lines;
+}
+
 function assembleProjectState(ps) {
   const now = new Date().toISOString();
   const lines = [];
@@ -1797,6 +1962,10 @@ function assembleProjectState(ps) {
   // items: a count describes a condition, it doesn't ask the operator to
   // decide anything. Rendered on CHANGE only; see renderRosterEntries.
   for (const line of renderRosterEntries(ps.roster)) issues.push(line);
+  // Worktree scan coverage (act:6dcb8015) — ambient state, so it lives here
+  // rather than in the queue. A partial warning reads as a complete answer, so
+  // "no worktree warnings" must be distinguishable from "the scan never ran".
+  for (const line of renderWorktreeCoverage(ps.worktreeCoverage)) issues.push(line);
   if (ps.divergedBranches && ps.divergedBranches.length > 0) {
     issues.push(`Diverged branches: ${ps.divergedBranches.join(', ')}`);
   }
@@ -1948,7 +2117,9 @@ function main() {
       }
 
       // Worktree scan — find orphaned worktrees with unmerged work
-      ps.orphanedWorktrees = scanWorktrees(name, projectPath);
+      const wtScan = scanWorktrees(name, projectPath);
+      ps.orphanedWorktrees = wtScan.orphaned;
+      ps.worktreeCoverage = wtScan.coverage;
 
       // Consumer hooks
       const hooks = config.hooks?.['ring1-post-collect'] || [];
@@ -2080,7 +2251,7 @@ function main() {
 // pure given an injectable `exec` — the inline call sites bind safeExec to a
 // cwd; the tests bind a runner against a temp git repo (act:6f36cbe2,
 // act:a136b362).
-export { resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState, branchExclusionMatcher, DEFAULT_LONG_LIVED_BRANCHES, createBranchDivergedItem, autoResolveBranchDivergedItems, autoResolveWorktreeItems, autoReconcileCompletionReviews, autoReconcilePendingRelations, autoReconcileSignificanceItems, fileOrphanedWorktreeItem, isSafeRefName };
+export { renderWorktreeCoverage, resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState, branchExclusionMatcher, DEFAULT_LONG_LIVED_BRANCHES, createBranchDivergedItem, autoResolveBranchDivergedItems, autoResolveWorktreeItems, autoReconcileCompletionReviews, autoReconcilePendingRelations, autoReconcileSignificanceItems, fileOrphanedWorktreeItem, isSafeRefName };
 
 // Entry guard so tests (and other modules) can import this file's pure
 // helpers without executing main(). realpathSync matters: node

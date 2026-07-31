@@ -78,9 +78,15 @@ function generateId() {
 // Best-effort removal of the mux dispatch-queue descriptor(s) for an item —
 // both the queued copy and the in-flight copy, across every desk dir (desk
 // names differ from project names, so we sweep rather than guess). Never
-// throws: a routing-cleanup failure must not block a gate exit. The ·N badge
-// is recomputed by mux on its next mutation/desk-open, so a deletion here is
-// picked up without tmux involvement.
+// throws: a routing-cleanup failure must not block a gate exit.
+//
+// No tmux involvement, deliberately — this runs from cron and headless gate
+// exits. mux owns re-projecting the ·N badge and reconciles it against this
+// dir on every `mux qa` verb, on desk open, and on every window switch (its
+// after-select-window hook). An earlier version of this comment claimed the
+// badge was picked up "on mux's next mutation", which was the false premise
+// behind act:ca6a19a0 — a mutation mux never makes never arrives, and a desk
+// showed a stale ·2 over an emptied queue for ~40 minutes.
 function clearDispatchEntries(item) {
   try {
     // item.id comes from disk CONTENT (which can differ from the gated
@@ -518,6 +524,56 @@ export function isHighConfidenceSignoff(item) {
   return true;
 }
 
+// --- Classification pass at scale (act:471941c9, part 5) ---
+//
+// The batch-signoff predicate is deliberately conservative, which is right when
+// the individual set is small and wrong when it is enormous. On 2026-07-30 it
+// routed 105 of 110 knowledge items into "needs a human look" and the surface
+// offered a 5-item batch against a 145-item pile — a remedy shaped for a
+// problem the operator did not have. What actually cleared the queue was a
+// CLASSIFICATION PASS: group by shape, propose one disposition per group. The
+// operator had to ask for it in so many words ("I am not going to look at them
+// one at a time. You're intelligent, right?"), so it becomes the offered path
+// rather than something they have to think of.
+//
+// The threshold is the point where a per-item walk stops being a real offer.
+export const INBOX_CLASSIFICATION_THRESHOLD = 30;
+
+/**
+ * Group items by SHAPE for a classification pass — the unit the operator
+ * dispositions when the individual set is too large to walk. Shape is the
+ * tuple a single decision can reasonably span: category, the extraction type
+ * and routing home when present, and urgency.
+ *
+ * Pure read helper — no writes, no I/O. Returns groups sorted largest-first, so
+ * the biggest win is the first decision offered.
+ * @param {Array} items
+ * @returns {Array<{key: string, label: string, category: string, type: string|null, home: string|null, urgency: string, items: Array}>}
+ */
+export function groupItemsByShape(items) {
+  const groups = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== 'object') continue;
+    const category = item.category || 'uncategorized';
+    const ev = item.evidence || {};
+    const type = typeof ev.type === 'string' ? ev.type : null;
+    const home = typeof ev.home === 'string' ? ev.home : null;
+    const urgency = item.urgency || 'normal';
+    const key = [category, type || '-', home || '-', urgency].join('|');
+    if (!groups.has(key)) {
+      const parts = [category];
+      if (type) parts.push(type);
+      if (home) parts.push(`→ ${home}`);
+      if (urgency !== 'normal') parts.push(urgency);
+      groups.set(key, {
+        key, label: parts.join(' · '), category, type, home, urgency, items: [],
+      });
+    }
+    groups.get(key).items.push(item);
+  }
+  return [...groups.values()].sort((a, b) => b.items.length - a.items.length);
+}
+
 /**
  * Partition pending items into the high-confidence sign-off set (eligible for
  * a one-shot batch approval) and the individual set (everything that wants a
@@ -554,6 +610,18 @@ export function partitionForBatchSignoff(items) {
 //     criterion). The annotation persists after its partner resolves — a
 //     draft whose twin was already dispositioned still wants a human look,
 //     not a batch sign-off.
+//
+//     STRICTLY PAIRWISE — NEVER CHAIN THESE (act:471941c9). This field is a
+//     claim about ONE pair. Similarity is not transitive: taking the
+//     transitive closure of these flags on 2026-07-30 produced a single
+//     70-item "cluster" of entirely unrelated drafts. If you want a group,
+//     read `evidence.duplicate_cluster` — computed once at detection time
+//     with size and density bounds, and explicitly null when the component
+//     is a hub artifact rather than a real group.
+//
+//   evidence.duplicate_cluster = {id, size, members} | null
+//   evidence.duplicate_cluster_rejected = 'oversized' | 'chained'   (when null)
+//     The cohesive-group view of the same pairs — see buildFoldClusters.
 //
 // The sibling `evidence.freshness` annotation (a draft citing a now-closed
 // act: fid, demoted as "possibly overtaken") was RETIRED (act:471dd701, N2
@@ -697,6 +765,109 @@ export function proposeFolds(items, { threshold = FOLD_SIMILARITY_THRESHOLD } = 
   return pairs;
 }
 
+// --- Cluster-safe duplicate flags (act:471941c9, part 3) ---
+//
+// `evidence.possible_duplicate_of` is STRICTLY PAIRWISE. It says "this draft
+// and that draft look alike"; it does NOT say "these drafts form a group", and
+// the two are not the same claim. On 2026-07-30 a consumer took the transitive
+// closure of 75 pairwise flags and got a single 70-item "cluster" whose members
+// were about a stub-Notion harness, token metering, a count-check design, and
+// batch verification — entirely unrelated. Every individual pair was
+// defensible. Chained, they were meaningless, because similarity is not
+// transitive and a few hub drafts connect everything to everything.
+//
+// So the cluster is computed ONCE, here, at detection time — and a component
+// only becomes a cluster if it is actually cohesive:
+//
+//   - SIZE BOUND. A component above FOLD_CLUSTER_MAX_SIZE is a hub artifact,
+//     not a group a human can act on in one decision.
+//   - DENSITY BOUND. A component must be a near-clique: at least
+//     FOLD_CLUSTER_MIN_DENSITY of its possible member pairs must ACTUALLY have
+//     been proposed. A chain (a–b, b–c, c–d …) has density approaching zero as
+//     it grows, which is exactly how the 70-item blob formed, so a chain can
+//     never present itself as a cluster.
+//
+// A rejected component still keeps its pairwise flags — nothing is lost, the
+// item still demotes out of batch sign-off. It simply carries an explicit
+// `duplicate_cluster: null` with a reason, so a consumer reading the field sees
+// "no cluster here" rather than being tempted to build one.
+export const FOLD_CLUSTER_MAX_SIZE = 6;
+export const FOLD_CLUSTER_MIN_DENSITY = 0.6;
+
+/**
+ * Group fold pairs into cohesive clusters. Pure — no I/O.
+ *
+ * Returns a Map from item id to a cluster annotation:
+ *   { cluster: {id, size, members} }            — cohesive component
+ *   { cluster: null, rejected: 'oversized' }    — component beyond the size bound
+ *   { cluster: null, rejected: 'chained' }      — component below the density bound
+ *
+ * The cluster id is derived from sorted membership, so the same group of drafts
+ * always produces the same id across sweeps without any stored counter.
+ * @param {Array<{a: string, b: string}>} pairs
+ * @param {object} [opts]
+ * @returns {Map<string, {cluster: object|null, rejected?: string}>}
+ */
+export function buildFoldClusters(pairs, {
+  maxSize = FOLD_CLUSTER_MAX_SIZE,
+  minDensity = FOLD_CLUSTER_MIN_DENSITY,
+} = {}) {
+  const out = new Map();
+  const adjacency = new Map();
+  const pairKeys = new Set();
+  for (const p of Array.isArray(pairs) ? pairs : []) {
+    if (!p || typeof p.a !== 'string' || typeof p.b !== 'string' || p.a === p.b) continue;
+    if (!adjacency.has(p.a)) adjacency.set(p.a, new Set());
+    if (!adjacency.has(p.b)) adjacency.set(p.b, new Set());
+    adjacency.get(p.a).add(p.b);
+    adjacency.get(p.b).add(p.a);
+    pairKeys.add([p.a, p.b].sort().join('|'));
+  }
+
+  const seen = new Set();
+  for (const start of adjacency.keys()) {
+    if (seen.has(start)) continue;
+    // Connected component by breadth-first walk — the SAME transitive closure
+    // the consumer took by hand. Computing it here is what lets us judge it.
+    const component = [];
+    const queue = [start];
+    seen.add(start);
+    while (queue.length) {
+      const node = queue.shift();
+      component.push(node);
+      for (const next of adjacency.get(node) || []) {
+        if (seen.has(next)) continue;
+        seen.add(next);
+        queue.push(next);
+      }
+    }
+    const members = component.sort();
+    if (members.length > maxSize) {
+      for (const id of members) out.set(id, { cluster: null, rejected: 'oversized' });
+      continue;
+    }
+    const possible = (members.length * (members.length - 1)) / 2;
+    let actual = 0;
+    for (let i = 0; i < members.length; i++) {
+      for (let j = i + 1; j < members.length; j++) {
+        if (pairKeys.has([members[i], members[j]].sort().join('|'))) actual++;
+      }
+    }
+    const density = possible === 0 ? 0 : actual / possible;
+    if (density < minDensity) {
+      for (const id of members) out.set(id, { cluster: null, rejected: 'chained' });
+      continue;
+    }
+    const cluster = {
+      id: `fold:${members[0]}+${members.length}`,
+      size: members.length,
+      members,
+    };
+    for (const id of members) out.set(id, { cluster });
+  }
+  return out;
+}
+
 /**
  * Merge ADDITIVE annotation fields into a PENDING item's evidence.
  * The write discipline (every clause is load-bearing):
@@ -771,8 +942,10 @@ export function buildQaPickupPrompt(item, mergedCommit) {
 // dispatch queue dir — fs-only on purpose: this runs from whatever context
 // called markHandoffMerged (possibly cron), where mux/tmux/python3 may be off
 // PATH (the routines library shells mux and degrades; here the enqueue file IS
-// the contract — `mux qa drain` reads the desk dir, and the ·N badge recomputes
-// on mux's next mutation/desk-open). Never throws; returns a status the caller
+// the contract — `mux qa drain` reads the desk dir, and mux reconciles the ·N
+// badge against it on every `mux qa` verb, on desk open, and on every window
+// switch; see clearDispatchEntries for why "on mux's next mutation" was not
+// good enough). Never throws; returns a status the caller
 // records in evidence so a failed dispatch re-triggers by STATE on the next
 // markHandoffMerged call, not lost to a write-skip:
 //   'dispatched'        — descriptor written (or already queued: idempotent)
