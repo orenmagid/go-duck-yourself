@@ -1317,6 +1317,69 @@ export function patternHasRequiredShape(body) {
     && body.includes('**Gap:**');
 }
 
+// The hole act:02e21a69 found in the gate above, and it is one line wide: it
+// checks that a **Gap:** block EXISTS, not that it ASSERTS a gap. Phase 2e's
+// generation-side exclusions already name "no-gap positives" as never-patterns
+// — the prompt says the right thing and the mechanical gate did not enforce
+// it. Per maintainability.md §Prefer Structural Prevention Over Detection, the
+// gate is the correct layer.
+//
+// The live specimen that shipped as a promotion says so in its own body:
+//   **Gap:** No gap — this is positive practice worth reinforcing.
+//
+// Scope is deliberately narrow: EMPTY, or an OPENING that negates a gap. A
+// pattern whose gap is real but awkwardly worded still passes — this rejects
+// the self-declared non-gap, not prose it disagrees with. Anything subtler
+// (an observation of something that went RIGHT, filed without saying so) is
+// not mechanically detectable and stays a human call at consolidation time.
+const GAP_BLOCK_MARKER = '**Gap:**';
+// Matched against the block's opening only (leading punctuation stripped), so
+// "No gap — this is positive practice" is caught while "No harm comes from X,
+// but the gap is Y" — which OPENS on a negation of something else — is not.
+//
+// CALIBRATED, not guessed. Run against the live 2432-section audit-patterns
+// corpus (2275 of which pass the older shape gate), this list rejects 12, and
+// all 12 read "No gap …" / "Not a gap …" in their own words. A first draft
+// that also listed `nothing` rejected a 13th — a REAL gap whose block opened
+// on a quotation ("Nothing is actively running on my side" and "the session
+// work is complete" are different claims) — so `nothing` was measured out
+// rather than kept on intuition.
+//
+// Three of the 12 read "No gap in this instance, but the pattern worth noting
+// is …". Those are borderline and are rejected DELIBERATELY: the promotion
+// question is whether this is a behavioral gap worth writing into a cabinet
+// member, and a body that opens by saying there isn't one has answered it.
+const GAP_NEGATION_RE = /^(no gaps?\b|none\b|n\/?a\b|not a gap\b|positive practice\b)/;
+const GAP_OPENING_CHARS = 60;
+
+// Pure: the text of the **Gap:** block — everything after the marker up to the
+// next bold block label or a blank line. Exported for the hermetic suite.
+export function extractGapBlock(body) {
+  if (typeof body !== 'string') return null;
+  const i = body.indexOf(GAP_BLOCK_MARKER);
+  if (i === -1) return null;
+  const rest = body.slice(i + GAP_BLOCK_MARKER.length);
+  const out = [];
+  for (const line of rest.split('\n')) {
+    // A blank line or the next `**Label:**` block ends this one. The blank-line
+    // stop only applies once content has been collected, so a Gap block whose
+    // text starts on the FOLLOWING line is still read.
+    if (/^\s*\*\*[^*]+:\*\*/.test(line)) break;
+    if (!line.trim()) { if (out.length) break; continue; }
+    out.push(line.trim());
+  }
+  return out.join(' ').trim();
+}
+
+// Pure: does the Gap block actually assert a gap? Exported for the suite.
+export function gapBlockAssertsGap(body) {
+  const gap = extractGapBlock(body);
+  if (gap === null) return false;   // no block at all — the older gate's job
+  if (!gap) return false;           // present but empty
+  const opening = gap.toLowerCase().replace(/^[^a-z0-9]+/, '').slice(0, GAP_OPENING_CHARS);
+  return !GAP_NEGATION_RE.test(opening);
+}
+
 // Freshness boundary for pattern filing (the backlog-drain guard,
 // 2026-07-29). scanAuditPatterns consumes an APPEND-ONLY corpus
 // (audit-patterns.md) whose unprocessed tail can hold months of content:
@@ -1487,6 +1550,13 @@ export async function scanAuditPatterns(config, deps = {}) {
   log(`Slow: routing ${batch.length} of ${freshPatterns.length} new audit patterns`);
 
   let rejectedMalformed = 0;
+  let rejectedGapNegating = 0;
+  // The gap-assertion arm is an opt-OUT (`!== false`), unlike the two dedup
+  // corpora it ships beside: this is a defect fix to a gate that already
+  // rejects on shape, calibrated against the live corpus, and shipping it off
+  // by default would leave the hole open. The flag exists so it can be turned
+  // OFF if it ever over-rejects, not so it has to be turned on.
+  const gapAssertionGate = config?.defaults?.pattern_gap_assertion !== false;
   for (const pattern of batch) {
     try {
       // Shape gate (act:09184ad7): reject BEFORE routing, so a document echo
@@ -1498,6 +1568,18 @@ export async function scanAuditPatterns(config, deps = {}) {
         rejectedMalformed++;
         processedSet.add(pattern.hash);
         log(`Slow: pattern rejected (missing Evidence/Gap shape): ${pattern.title.slice(0, 60)}`);
+        continue;
+      }
+
+      // Gap-assertion arm (act:02e21a69): the block is present but empty, or
+      // opens by denying there is a gap at all. Counted into the same totals
+      // as the shape rejections AND into its own pair, so the new arm's rate
+      // is measurable separately from the arm it extends.
+      if (gapAssertionGate && !gapBlockAssertsGap(pattern.body)) {
+        rejectedMalformed++;
+        rejectedGapNegating++;
+        processedSet.add(pattern.hash);
+        log(`Slow: pattern rejected (Gap block asserts no gap): ${pattern.title.slice(0, 60)}`);
         continue;
       }
 
@@ -1547,12 +1629,16 @@ export async function scanAuditPatterns(config, deps = {}) {
   state.processed_hashes = [...processedSet];
   state.rejected_malformed_total = (state.rejected_malformed_total || 0) + rejectedMalformed;
   state.last_scan_rejected = rejectedMalformed;
+  state.rejected_gap_negating_total =
+    (state.rejected_gap_negating_total || 0) + rejectedGapNegating;
+  state.last_scan_rejected_gap_negating = rejectedGapNegating;
   state.skipped_stale_total = (state.skipped_stale_total || 0) + skippedStale;
   state.last_scan_skipped_stale = skippedStale;
   atomicWrite(statePath, JSON.stringify(state, null, 2));
   if (rejectedMalformed > 0) {
     log(`Slow: ${rejectedMalformed} malformed pattern(s) rejected this scan `
-      + `(${state.rejected_malformed_total} total since install)`);
+      + `(${rejectedGapNegating} for asserting no gap; `
+      + `${state.rejected_malformed_total} total since install)`);
   }
 }
 

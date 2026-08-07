@@ -226,7 +226,8 @@ Commands:
   query "SQL"                       Run a SQL query
   create-action "text" [--projectFid X] [--area X] [--due X] [--notes X]  Create an action
   list-actions [--status X] [--project X]  List actions (default: open)
-  update-action <fid> [--status X] [--text X] [--tags X] [--notes X]
+  update-action <fid> [--status X] [--text X] [--tags X] [--notes X] [--projectFid prj:X]
+                                    (--projectFid reparents; the target project must exist)
   complete-action <fid>             Mark action complete (status=done)
   defer-with-trigger <fid> --trigger "<text>" [--cascade]
                                     Defer with a return condition

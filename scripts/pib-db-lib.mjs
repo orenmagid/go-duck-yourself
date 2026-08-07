@@ -311,7 +311,7 @@ export function listActions(db, { status, project } = {}) {
   return { rows };
 }
 
-export function updateAction(db, { fid, status, text, tags, notes, due, flagged, client_title, client_body, client_generated_at, client_generated_status }) {
+export function updateAction(db, { fid, status, text, tags, notes, due, flagged, projectFid, client_title, client_body, client_generated_at, client_generated_status }) {
   const sets = [];
   const params = [];
 
@@ -321,6 +321,16 @@ export function updateAction(db, { fid, status, text, tags, notes, due, flagged,
   if (notes !== undefined) { sets.push('notes = ?'); params.push(notes); }
   if (due !== undefined) { sets.push('due = ?'); params.push(due); }
   if (flagged !== undefined) { sets.push('flagged = ?'); params.push(flagged === 'true' || flagged === '1' || flagged === true ? 1 : 0); }
+  if (projectFid !== undefined) {
+    // Reparent. The target project must exist — never silently accept a bogus
+    // fid the way create-action's snake_case project_fid was silently dropped
+    // (act:5a2f1f38), which is how actions ended up orphaned to begin with.
+    const proj = db.prepare('SELECT fid FROM projects WHERE fid = ? AND deleted_at IS NULL').get(projectFid);
+    if (!proj) {
+      return { error: { message: `Cannot reparent ${fid}: project ${projectFid} does not exist (or is deleted). Pass an existing project fid.` } };
+    }
+    sets.push('project_fid = ?'); params.push(projectFid);
+  }
   if (client_title !== undefined) { sets.push('client_title = ?'); params.push(client_title || null); }
   if (client_body !== undefined) { sets.push('client_body = ?'); params.push(client_body || null); }
   if (client_generated_at !== undefined) { sets.push('client_generated_at = ?'); params.push(client_generated_at || null); }
@@ -337,7 +347,7 @@ export function updateAction(db, { fid, status, text, tags, notes, due, flagged,
   }
 
   if (sets.length === 0) {
-    return { error: { message: 'No fields to update. Use status, text, tags, notes, due, flagged, client_title, client_body, client_generated_at, or client_generated_status.' } };
+    return { error: { message: 'No fields to update. Use status, text, tags, notes, due, flagged, projectFid, client_title, client_body, client_generated_at, or client_generated_status.' } };
   }
 
   params.push(fid);

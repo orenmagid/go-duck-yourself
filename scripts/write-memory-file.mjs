@@ -126,9 +126,44 @@ function extractFirstLine(text) {
 }
 
 /**
+ * Region-pointer coverage check (act:ea61631f).
+ *
+ * The memory-lifecycle contract says reachability is satisfied by EITHER a
+ * direct index line OR a region pointer whose glob matches the file — and that
+ * region pointers are the mechanism that keeps the eagerly-loaded working set
+ * bounded while total memory grows without limit. Writing an index line for a
+ * file a pointer already covers therefore adds bytes to the session-start
+ * budget and buys no reachability at all.
+ *
+ * Measured cost of not doing this: a 129-draft bulk keep would have appended
+ * ~129 lines (~15KB) to a MEMORY.md already at 18,794 of its 25,000-byte
+ * budget — the prescribed bulk sign-off path breaking at exactly the scale it
+ * exists for. A second desk independently hit the same wall with 192 bytes of
+ * headroom and reached the same bypass. Two sessions inventing the same
+ * workaround is the signal the writer is wrong, not the callers.
+ *
+ * The rule is OWNED by validate-memory.mjs (the validator that enforces it);
+ * this consults it rather than growing a second copy. Both files ship in the
+ * memory module and install side by side, so the import always resolves. If it
+ * ever does not, fail OPEN and write the index line — an extra line costs
+ * bytes, a missing one costs reachability, and only one of those loses a memory.
+ */
+function regionPointerCovers(indexBody, fileName) {
+  try {
+    const vm = require('./validate-memory.mjs');
+    if (typeof vm.parseRegionPointers !== 'function' || typeof vm.globToRegex !== 'function') return false;
+    return vm.parseRegionPointers(indexBody)
+      .some((p) => vm.globToRegex(p.glob).test(fileName));
+  } catch {
+    return false; // fail open — write the line
+  }
+}
+
+/**
  * Add an entry for `fileName` to MEMORY.md's curated-entries section.
- * Creates the section if absent. If the file is already indexed
- * anywhere (Topic files OR Curated entries section), no-op.
+ * Creates the section if absent. No-op when the file is already indexed
+ * anywhere (Topic files OR Curated entries section), or when an existing
+ * region pointer's glob already covers it.
  *
  * Returns true if MEMORY.md was modified, false if no change needed.
  */
@@ -138,6 +173,12 @@ function updateMemoryIndex({ memoryDir, fileName, title, description }) {
 
   // Idempotency: don't re-index a file already referenced anywhere.
   if (body.includes(`(${fileName})`) || body.includes(`**${fileName}**`)) {
+    return false;
+  }
+
+  // Already reachable via a region pointer — an index line would add budget
+  // without adding reachability. This is what makes bulk sign-off survivable.
+  if (regionPointerCovers(body, fileName)) {
     return false;
   }
 

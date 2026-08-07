@@ -108,7 +108,7 @@ const TOOLS = [
   },
   {
     name: 'pib_update_action',
-    description: 'Update fields on an existing action.',
+    description: 'Update fields on an existing action, including reparenting it to a different project via projectFid.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -119,6 +119,7 @@ const TOOLS = [
         notes: { type: 'string', description: 'Updated notes' },
         due: { type: 'string', description: 'Due date (YYYY-MM-DD)' },
         flagged: { type: 'boolean', description: 'Flag the action' },
+        projectFid: { type: 'string', description: 'Reparent the action to this project fid (must be an existing project; rejected if not found)' },
       },
       required: ['fid'],
     },

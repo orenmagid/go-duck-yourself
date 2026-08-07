@@ -1505,6 +1505,124 @@ function loadMemoryTitles(projectPath) {
   return loadMemoryCorpus(projectPath).titles;
 }
 
+// --- Rules corpus (act:02e21a69, the seventh corpus) ------------------------
+//
+// A `.claude/rules/` file is eagerly loaded into EVERY session, so a draft
+// restating one is knowledge the operator already has in front of them. Two
+// structurally unrelated lenses measured the same thing on the same day:
+// 14 of 20 cross-project-insight items and 27 of 58 pattern-promotion
+// candidates were restating an already-loaded rule — 41 of 78 total,
+// converging on the same three rules. The cause is structural, not per-lens:
+// a pattern detector converges on established rules BECAUSE a rule exists
+// precisely when its pattern already recurred across sessions. The better the
+// enforcement pipeline works, the more reliably every pattern lens
+// rediscovers its own outputs.
+//
+// HEADINGS AND THE FILENAME SLUG ONLY — never the body. A rules file is
+// thousands of words; matching its prose would over-suppress catastrophically
+// (it is the same substring-over-prose mistake M1a exists to have killed).
+//
+// Two safety properties fall out of the existing matcher rather than being
+// bolted on:
+//   1. A short generic heading is INERT. `meaningfulTokens` drops words of
+//      length <= 3 and the STOPWORDS set, so "The tell", "The shape", and
+//      "Why this is a rule" contribute fewer than OVERLAP_THRESHOLD tokens
+//      and can never reach the bar. Only long, specific headings — the ones
+//      that actually name a rule's claim — can fire.
+//   2. RULES_MIN_RATIO (near-identity, the same 0.8-of-the-shorter bar the
+//      file-derived memory corpus uses) means a heading fires only when
+//      essentially ALL of its meaningful tokens appear in the draft. On a
+//      3-token heading that is free; on a long heading it is the difference
+//      between "restates this rule" and "shares some vocabulary with it".
+//
+// BOTH rule scopes are read: the project's own `.claude/rules/` and the
+// operator's global `~/.claude/rules/`. Scope is not the criterion —
+// "eagerly loaded in every session" is, and the specimen that motivated this
+// (a draft restating `~/.claude/rules/summaries-are-short.md`) lives in the
+// global set. Labels distinguish them so a suppression names the actual file.
+//
+// MEASURED ON THE LIVE CORPUS AT SHIP TIME, AND THE RESULT IS NOT WHAT THE
+// FILING ACTION PREDICTED. Against every inbox item this portfolio has ever
+// filed — 2132 knowledge-extraction, 906 pattern-promotion, 23
+// raised-unhandled, 35 advisor-finding — 115 rule entries (65 of which carry
+// enough long tokens to fire at all) suppress THREE items. All three are true
+// positives (two SSOT patterns and one constraint, each matching
+// `maintainability.md § Single Source of Truth`), so the corpus is precise;
+// it is simply almost inert. Dropping RULES_MIN_RATIO to the count-only bar
+// every other non-memory corpus uses raises it to eight and immediately buys
+// false positives (a UTC-day upsert lesson matching "The canonical write path:
+// /cc-remember"), so the near-identity gate stays.
+//
+// The reason is structural and worth stating rather than tuning around: an
+// item that RESTATES a rule restates its CONTENT in its own words, and shares
+// almost no long tokens with the rule's HEADING. The 41-of-78 class
+// act:02e21a69 measured is real, but heading-and-slug matching is not the
+// mechanism that catches it — and matching rule bodies, the only thing that
+// would, is the over-suppression the same action forbids. So this ships
+// correct, safe, and default-OFF, and the 41-of-78 problem stays open.
+const RULES_MIN_RATIO = 0.8;
+const RULES_MAX_FILES = 200;
+const RULES_HEADING_RE = /^#{1,6}\s+(.+?)\s*$/;
+
+// Pure: the corpus entries one rules file contributes. Exported for the
+// hermetic suite — this is the whole matching surface, so it is the thing
+// worth pinning down in tests.
+export function ruleFileEntries(filename, content, { scope = 'project' } = {}) {
+  const entries = [];
+  if (typeof filename !== 'string' || !filename.endsWith('.md')) return entries;
+  const label = scope === 'global' ? `global:${filename}` : filename;
+  // The filename slug IS a title the operator wrote — `verify-before-asserting`
+  // is the rule's name. Dashes/underscores become spaces so the tokenizer sees
+  // words, not one unmatched blob.
+  const slug = filename.replace(/\.md$/, '').replace(/[-_]+/g, ' ').toLowerCase();
+  if (slug) entries.push({ text: slug, label, minRatio: RULES_MIN_RATIO });
+  if (typeof content !== 'string') return entries;
+  const seen = new Set();
+  for (const line of content.split('\n')) {
+    const m = RULES_HEADING_RE.exec(line);
+    if (!m) continue;
+    // Strip markdown emphasis/code marks so `**Gap:**`-style headings tokenize
+    // as words rather than punctuation-glued blobs.
+    const heading = m[1].replace(/[*_`]/g, '').trim().toLowerCase();
+    if (!heading || seen.has(heading)) continue;
+    seen.add(heading);
+    entries.push({ text: heading, label: `${label} § ${m[1].trim()}`, minRatio: RULES_MIN_RATIO });
+  }
+  return entries;
+}
+
+// Reads both rule scopes. Fails OPEN at every step — an unreadable rules dir
+// degrades dedup (a draft re-files once, one dismissal click) rather than
+// aborting the lens.
+// `globalDir` is injectable so the hermetic suite can point the global scope
+// at a fixture instead of the operator's real `~/.claude/rules`.
+export function loadRulesCorpus(projectPath,
+  { globalDir = join(homedir(), '.claude', 'rules') } = {}) {
+  const dirs = [];
+  if (projectPath) dirs.push({ dir: join(projectPath, '.claude', 'rules'), scope: 'project' });
+  if (globalDir) dirs.push({ dir: globalDir, scope: 'global' });
+  const entries = [];
+  for (const { dir, scope } of dirs) {
+    if (!existsSync(dir)) continue;
+    let files = [];
+    try {
+      files = readdirSync(dir).filter((f) => f.endsWith('.md')).slice(0, RULES_MAX_FILES);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      let content = '';
+      try {
+        content = readFileSync(join(dir, f), 'utf8');
+      } catch {
+        content = ''; // one unreadable rule degrades the corpus, never aborts it
+      }
+      entries.push(...ruleFileEntries(f, content, { scope }));
+    }
+  }
+  return entries;
+}
+
 function tokenize(text) {
   // Coerce non-strings to no-tokens. This is the single choke point for every
   // token operation — a null/number corpus entry (a title-less inbox item is
@@ -1598,7 +1716,7 @@ function corpusEntryMinRatio(e) {
 
 // isDuplicate — meaningful-token overlap dedup across all corpora (M1a).
 //
-// FIVE title/prose corpora, all matched the SAME way — whole-token overlap of
+// SEVEN title/prose corpora, all matched the SAME way — whole-token overlap of
 // post-stopword "meaningful" tokens, threshold OVERLAP_THRESHOLD:
 //   memoryTitles    — parsed MEMORY.md titles (NO description tail; the M1a fix)
 //   threadCursorLines — active thread-cursor prose ("what the system already
@@ -1614,6 +1732,28 @@ function corpusEntryMinRatio(e) {
 //                       ledger shows thread-cursor over-suppression, raise its
 //                       threshold then, with data (don't pre-tune blind).
 //   pendingTitles / resolvedTitles / dismissedTitles — inbox-item titles.
+//   sessionActionEntries — the `text` of actions this project filed inside the
+//                       session's own day window (act:a6bb5603). The class it
+//                       kills: the session filed the bug as an action hours
+//                       ago, then Ring 3 read the same transcript and drafted
+//                       a lesson describing it. Action NOTES are deliberately
+//                       excluded — prose that long generates false overlap
+//                       with almost anything.
+//   ruleEntries       — HEADINGS + filename slug of `.claude/rules/*.md`
+//                       (act:02e21a69). Rule BODIES are never matched: a rules
+//                       file is thousands of words and matching its body would
+//                       over-suppress catastrophically. Two structurally
+//                       unrelated lenses measured 41 of 78 filed items
+//                       restating a rule already loaded in every session —
+//                       the cause is structural (a pattern detector converges
+//                       on established rules, because a rule exists precisely
+//                       when its pattern already recurred), so it is fixed
+//                       once here rather than per-lens.
+//
+// BOTH new corpora are CONFIG-FLAGGED AND DEFAULT OFF (see
+// buildExtractionCorpora): they can only ever suppress MORE, and
+// over-suppression destroys novel knowledge silently. The caller passes an
+// empty array when the flag is off, so isDuplicate itself stays flag-blind.
 //
 // SHORT-TITLE FLOOR (boundary-man #1): a candidate whose title+content cannot
 // muster >=3 meaningful tokens is NEVER suppressed — terseness must not lower
@@ -1629,7 +1769,8 @@ function corpusEntryMinRatio(e) {
 // Returns false, or a truthy { corpus, match } — callers log one line per
 // suppression AND append a structured ledger record (recordSuppression).
 function isDuplicate(title, content, memoryTitles, pendingTitles,
-  { resolvedTitles = [], dismissedTitles = [], threadCursorLines = [] } = {}) {
+  { resolvedTitles = [], dismissedTitles = [], threadCursorLines = [],
+    sessionActionEntries = [], ruleEntries = [] } = {}) {
   const titleTokens = meaningfulTokens(title);
   const contentTokens = meaningfulTokens(content).slice(0, 10);
   const allTokens = [...new Set([...titleTokens, ...contentTokens])];
@@ -1650,6 +1791,12 @@ function isDuplicate(title, content, memoryTitles, pendingTitles,
     ['pending', pendingTitles],
     ['resolved', resolvedTitles],
     ['dismissed', dismissedTitles],
+    // The two newest corpora sit LAST so first-match attribution — and with it
+    // every historical ledger label — is unchanged for the five that predate
+    // them. An item both corpora could claim is still credited to the older
+    // one, which keeps the canary's per-corpus trend lines comparable.
+    ['session-actions', sessionActionEntries],
+    ['rules', ruleEntries],
   ];
   for (const [corpus, entries] of passes) {
     for (const entry of (entries || [])) {
@@ -1886,7 +2033,20 @@ function threadCursorLines(threadsDir, projectSlug) {
 // `threadCursorLines` (active-thread cursor prose) are now SEPARATE named
 // corpora — they used to be smuggled into one `memoryLines` array and substring
 // -matched together. They are both whole-token-matched by isDuplicate now.
-function buildExtractionCorpora(project, { phase } = {}) {
+//
+// THE TWO NEWEST CORPORA ARE OFF UNLESS EXPLICITLY ENABLED (act:a6bb5603,
+// act:02e21a69). Both flags are `=== true` opt-INs, not `!== false` opt-outs
+// like every other flag in this file, and that inversion is deliberate: these
+// corpora can only ever suppress MORE, and a wrong suppression destroys
+// knowledge silently and invisibly. A missing config therefore yields empty
+// corpora — the fail-safe direction is "file a possible duplicate", never
+// "drop a possible lesson". Flip them on only after the recall canary has been
+// read against their separately-labelled ledger lines.
+//   dedup_session_actions_corpus — needs `sessionWindow` too; without one
+//                                  (an unparseable transcript) the corpus
+//                                  stays empty rather than borrowing a window.
+//   dedup_rules_corpus           — needs only the project path.
+function buildExtractionCorpora(project, { phase, config = null, sessionWindow = null } = {}) {
   const tag = phase || 'lens';
   // act:471941c9 part 4: `memoryCorpus.entries` is what isDuplicate consumes
   // (file-derived, labelled, per-entry thresholds); `titles` stays the bare
@@ -1918,6 +2078,26 @@ function buildExtractionCorpora(project, { phase } = {}) {
   } catch (e) {
     logError(`${tag}: resolution corpus failed (${e.message}) — continuing without it`);
   }
+  let sessionActions = [];
+  let ruleCorpus = [];
+  if (config?.defaults?.dedup_session_actions_corpus === true && sessionWindow) {
+    try {
+      sessionActions = sessionActionEntries(
+        loadSessionFiledActions(project, sessionWindow, { phase: tag }));
+      log(`${tag}: session-actions corpus — ${sessionActions.length} action(s) filed `
+        + `${sessionWindow.startDay}..${sessionWindow.endDay}`);
+    } catch (e) {
+      logError(`${tag}: session-actions corpus failed (${e.message}) — continuing without it`);
+    }
+  }
+  if (config?.defaults?.dedup_rules_corpus === true) {
+    try {
+      ruleCorpus = loadRulesCorpus(project.path);
+      log(`${tag}: rules corpus — ${ruleCorpus.length} heading/slug entr(ies)`);
+    } catch (e) {
+      logError(`${tag}: rules corpus failed (${e.message}) — continuing without it`);
+    }
+  }
   return {
     memoryTitles,
     memoryEntries: memoryCorpus.entries,
@@ -1925,6 +2105,8 @@ function buildExtractionCorpora(project, { phase } = {}) {
     threadCursorLines: cursorLines,
     pendingTitles,
     resolutionTitles,
+    sessionActionEntries: sessionActions,
+    ruleEntries: ruleCorpus,
   };
 }
 
@@ -2359,47 +2541,113 @@ export function resolveAuthorityPath(config, projectName, type) {
 // explicit requirement when this was filed: "the watchtower must not create
 // duplicates of what the sweep files."
 //
-// So Phase 2d loads the actions this project created on the session's date and
-// declines to file a commitment-shaped extraction that one of them already
-// covers. The window is the session's calendar DAY, not the session itself,
-// because pib-db's `actions.created` is a date (`GLOB '????-??-??'`) with no
-// time component — coarser than ideal, and adequate: the sweep files minutes
-// before the ring runs. Sessions that cross midnight are covered by taking
-// everything created on or after the session-start date.
+// So Phase 2d loads the actions this project created inside the session's own
+// window and declines to file a commitment-shaped extraction that one of them
+// already covers.
 //
 // This is the same seam as bookkeeping suppression (act:471941c9) from the
 // other side. Bookkeeping says "pib-db already owns this event"; this says
 // "pib-db already owns this obligation, as of ninety seconds ago."
-function loadSessionFiledActions(project, sessionStartIso) {
+//
+// act:a6bb5603 made this reader SHARED — the same rows now also feed
+// isDuplicate as the sixth dedup corpus — and bounded its window at BOTH ends.
+// See sessionActionWindow for why, and for the residual imprecision.
+
+// sessionActionWindow — the calendar-day window an action must fall inside to
+// count as "this session filed it".
+//
+// SCOPE IS THE SESSION, NOT THE CALENDAR DAY. That distinction is the whole
+// safety argument: a window wide enough to catch cross-session duplication
+// turns the entire open backlog into a suppression corpus, which is precisely
+// the over-suppression failure the M1/M2 recall-fix program exists to prevent
+// (act:7d6a4b3b, act:edd79e15, act:6354a9db). Cross-session duplication stays
+// deliberately UNCOVERED — it is the rarer case, and the cost asymmetry is
+// decisive: a wrong suppression silently destroys a lesson, a missed
+// suppression costs one dismissal click.
+//
+// THE RESIDUAL IMPRECISION, STATED PLAINLY: pib-db's `actions.created` is a
+// DATE (`CHECK(created GLOB '????-??-??')`) with no time component, so the
+// session's real start/end timestamps cannot be applied at the data layer.
+// The tightest window the schema supports is [session-start day, session-end
+// day], and an action filed by a DIFFERENT session on one of those same
+// calendar days is indistinguishable from one this session filed. That is a
+// known, accepted looseness — not an oversight — and it is the only direction
+// the corpus is loose in.
+//
+// Bounding the LATE end is new and load-bearing. The old `created >= day`
+// query had no upper bound, which is harmless for a live close (nothing can be
+// created in the future) but wrong for the reprocess path: replaying a
+// three-week-old transcript would have pulled every action filed since into
+// the corpus — the exact "whole backlog as suppression corpus" failure. The
+// end day comes from the transcript's LAST timestamp; when that is
+// unavailable we allow ONE day of midnight-crossing tolerance and no more,
+// deliberately NOT falling back to now().
+const SESSION_WINDOW_MIDNIGHT_TOLERANCE_DAYS = 1;
+export function sessionActionWindow(sessionStartIso, sessionEndIso = null) {
+  const dayOf = (iso) => (typeof iso === 'string' && /^\d{4}-\d{2}-\d{2}/.test(iso))
+    ? iso.slice(0, 10) : null;
+  const startDay = dayOf(sessionStartIso);
+  // No session start means no window. Returning null (rather than defaulting
+  // to today) keeps an unparseable transcript from silently borrowing a
+  // window it has no claim to.
+  if (!startDay) return null;
+  let endDay = dayOf(sessionEndIso);
+  if (!endDay || endDay < startDay) {
+    const t = Date.parse(`${startDay}T00:00:00Z`);
+    endDay = Number.isNaN(t)
+      ? startDay
+      : new Date(t + SESSION_WINDOW_MIDNIGHT_TOLERANCE_DAYS * 86400000)
+        .toISOString().slice(0, 10);
+  }
+  return { startDay, endDay };
+}
+
+// The shared reader. Returns [{fid, text}] — NEVER notes: action notes are
+// long and prose-heavy and would generate false overlap with almost anything
+// (act:a6bb5603's explicit constraint).
+function loadSessionFiledActions(project, window, { phase = 'Phase 2d' } = {}) {
   const projectPath = project && project.path;
-  if (!projectPath) return [];
+  if (!projectPath || !window) return [];
   const dbPath = join(projectPath, 'pib.db');
   if (!existsSync(dbPath)) return [];
   const Database = loadBetterSqlite3(projectPath);
   if (!Database) return [];
   // Fail OPEN at every step: a db hiccup means Ring 3 may file a duplicate the
   // operator dismisses in a second. Failing CLOSED would mean silently
-  // dropping a commitment, which is the failure this action exists to fix.
+  // dropping a commitment (or a lesson), which is the failure this whole
+  // program exists to prevent.
   let db;
   try {
     db = new Database(dbPath, { readonly: true, timeout: 5000 });
   } catch (e) {
-    logError(`Phase 2d: cannot open pib.db for commitment dedup (${e.message}) — continuing without it`);
+    logError(`${phase}: cannot open pib.db for session-action dedup (${e.message}) — continuing without it`);
     return [];
   }
   try {
-    const day = (sessionStartIso && /^\d{4}-\d{2}-\d{2}/.test(sessionStartIso))
-      ? sessionStartIso.slice(0, 10)
-      : new Date().toISOString().slice(0, 10);
     return db.prepare(
-      "SELECT fid, text FROM actions WHERE created >= ? AND deleted_at IS NULL"
-    ).all(day);
+      'SELECT fid, text FROM actions '
+      + 'WHERE created >= ? AND created <= ? AND deleted_at IS NULL'
+    ).all(window.startDay, window.endDay);
   } catch (e) {
-    logError(`Phase 2d: cannot query same-day actions for commitment dedup (${e.message}) — continuing without it`);
+    logError(`${phase}: cannot query session-window actions (${e.message}) — continuing without it`);
     return [];
   } finally {
     try { db.close(); } catch { /* already closed or never opened cleanly */ }
   }
+}
+
+// sessionActionEntries — the corpus-entry view of those rows. Pure; exported
+// for the hermetic suite. The label carries the fid so a suppression names the
+// action that blocked the draft rather than echoing text the operator would
+// have to go find.
+export function sessionActionEntries(rows) {
+  if (!Array.isArray(rows)) return [];
+  const entries = [];
+  for (const r of rows) {
+    if (!r || typeof r.text !== 'string' || !r.text.trim()) continue;
+    entries.push({ text: r.text.toLowerCase(), label: `${r.fid}: ${r.text}` });
+  }
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -2407,7 +2655,8 @@ function loadSessionFiledActions(project, sessionStartIso) {
 // ---------------------------------------------------------------------------
 
 async function decisionExtraction(compressed, project, sessionId, transcriptPath,
-  threadIds = [], { callFn = claudeCall, config = null, sessionStartIso = null } = {}) {
+  threadIds = [], { callFn = claudeCall, config = null, sessionStartIso = null,
+    sessionWindow = null } = {}) {
   const projectPath = project.path;
   log('Phase 2d: Knowledge extraction');
 
@@ -2418,8 +2667,13 @@ async function decisionExtraction(compressed, project, sessionId, transcriptPath
   // tail), thread cursors are their own whole-token corpus; every builder fails
   // open. Queried by the resolved project NAME (the old basename query looked
   // up a phantom project, so dedup never matched and dups re-filed).
+  // The session-actions corpus is built BELOW rather than here, because Phase
+  // 2d already reads exactly those rows for commitment dedup — one db read,
+  // two consumers (the "shared reader" act:a6bb5603 asks for). Every other
+  // lens has no such reader and lets the builder do it.
   const { memoryTitles, memoryEntries, memoryPromptLines, threadCursorLines: cursorLines,
-    pendingTitles, resolutionTitles } = buildExtractionCorpora(project, { phase: 'Phase 2d' });
+    pendingTitles, resolutionTitles, ruleEntries } =
+    buildExtractionCorpora(project, { phase: 'Phase 2d', config });
   // Positive confirmation, not silence: "no suppressions" must be
   // distinguishable from "the memory corpus never loaded".
   log(`Phase 2d: memory corpus — ${memoryTitles.length} title(s), ${memoryEntries.length} dedup entr(ies), ${memoryPromptLines.length} novelty line(s)`);
@@ -2550,9 +2804,21 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
 
   // act:aa554774: the actions /close's commitment sweep could have filed for
   // this session. Loaded once, outside the loop.
-  const sessionFiledActions = loadSessionFiledActions(project, sessionStartIso);
+  const window = sessionWindow || sessionActionWindow(sessionStartIso);
+  const sessionFiledActions = loadSessionFiledActions(project, window);
   if (sessionFiledActions.length) {
-    log(`Phase 2d: commitment dedup — ${sessionFiledActions.length} action(s) filed on this session's date are in scope`);
+    log(`Phase 2d: commitment dedup — ${sessionFiledActions.length} action(s) filed `
+      + `${window.startDay}..${window.endDay} are in scope`);
+  }
+  // act:a6bb5603, the sixth corpus: the SAME rows, read once, now also offered
+  // to isDuplicate as a general dedup corpus. Config-flagged and OFF by
+  // default — commitment dedup above is unaffected by the flag, because it is
+  // narrowly shaped (commitment-shaped items only) and already shipped.
+  const sessionActionCorpus = config?.defaults?.dedup_session_actions_corpus === true
+    ? sessionActionEntries(sessionFiledActions)
+    : [];
+  if (sessionActionCorpus.length) {
+    log(`Phase 2d: session-actions corpus — ${sessionActionCorpus.length} action text(s) in scope`);
   }
 
   for (const item of extractions) {
@@ -2605,7 +2871,12 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
 
     const dup = isDuplicate(
       fullTitle, item.content || '', memoryEntries, pendingTitles,
-      { ...resolutionTitles, threadCursorLines: cursorLines });
+      {
+        ...resolutionTitles,
+        threadCursorLines: cursorLines,
+        sessionActionEntries: sessionActionCorpus,
+        ruleEntries,
+      });
     if (dup) {
       // M1b rescue gate: a lexical flag the model AFFIRMATIVELY judged novel is
       // RESCUED (filed). The model can only rescue, never independently suppress
@@ -3091,7 +3362,7 @@ function parseAdvisorFindings(text) {
 // callFn is injectable for hermetic tests — production callers omit it and
 // get this run's pinned-sonnet claudeCall.
 async function advisorPass(compressed, project, sessionId, threadIds = [],
-  { callFn = claudeCall } = {}) {
+  { callFn = claudeCall, config = null, sessionWindow = null } = {}) {
   log('Phase 2m: Session advisor pass');
 
   const { advisors, reason } = discoverSessionAdvisors(project.path);
@@ -3115,6 +3386,27 @@ async function advisorPass(compressed, project, sessionId, threadIds = [],
     resolutionTitles = resolutionCorpus(project.name);
   } catch (e) {
     logError(`Phase 2m: resolution corpus failed (${e.message}) — continuing without it`);
+  }
+  // The two flagged corpora (act:a6bb5603 / act:02e21a69). Phase 2m keeps its
+  // deliberately reduced corpus set — no memory, no thread cursors — but an
+  // advisor finding that restates an eagerly-loaded rule, or an action this
+  // session already filed, is the same noise every other lens files.
+  let sessionActionCorpus = [];
+  let ruleEntries = [];
+  if (config?.defaults?.dedup_session_actions_corpus === true && sessionWindow) {
+    try {
+      sessionActionCorpus = sessionActionEntries(
+        loadSessionFiledActions(project, sessionWindow, { phase: 'Phase 2m' }));
+    } catch (e) {
+      logError(`Phase 2m: session-actions corpus failed (${e.message}) — continuing without it`);
+    }
+  }
+  if (config?.defaults?.dedup_rules_corpus === true) {
+    try {
+      ruleEntries = loadRulesCorpus(project.path);
+    } catch (e) {
+      logError(`Phase 2m: rules corpus failed (${e.message}) — continuing without it`);
+    }
   }
 
   const transcriptSlice = recentSlice(compressed, ADVISOR_TRANSCRIPT_SLICE);
@@ -3151,7 +3443,8 @@ Output ONLY the JSON array, no other text.`;
     const shortName = advisor.name.replace(/^cabinet-/, '');
     for (const f of findings) {
       const fullTitle = `${shortName}: ${f.title}`;
-      const dup = isDuplicate(fullTitle, f.summary, [], pendingTitles, resolutionTitles);
+      const dup = isDuplicate(fullTitle, f.summary, [], pendingTitles,
+        { ...resolutionTitles, sessionActionEntries: sessionActionCorpus, ruleEntries });
       if (dup) {
         suppressed++;
         log(`Phase 2m: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
@@ -3258,7 +3551,7 @@ function parseLensFindings(text, { cap, extraKeys = [] } = {}) {
 // already contains this session's completion candidates, extractions, and
 // advisor findings — a loose end one of those already captured is suppressed.
 async function raisedUnhandledLens(compressed, project, sessionId, transcriptPath,
-  threadIds = [], { callFn = claudeCall } = {}) {
+  threadIds = [], { callFn = claudeCall, config = null, sessionWindow = null } = {}) {
   log('Phase 2n: Raised-but-unhandled lens');
 
   const systemPrompt = `You are scanning a finished Claude Code session transcript for loose ends: things that were RAISED during the session but were neither completed nor recorded anywhere before it ended. Three kinds:
@@ -3291,15 +3584,23 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
     return { queued: 0 };
   }
 
-  const { memoryEntries, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
-    buildExtractionCorpora(project, { phase: 'Phase 2n' });
+  // Phase 2n is the lens the session-actions corpus fits best: a loose end the
+  // session ALREADY filed as an action is by definition not unhandled.
+  const { memoryEntries, threadCursorLines: cursorLines, pendingTitles, resolutionTitles,
+    sessionActionEntries: sessionActionCorpus, ruleEntries } =
+    buildExtractionCorpora(project, { phase: 'Phase 2n', config, sessionWindow });
 
   let queued = 0;
   let suppressed = 0;
   for (const f of findings) {
     const fullTitle = `unhandled: ${f.title}`;
     const dup = isDuplicate(fullTitle, f.summary, memoryEntries, pendingTitles,
-      { ...resolutionTitles, threadCursorLines: cursorLines });
+      {
+        ...resolutionTitles,
+        threadCursorLines: cursorLines,
+        sessionActionEntries: sessionActionCorpus,
+        ruleEntries,
+      });
     if (dup) {
       suppressed++;
       log(`Phase 2n: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
@@ -3353,7 +3654,7 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
 // slash-command would have automated it. Surface it as a "should this become
 // a skill?" inbox item. Same dedup discipline as every other lens.
 async function skillCandidateLens(compressed, project, sessionId, transcriptPath,
-  threadIds = [], { callFn = claudeCall } = {}) {
+  threadIds = [], { callFn = claudeCall, config = null, sessionWindow = null } = {}) {
   log('Phase 2o: Skill-candidate lens');
 
   const systemPrompt = `You are scanning a finished Claude Code session transcript for REPEATED MANUAL PROCEDURES that should become a reusable Claude Code skill (slash-command). Look for a multi-step sequence the operator or assistant performed BY HAND two or more times, or an ad-hoc procedure clearly done routinely, where a skill would have automated it.
@@ -3386,15 +3687,21 @@ Skill candidates are durable — they are almost never urgent. Output ONLY the J
     return { queued: 0 };
   }
 
-  const { memoryEntries, threadCursorLines: cursorLines, pendingTitles, resolutionTitles } =
-    buildExtractionCorpora(project, { phase: 'Phase 2o' });
+  const { memoryEntries, threadCursorLines: cursorLines, pendingTitles, resolutionTitles,
+    sessionActionEntries: sessionActionCorpus, ruleEntries } =
+    buildExtractionCorpora(project, { phase: 'Phase 2o', config, sessionWindow });
 
   let queued = 0;
   let suppressed = 0;
   for (const f of findings) {
     const fullTitle = `skill-candidate: ${f.title}`;
     const dup = isDuplicate(fullTitle, f.summary, memoryEntries, pendingTitles,
-      { ...resolutionTitles, threadCursorLines: cursorLines });
+      {
+        ...resolutionTitles,
+        threadCursorLines: cursorLines,
+        sessionActionEntries: sessionActionCorpus,
+        ruleEntries,
+      });
     if (dup) {
       suppressed++;
       log(`Phase 2o: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
@@ -3951,6 +4258,29 @@ function sessionStartFromTranscript(transcriptPath) {
   return null;
 }
 
+// sessionEndFromTranscript — the mirror of the above, reading the LAST
+// timestamped line. It exists to bound the session-action corpus at its late
+// end (act:a6bb5603): on a live close it is ~now and changes nothing, but on a
+// REPROCESS of an old transcript it is the difference between "actions this
+// session filed" and "every action filed in the weeks since". Returns null
+// when the transcript carries no timestamp, which sessionActionWindow answers
+// with one day of midnight tolerance rather than now().
+function sessionEndFromTranscript(transcriptPath) {
+  try {
+    const raw = readFileSync(transcriptPath, 'utf8');
+    const lines = raw.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const t = lines[i].trim();
+      if (!t) continue;
+      let o;
+      try { o = JSON.parse(t); } catch { continue; }
+      const ts = o.timestamp || o.time || o.ts;
+      if (typeof ts === 'string' && ts) return ts;
+    }
+  } catch { /* unreadable transcript — no window */ }
+  return null;
+}
+
 // --- Standing-debt aggregation (act:e888dd63) -------------------------------
 // A coverage warning is a STANDING condition, not an event: the same debt
 // recurs every session while the scenarios lag the UI. Filing one item per
@@ -4346,6 +4676,11 @@ async function main() {
   // Session start (transcript-derived) — consumed by Phase 2c's
   // create-vs-complete filter and the Phase 2q verify-coverage lens.
   const sessionStartIso = sessionStartFromTranscript(args.transcriptPath);
+  // The calendar-day window the session-actions dedup corpus is scoped to —
+  // computed once and threaded, bounded at BOTH ends so a reprocess of an old
+  // transcript cannot sweep in everything filed since (act:a6bb5603).
+  const sessionWindow = sessionActionWindow(
+    sessionStartIso, sessionEndFromTranscript(args.transcriptPath));
 
   // Phase 2c: Work item closure
   try {
@@ -4359,7 +4694,7 @@ async function main() {
 
   // Phase 2d: Decision/lesson extraction
   try {
-    const result = await decisionExtraction(compressed, project, args.sessionId, args.transcriptPath, threadIds, { config, sessionStartIso });
+    const result = await decisionExtraction(compressed, project, args.sessionId, args.transcriptPath, threadIds, { config, sessionStartIso, sessionWindow });
     stats.memoryWritten = result.autoWritten;
     stats.extractionsQueued = result.queued;
     stats.itemsFiled += result.queued;
@@ -4401,7 +4736,7 @@ async function main() {
   // claudeCall for cost control.
   if (config.defaults?.session_advisors !== false) {
     try {
-      const result = await advisorPass(compressed, project, args.sessionId, threadIds);
+      const result = await advisorPass(compressed, project, args.sessionId, threadIds, { config, sessionWindow });
       stats.advisorFindings = result.filed;
       stats.itemsFiled += result.filed;
     } catch (e) {
@@ -4416,7 +4751,8 @@ async function main() {
   if (config.defaults?.raised_unhandled_lens !== false) {
     try {
       const result = await raisedUnhandledLens(
-        compressed, project, args.sessionId, args.transcriptPath, threadIds);
+        compressed, project, args.sessionId, args.transcriptPath, threadIds,
+        { config, sessionWindow });
       stats.itemsFiled += result.queued;
     } catch (e) {
       logError(`Phase 2n failed: ${e.message}`);
@@ -4427,7 +4763,8 @@ async function main() {
   if (config.defaults?.skill_candidate_lens !== false) {
     try {
       const result = await skillCandidateLens(
-        compressed, project, args.sessionId, args.transcriptPath, threadIds);
+        compressed, project, args.sessionId, args.transcriptPath, threadIds,
+        { config, sessionWindow });
       stats.itemsFiled += result.queued;
     } catch (e) {
       logError(`Phase 2o failed: ${e.message}`);
@@ -4699,6 +5036,11 @@ export {
   resolutionCorpus,
   threadCursorLines,
   buildExtractionCorpora,
+  // The sixth + seventh dedup corpora (act:a6bb5603, act:02e21a69).
+  // sessionActionWindow, sessionActionEntries, ruleFileEntries, and
+  // loadRulesCorpus are exported inline at their declarations.
+  loadSessionFiledActions,
+  sessionEndFromTranscript,
   completionReviewEmitGuard,
   // Exported for the quote-instrumentation suite (act:ea23b3a5): a fixture
   // must be built by the REAL preprocessor, because its JSON-serialized output

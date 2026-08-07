@@ -517,8 +517,42 @@ export function isHighConfidenceSignoff(item) {
   // on 62-of-66 TRUE drafts and 70-of-84 flags were false by construction,
   // catching less than chance. See runDraftAnnotationSweep in
   // watchtower-ring2.mjs for the measurement.)
+  //
+  // act:3edf14ee — demote on the CLUSTER, not on the pairwise flag. Demoting on
+  // a non-empty `possible_duplicate_of` collapsed the partition to EMPTY at
+  // scale: on a 252-item queue, 151 items carried the flag and signoff came back
+  // 0. A second desk measured the same day that 10 of 10 demoted draft-carrying
+  // items portfolio-wide were demoted by this flag ALONE — none by staleness or
+  // urgency. When a flag fires on ~60% of a queue, a "conservative" demotion is
+  // arithmetically equivalent to disabling the feature, and it disables it
+  // exactly when the pile is deepest, which is the only time it matters.
+  //
+  // The pairwise flag is STRICTLY PAIRWISE by design (see proposeFolds) and is
+  // NOT a group. `duplicate_cluster` is the cohesion-checked component computed
+  // once at detection time. Three states, handled explicitly rather than by
+  // falsy-coercion, because they mean different things:
+  //
+  //   object            — a surviving, bounded cluster: there IS a coherent
+  //                       group to read side by side. DEMOTE; this is the case
+  //                       the demotion was written for.
+  //   null + rejected   — the matcher examined the component and could not
+  //                       substantiate it (oversized / chained). ALLOW: there is
+  //                       nothing to compare against, so individual review buys
+  //                       the operator no information and costs the partition.
+  //   field absent      — annotated before clustering shipped (285 of 564 live
+  //                       flagged items at time of writing). ALLOW, for the same
+  //                       reason: no substantiation exists. Absence is
+  //                       "unanalyzed", not "analyzed and confirmed", and the
+  //                       finding here is precisely that the bare pairwise flag
+  //                       was never a sufficient basis for demotion. The sweep
+  //                       backfills the field on a later pass.
+  //
+  // The advisory contract is preserved throughout: the annotation still never
+  // SUPPRESSES an item, it only routes it to individual review.
   if (item.evidence && Array.isArray(item.evidence.possible_duplicate_of)
-      && item.evidence.possible_duplicate_of.length > 0) return false;
+      && item.evidence.possible_duplicate_of.length > 0
+      && item.evidence.duplicate_cluster
+      && typeof item.evidence.duplicate_cluster === 'object') return false;
   // Held items (holdItem) are deliberate human retention — never a batch nod.
   if (item.evidence && item.evidence.held) return false;
   return true;
