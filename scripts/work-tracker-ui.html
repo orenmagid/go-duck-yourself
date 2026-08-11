@@ -393,6 +393,45 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    /* Kind is carried by the header's COMPOSITION (a project gets a progress
+       bar + percent because its outcome can become true; an area gets a flow
+       figure because its health is throughput, not completion) — the tag is
+       the explicit label so nobody ever infers kind from the prj: prefix. */
+    .kind-tag {
+      font-size: 9px; letter-spacing: .5px; text-transform: uppercase;
+      color: #5c5f66; border: 1px solid #2c2e33;
+      padding: 0 4px; border-radius: 2px;
+    }
+    .kind-tag.area { color: #4dabf7; border-color: #1c7ed655; }
+    .flow-figure { font-size: 11px; color: #5c5f66; }
+
+    /* The typed resolution (§16.1): a child closed because its parent
+       project's outcome became true is a materially different claim from one
+       whose acceptance criteria were verified, and every read surface renders
+       the difference rather than leaving it to a join nobody runs. */
+    .badge-parent-outcome {
+      font-size: 9px; letter-spacing: .3px; text-transform: uppercase;
+      color: #9775fa; border: 1px solid #7048e855;
+      padding: 0 4px; border-radius: 2px;
+    }
+    /* A done project holding open children (a reopen re-minted the state the
+       gate exists to prevent) is rendered, never hidden (§16.4). */
+    .badge-done-open {
+      font-size: 10px; color: #ffa94d; border: 1px solid #e4932d66;
+      padding: 0 5px; border-radius: 2px;
+    }
+
+    /* Non-blocking notice for server teaching notes (e.g. reopening a child
+       under a done project). An alert() would block the page — and blocks
+       browser automation outright. */
+    #note-toast {
+      position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+      max-width: 560px; padding: 10px 16px; z-index: 100;
+      background: #2b2130; border: 1px solid #7048e8; border-radius: 6px;
+      color: #d0bfff; font-size: 12px; line-height: 1.5;
+      opacity: 0; pointer-events: none; transition: opacity .3s;
+    }
+    #note-toast.show { opacity: 1; pointer-events: auto; }
     .progress-bar {
       height: 3px;
       background: #373a40;
@@ -500,7 +539,9 @@
   </header>
 
   <div class="tabs" id="tabs">
-    <div class="tab active" data-view="projects">Projects</div>
+    <div class="tab active" data-view="projects">Areas &amp; Projects</div>
+    <div class="tab" data-view="ready">Ready</div>
+    <div class="tab" data-view="blocked">Blocked</div>
     <div class="tab" data-view="actions">All Actions</div>
     <div class="tab" data-view="flagged">Flagged</div>
   </div>
@@ -557,6 +598,8 @@
     // State
     let projects = [];
     let actions = [];
+    let ready = { rows: [], danglingEdges: 0, staleBlockedStatus: [], releasedByTrigger: [] };
+    let blocked = { rows: [] };
     let currentView = 'projects';
     let currentStatus = 'active';
     let searchQuery = '';
@@ -565,14 +608,18 @@
     // Fetch data
     async function load() {
       try {
-        const [projRes, actRes, statsRes, metaRes] = await Promise.all([
+        const [projRes, actRes, statsRes, metaRes, readyRes, blockedRes] = await Promise.all([
           fetch(`/api/projects?status=${currentStatus}`),
           fetch('/api/actions?status=all'),
           fetch('/api/stats'),
           fetch('/api/meta'),
+          fetch('/api/ready'),
+          fetch('/api/blocked'),
         ]);
         projects = await projRes.json();
         actions = await actRes.json();
+        ready = await readyRes.json();
+        blocked = await blockedRes.json();
         const stats = await statsRes.json();
         const meta = await metaRes.json();
         if (meta.projectName) {
@@ -604,6 +651,8 @@
       root.innerHTML = '';
 
       if (currentStatus === 'waiting') renderWaiting(root);
+      else if (currentView === 'ready') renderReady(root);
+      else if (currentView === 'blocked') renderBlocked(root);
       else if (currentView === 'projects') renderProjects(root);
       else if (currentView === 'actions') renderAllActions(root);
       else if (currentView === 'flagged') renderFlagged(root);
@@ -625,7 +674,7 @@
             <div class="project-header" data-fid="${p.fid}">
               <span class="project-name">${esc(p.name)}</span>
               <div class="project-meta">
-                ${p.area ? `<span>${esc(p.area)}</span>` : ''}
+                <span class="kind-tag ${p.kind === 'project' ? 'project' : 'area'}">${p.kind === 'project' ? 'project' : 'area'}</span>
                 <span class="badge badge-someday" title="waiting">waiting</span>
                 <span class="badge badge-${p.status}">${p.status}</span>
               </div>
@@ -663,7 +712,7 @@
     function renderProjects(root) {
       const filtered = filterProjects();
       if (filtered.length === 0) {
-        root.innerHTML = '<div class="empty-state">No projects found.</div>';
+        root.innerHTML = '<div class="empty-state">No areas or projects found.</div>';
         return;
       }
 
@@ -676,14 +725,28 @@
         const card = document.createElement('div');
         card.className = 'project-card';
 
+        // Kind-asymmetric header (IA §5): a PROJECT's outcome can become true,
+        // so it gets a progress bar and a percent. An AREA never completes, so
+        // a completion-shaped gauge on it would be a lie — it shows throughput
+        // (closed in the last 30 days) instead. Rows missing kind (pre-v9
+        // payloads) render as areas, the migration's own default.
+        const isProject = p.kind === 'project';
         const pct = projectActions.length > 0 ? Math.round(done.length / projectActions.length * 100) : 0;
+        // Lexical >= is correct for both stored formats (full ISO and the
+        // 37 legacy date-only stamps): dates differing in the date part
+        // compare correctly as strings.
+        const cutoff30 = new Date(Date.now() - 30 * 86400000).toISOString();
+        const closed30 = done.filter(a => a.completed_at && String(a.completed_at) >= cutoff30).length;
 
         card.innerHTML = `
           <div class="project-header" data-fid="${p.fid}">
             <span class="project-name">${esc(p.name)}</span>
             <div class="project-meta">
-              ${p.area ? `<span>${esc(p.area)}</span>` : ''}
-              <span>${open.length} open / ${projectActions.length} total</span>
+              <span class="kind-tag ${isProject ? 'project' : 'area'}">${isProject ? 'project' : 'area'}</span>
+              ${isProject
+                ? `<span>${open.length} open / ${projectActions.length} total · ${pct}%</span>`
+                : `<span class="flow-figure">${open.length} open · ${closed30} closed in 30d</span>`}
+              ${isProject && p.status === 'done' && open.length > 0 ? `<span class="badge-done-open" title="A child was reopened (or filed) after this project completed. Reparent the open work to a live container, or reopen the project.">${open.length} open under a done project</span>` : ''}
               ${p.trigger_condition ? `<span class="badge badge-someday" title="${esc(p.trigger_condition)}">waiting</span>` : ''}
               <span class="badge badge-${p.status}">${p.status}</span>
             </div>
@@ -692,7 +755,7 @@
             ${p.trigger_condition ? `
               <div style="padding: 10px 14px 0;" data-project-trigger-slot="${esc(p.fid)}"></div>
             ` : ''}
-            ${projectActions.length > 0 ? `
+            ${isProject && projectActions.length > 0 ? `
               <div style="padding: 4px 14px 0;">
                 <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
               </div>
@@ -738,6 +801,72 @@
       root.innerHTML = renderActionRows(filtered, true);
     }
 
+    // "What can I start right now" — the derived next-actions list. The rows
+    // come straight from /api/ready, which delegates to the library's
+    // listStartable; nothing here re-derives the predicate.
+    function renderReady(root) {
+      // A failed /api/ready returns {error} with no rows; without this guard
+      // the tab clears the pane and then throws, leaving a permanently blank
+      // view with no message anywhere.
+      if (!Array.isArray(ready.rows)) {
+        root.innerHTML = '<div class="empty-state">Could not load the ready list. Is the work-tracker server still running?</div>';
+        return;
+      }
+      const rows = ready.rows.filter(a => matchesSearch(a.text) || matchesSearch(a.project));
+      const notes = [];
+      if (ready.danglingEdges) {
+        // Never silent: an action can be startable BECAUSE its blocker was
+        // soft-deleted, and the operator needs to know that happened.
+        notes.push(`${ready.danglingEdges} dependency edge(s) point at a deleted or missing action and no longer constrain anything.`);
+      }
+      if (ready.releasedByTrigger && ready.releasedByTrigger.length) {
+        notes.push(`${ready.releasedByTrigger.length} item(s) are here because a trigger condition was evaluated and found to have fired.`);
+      }
+      if (ready.staleBlockedStatus && ready.staleBlockedStatus.length) {
+        // The derived answer CORRECTING a stored conclusion — the whole point
+        // of the model. Without this line the row shows an unexplained red
+        // "blocked" badge from the generic renderer and reads as a bug.
+        notes.push(`${ready.staleBlockedStatus.length} item(s) still say "blocked" but nothing actually blocks them any more — the status is stale, not the list.`);
+      }
+      const noteHtml = notes.length
+        ? `<div class="orphan-header" style="opacity:.75;font-weight:normal;">${notes.map(esc).join('<br>')}</div>`
+        : '';
+
+      if (rows.length === 0) {
+        root.innerHTML = noteHtml + '<div class="empty-state">Nothing is startable right now — everything open is waiting on another action or on a trigger.</div>';
+        return;
+      }
+      root.innerHTML = noteHtml + renderActionRows(rows.map(a => ({ ...a, project_name: a.project })), true);
+    }
+
+    // The complement — what is waiting and on what. This is the query a
+    // waiting-for FOLDER collapses into: group by blocker to see everything
+    // stuck behind one gate.
+    function renderBlocked(root) {
+      if (!Array.isArray(blocked.rows)) {
+        root.innerHTML = '<div class="empty-state">Could not load the blocked list. Is the work-tracker server still running?</div>';
+        return;
+      }
+      const rows = blocked.rows.filter(a => matchesSearch(a.text) || matchesSearch(a.project));
+      if (rows.length === 0) {
+        root.innerHTML = '<div class="empty-state">Nothing is blocked.</div>';
+        return;
+      }
+      root.innerHTML = rows.map(a => `
+        <div class="action-row" data-action-fid="${esc(a.fid)}">
+          <div class="action-content">
+            <div class="action-text">${esc(a.text)}</div>
+            <div class="action-sub">
+              <span class="action-fid">${esc(a.fid)}</span>
+              ${a.project ? `<span>${esc(a.project)}</span>` : ''}
+              ${a.unmet_blockers ? `<span class="badge badge-blocked">waiting on ${a.unmet_blockers} action${a.unmet_blockers === 1 ? '' : 's'}: ${esc(a.blocker_fids || '')}</span>` : ''}
+              ${a.waiting_on_trigger ? `<span class="badge badge-someday">trigger not fired${a.last_trigger_result ? ' (last check: ' + esc(a.last_trigger_result) + ')' : ' (never checked)'}</span>` : ''}
+            </div>
+          </div>
+        </div>
+      `).join('');
+    }
+
     function renderFlagged(root) {
       const flagged = actions.filter(a => a.flagged && !a.completed);
       if (flagged.length === 0) {
@@ -756,6 +885,7 @@
             <div class="action-sub">
               <span class="action-fid">${esc(a.fid)}</span>
               ${a.status !== 'open' && a.status !== 'done' ? `<span class="badge badge-${a.status}">${a.status}</span>` : ''}
+              ${a.completed && a.resolution === 'parent-outcome' ? `<span class="badge-parent-outcome" title="Closed because its parent project's outcome became true — its own acceptance criteria were never individually verified.">closed by parent outcome</span>` : ''}
               ${showProject && a.project_name ? `<span>${esc(a.project_name)}</span>` : ''}
               ${a.due ? `<span>due ${esc(a.due)}</span>` : ''}
               ${a.notes ? `<span style="cursor:pointer;color:#7048e8;" data-notes="${a.fid}">notes</span>` : ''}
@@ -772,7 +902,7 @@
         const q = searchQuery.toLowerCase();
         filtered = filtered.filter(p =>
           p.name.toLowerCase().includes(q) ||
-          (p.area && p.area.toLowerCase().includes(q)) ||
+          (p.kind && p.kind.toLowerCase() === q) ||
           actions.some(a => a.project_fid === p.fid && a.text.toLowerCase().includes(q))
         );
       }
@@ -978,15 +1108,74 @@
       exitEditMode();
     }
 
+    // Both surfaces that can CLOSE an action — the row checkbox and the status
+    // dropdown — write through here, so a refusal is never mistaken for a save
+    // (act:cbf19c3f). Closing now runs the completion gate server-side and a
+    // refusal comes back with a message saying how to close it properly; the old
+    // code fired and forgot, then optimistically flipped the row, which is
+    // exactly what kept the ungated closure path invisible. Returns true only
+    // when the write actually landed. (The flag toggle and the edit-mode save
+    // stay on their own fetches — neither can write a completion.)
+    async function patchAction(fid, body) {
+      let res;
+      try {
+        res = await fetch(`/api/action/${encodeURIComponent(fid)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      } catch (e) {
+        alert(`Could not reach the work tracker server: ${e.message}`);
+        return false;
+      }
+      if (res.ok) {
+        // The server can attach a teaching note to a successful write (e.g.
+        // reopening a child under a DONE project — allowed, but it leaves
+        // live work under a completed container). Surface it non-blockingly.
+        try {
+          const data = await res.json();
+          if (data && data.note) showNote(data.note);
+        } catch {}
+        return true;
+      }
+      let msg = `The server refused that change (${res.status}).`;
+      try {
+        const err = await res.json();
+        msg = err.message || err.error || msg;
+      } catch {}
+      alert(msg);
+      // The page never polls and never reloads, so a refusal must not leave a
+      // row showing something the database disagrees with. That is reachable
+      // without any exotic input: double-click the checkbox, or have Claude
+      // close the action over MCP while this page is open, and the refusal is
+      // "already done" against a row still drawn as open. Re-read the one row.
+      await reconcileAction(fid);
+      return false;
+    }
+
+    // Re-read a single action from the server and redraw from that, discarding
+    // whatever the page believed.
+    async function reconcileAction(fid) {
+      try {
+        const res = await fetch(`/api/action/${encodeURIComponent(fid)}`);
+        if (!res.ok) return;
+        const fresh = await res.json();
+        const i = actions.findIndex(x => x.fid === fid);
+        if (i !== -1) actions[i] = { ...actions[i], ...fresh };
+        render();
+      } catch {}
+    }
+
     async function updateStatus(newStatus) {
       const a = actions.find(x => x.fid === editingFid);
       if (!a) return;
       const completed = newStatus === 'done' ? 1 : 0;
-      await fetch(`/api/action/${encodeURIComponent(editingFid)}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: newStatus, completed }),
-      });
+      const ok = await patchAction(editingFid, { status: newStatus, completed });
+      if (!ok) {
+        // Put the dropdown back where the action actually is.
+        renderEditBar(a);
+        return;
+      }
       a.status = newStatus;
       a.completed = completed;
       // Update meta badge
@@ -1006,6 +1195,23 @@
       if (!el) return;
       el.classList.add('show');
       setTimeout(() => el.classList.remove('show'), 1500);
+    }
+
+    // Non-blocking teaching toast (never alert(): it blocks the page and any
+    // browser automation driving it). Click to dismiss early.
+    let noteTimer = null;
+    function showNote(msg) {
+      let el = document.getElementById('note-toast');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'note-toast';
+        el.addEventListener('click', () => el.classList.remove('show'));
+        document.body.appendChild(el);
+      }
+      el.textContent = msg;
+      el.classList.add('show');
+      if (noteTimer) clearTimeout(noteTimer);
+      noteTimer = setTimeout(() => el.classList.remove('show'), 10000);
     }
 
     // Events
@@ -1081,11 +1287,10 @@
         const a = actions.find(x => x.fid === fid);
         if (!a) return;
         const newVal = a.completed ? 0 : 1;
-        fetch(`/api/action/${encodeURIComponent(fid)}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ completed: newVal, status: newVal ? 'done' : 'open' }),
-        }).then(() => {
+        patchAction(fid, { completed: newVal, status: newVal ? 'done' : 'open' }).then(ok => {
+          // A refused close leaves the row exactly as it is — the checkbox must
+          // never show a closure the database did not accept.
+          if (!ok) return;
           a.completed = newVal;
           a.status = newVal ? 'done' : 'open';
           render();

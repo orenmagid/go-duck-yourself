@@ -96,11 +96,14 @@ const MODEL = 'claude-sonnet-4-6';
 // pt2) handles; preprocessing's pre-truncation means that is the largest
 // untruncated sessions only.
 const SINGLE_CALL_TRANSCRIPT_BUDGET = 300_000;
-// Completion detection (Phase 2c) stays deliberately recency-biased: a missed
-// completion is recoverable next session, a missed lesson is not. It routes
-// through recentSlice too — the recency bias is now an explicit CHOICE, not
-// an accidental front-slice.
-const COMPLETION_TRANSCRIPT_BUDGET = 50_000;
+// COMPLETION_TRANSCRIPT_BUDGET (50_000) is GONE (act:25b2c277). It was the same
+// inherited front-slice number as every other budget; act:edd79e15 kept it for
+// Phase 2c and justified it as "a missed completion is recoverable next session,
+// a missed lesson is not". The premise is false: each session evaluates every
+// open action against THAT session's transcript only, so a completion whose
+// evidence fell outside the window is never revisited unless the same work
+// happens to be discussed again. There was no second look to rely on. Phase 2c
+// now reads the shared slice like the rest of the group.
 // M2 Phase B (act:edd79e15 pt2): when a compressed transcript exceeds the
 // single-call budget, extraction chunks it into OVERLAPPING windows so a lesson
 // straddling a boundary survives in at least one chunk. Bounded fallback only —
@@ -222,7 +225,64 @@ let apiCallsFailed = 0;
 // stamps now() exactly as before (byte-identical live behavior).
 let reprocessTs = null;
 
-async function claudeCall(systemPrompt, userMessage) {
+// --- Prompt caching (act:25b2c277) ---
+// Ring 3 sends the SAME transcript ~9 times per session close (2b, 2b2, the
+// four advisors, and the three lenses). Those calls could never share a cache
+// entry: prefixes build tools -> system -> messages, and each phase's own
+// instruction sat in `system`, AHEAD of the identical transcript, invalidating
+// everything after it. Measured 2026-08-09 over 28.3d: both cache fields 0 on
+// all 11,894 usage records; ~a third of Ring 3's $566/mo was one transcript
+// re-sent.
+//
+// The fix is order, not size. Only 1 of 15 system prompts (Phase 2d, 1,761
+// tokens) even clears Sonnet's 1,024-token minimum cacheable prefix, and
+// caching it alone is NET NEGATIVE — one write per close, no second reader.
+// So the transcript becomes the cached prefix and each phase's instruction
+// rides AFTER it, which is also the shape Anthropic's long-context guidance
+// recommends ("put longform data at the top… queries at the end can improve
+// response quality by up to 30 percent").
+//
+// SHARED_PREFACE must stay BYTE-IDENTICAL across every group member — it is
+// the `system` block ahead of the cached transcript, so any per-phase variation
+// here silently un-shares the entry and returns the cost to where it was.
+export const SHARED_PREFACE = 'You are analyzing a finished Claude Code session transcript. The transcript appears first. Your specific task appears after it — read the whole task before answering.';
+
+// The ONE definition of the cached block. Every group member derives its
+// transcript through this, so byte-identity is by construction rather than by
+// nine call sites agreeing. Phases 2b/2b2 previously passed raw `compressed`
+// while the rest passed the 300K tail — identical only while the transcript
+// stayed under budget, so long sessions silently un-shared. Recomputing the
+// slice per call is a string op on <=400K chars; cheap next to a model call.
+export function cacheableTranscript(compressed) {
+  return recentSlice(compressed, SINGLE_CALL_TRANSCRIPT_BUDGET);
+}
+
+// Gate for the whole mechanism (config.ring3.prompt_caching, default ON).
+// Module-scoped like reprocessTs: claudeCall is the single API chokepoint and
+// has no config handle of its own. Set once in main().
+let promptCachingEnabled = true;
+
+export function setPromptCaching(enabled) { promptCachingEnabled = enabled !== false; }
+
+// The request-shaping decision, pure and exported so the cache contract is
+// testable without an SDK or a network. claudeCall is a thin wrapper over it.
+export function buildRequestShape(systemPrompt, userMessage, cachePrefix, caching) {
+  if (!cachePrefix) return { system: systemPrompt, content: userMessage };
+  if (!caching) {
+    // Exact pre-act:25b2c277 shape: phase instruction in `system`, transcript
+    // alone in the message. The flag reverts the reorder, not just the cache.
+    return { system: userMessage, content: cachePrefix };
+  }
+  return {
+    system: systemPrompt,
+    content: [
+      { type: 'text', text: cachePrefix, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: userMessage },
+    ],
+  };
+}
+
+async function claudeCall(systemPrompt, userMessage, { cachePrefix = null } = {}) {
   apiCallsAttempted++;
   // Once a systemic failure is latched, every subsequent phase would fail the
   // same way — stop hammering a dead API (the July outage burned ~15 failed
@@ -238,11 +298,20 @@ async function claudeCall(systemPrompt, userMessage) {
     // call too, or the all-api-phases-failed detector would undercount and a
     // total-outage session could slip through as "not all failed" (act:6fb2b7d1).
     const client = await getAnthropicClient();
+    // Group calls (cachePrefix set) render transcript-first with the phase
+    // instruction after it, and mark the transcript as the cache breakpoint.
+    // With caching disabled the call reverts EXACTLY to the pre-act:25b2c277
+    // shape — phase instruction in `system`, transcript alone in the message —
+    // so the flag rolls back the prompt REORDER too, not merely the
+    // cache_control. A quality regression and a cost regression are both one
+    // config edit away from rollback; that is the point of a full revert.
+    const { system, content } = buildRequestShape(
+      systemPrompt, userMessage, cachePrefix, promptCachingEnabled);
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 4096,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userMessage }],
+      system,
+      messages: [{ role: 'user', content }],
     });
     recordApiUsage({ ring: 'ring3', model: MODEL, usage: response.usage }, { watchtowerDir: WATCHTOWER_DIR });
     return response.content[0]?.text || '';
@@ -516,9 +585,13 @@ export function appendRecordPointer(bullets, recordRef) {
 async function sessionSummary(compressed, projectSlug, sessionId) {
   log('Phase 2b: Session summary');
 
-  const systemPrompt = `You are a session summarizer. Given a Claude Code session transcript, produce exactly 3-5 bullet points summarizing what was accomplished. Be specific about file changes, decisions made, and problems solved. Output ONLY the bullet points, one per line, starting with "- ".`;
+  // Cache-group member (act:25b2c277): instruction AFTER the transcript, which
+  // rides in the shared cached block. This phase runs FIRST in main() and is
+  // awaited, so it is the call that WRITES the entry every later member reads.
+  const instruction = `You are a session summarizer. Given the Claude Code session transcript above, produce exactly 3-5 bullet points summarizing what was accomplished. Be specific about file changes, decisions made, and problems solved. Output ONLY the bullet points, one per line, starting with "- ".`;
 
-  const response = await claudeCall(systemPrompt, compressed);
+  const response = await claudeCall(SHARED_PREFACE, instruction,
+    { cachePrefix: cacheableTranscript(compressed) });
   // The COMPLETE model bullet set — the single source for BOTH the per-session
   // record and the inline "## Last Session" block. Never sliced or truncated
   // for the inline section (act:ac119994): the inline block was historically a
@@ -833,7 +906,12 @@ async function threadCapture(compressed, projectSlug, sessionId, summary, transc
     ? existingThreads.map(t => `- ${t.id}: ${t.what}`).join('\n')
     : '(no active threads yet)';
 
-  const systemPrompt = `You identify which LINES OF WORK a session contributed to, so future sessions can pick up where this one left off.
+  // Cache-group member (act:25b2c277). Note this prompt interpolates the LIVE
+  // thread list mid-body — as a `system` block that made it unshareable twice
+  // over (per-phase AND per-run), and only its ~464-token head was ever stable,
+  // under Sonnet's 1,024 floor. Riding after the cached transcript, the
+  // interpolation is harmless: it sits past the breakpoint.
+  const instruction = `You identify which LINES OF WORK a session contributed to, so future sessions can pick up where this one left off.
 
 A thread is a durable work stream that spans multiple sessions — not a task, not a routine operation. Threads exist at DIFFERENT ZOOM LEVELS, and a session normally touches several at once:
 - Initiative level (REQUIRED when real work happened): the specific line of work — "maginnis-email-system", "watchtower-threading", "mux-dx". This is the level that matters most and the one most often missed. Always name it.
@@ -878,7 +956,8 @@ Rules:
 - Capture what you LEARNED, not what you DID
 - Output ONLY the JSON array, no markdown fences`;
 
-  const response = await callFn(systemPrompt, compressed);
+  const response = await callFn(SHARED_PREFACE, instruction,
+    { cachePrefix: cacheableTranscript(compressed) });
 
   let threads;
   try {
@@ -1074,7 +1153,19 @@ async function workItemClosure(compressed, project, threadIds = [], sessionStart
     return `- ${a.fid}: ${a.text} (${a.status})${acBlock}`;
   }).join('\n');
 
-  const systemPrompt = `You are evaluating which work items appear completed based on a session transcript. For each action, assess confidence:
+  // Cache-group member (act:25b2c277 follow-up). This phase's 50K budget was the
+  // SAME inherited front-slice number as the others; act:edd79e15 kept it and
+  // wrote a rationale — "a missed completion is recoverable next session, a
+  // missed lesson is not". That safety net does not exist: each session checks
+  // every open action against THAT session's transcript only, so a completion
+  // whose evidence fell outside the window is never revisited unless the work
+  // happens to come up again. Finish something and move on and it stays open.
+  //
+  // CALIBRATION FENCE (act:ea23b3a5): the anti-predictive-`high` measurement
+  // holds for this rubric AS WRITTEN. The rubric is unchanged here, but the
+  // INPUT is ~6x wider — re-measure precision per confidence band before
+  // trusting the existing suppression thresholds.
+  const instruction = `You are evaluating which work items appear completed based on the session transcript above. For each action, assess confidence:
 - "high" = clearly completed in the transcript (code written, committed, tests passing, etc.)
 - "medium" = partially done or implied complete but not confirmed
 - "low" = mentioned but unclear if completed
@@ -1096,12 +1187,17 @@ Output ONLY the JSON array, no other text.`;
   // The SAME slice is the model's haystack and the quote checker's — captured
   // once so the two can never drift apart (a quote can only be verified against
   // the text the model was actually shown).
-  const transcriptSlice = recentSlice(compressed, COMPLETION_TRANSCRIPT_BUDGET);
-  const userMessage = `Open actions:\n${actionList}\n\nSession transcript:\n${transcriptSlice}`;
+  const transcriptSlice = cacheableTranscript(compressed);
+  // The open-actions list stays AHEAD of the instruction, because the prompt
+  // refers to it positionally three times ("the list of open actions above",
+  // "Some actions above carry…", "the acceptance criteria block above"). Only
+  // the transcript moved — every one of those references is still true.
+  const userMessage = `Open actions:\n${actionList}\n\n${instruction}`;
 
   let evaluations = [];
   try {
-    const response = await claudeCall(systemPrompt, userMessage);
+    const response = await claudeCall(SHARED_PREFACE, userMessage,
+      { cachePrefix: transcriptSlice });
     // Extract JSON from response (handle markdown code fences)
     const jsonMatch = response.match(/\[[\s\S]*\]/);
     if (jsonMatch) {
@@ -1976,8 +2072,12 @@ function mergeChunkExtractions(perChunk) {
 // Shared by the Phase A single call and each Phase B chunk. Throws on a call or
 // JSON error so the caller decides the fail-direction (Phase A returns nothing;
 // Phase B isolates per chunk so one bad window doesn't lose the others).
-async function runExtractionCall(callFn, systemPrompt, userMessage) {
-  const response = await callFn(systemPrompt, userMessage);
+async function runExtractionCall(callFn, userMessage, { cachePrefix = null } = {}) {
+  // Both paths render transcript-first with the instruction last, so Phase 2d
+  // behaves identically on short and long sessions. Only the single-call path
+  // passes a cachePrefix: each Phase B window is used exactly once, so caching
+  // one would pay the 1.25x write premium for a read that never comes.
+  const response = await callFn(SHARED_PREFACE, userMessage, { cachePrefix });
   const jsonMatch = response.match(/\[[\s\S]*\]/);
   return jsonMatch ? JSON.parse(jsonMatch[0]) : [];
 }
@@ -2678,7 +2778,10 @@ async function decisionExtraction(compressed, project, sessionId, transcriptPath
   // distinguishable from "the memory corpus never loaded".
   log(`Phase 2d: memory corpus — ${memoryTitles.length} title(s), ${memoryEntries.length} dedup entr(ies), ${memoryPromptLines.length} novelty line(s)`);
 
-  const transcript = recentSlice(compressed, SINGLE_CALL_TRANSCRIPT_BUDGET);
+  // Routed through the shared helper, not an equivalent expression: the two
+  // were byte-identical by coincidence, and a change to one would have
+  // silently un-shared the entry rather than failing.
+  const transcript = cacheableTranscript(compressed);
   // M1b prefilter: the saved titles most relevant to THIS session (scored over
   // the full compressed transcript, not just the recent slice).
   // act:471941c9 part 4: scored over `memoryPromptLines` (title — description),
@@ -2700,7 +2803,11 @@ async function decisionExtraction(compressed, project, sessionId, transcriptPath
   const nearbyPending = selectNearbyPendingItems(pendingItemsForRelation, compressed);
   const pendingByTitle = new Map(nearbyPending.map((p) => [p.title, p.id]));
 
-  const systemPrompt = `You are extracting decisions, constraints, lessons, and user preferences from a Claude Code session transcript. For each item found, classify its home:
+  // Cache-group member (act:25b2c277 follow-up). The single-call path binds the
+  // SAME slice as cacheableTranscript() and was already transcript-first, so it
+  // joins the shared entry for free — it was excluded on a misreading of the
+  // chunked path, which is the only one whose windows genuinely differ.
+  const instruction = `You are extracting decisions, constraints, lessons, and user preferences from the Claude Code session transcript above. For each item found, classify its home:
 
 - "memory" = a lesson, preference, or constraint worth remembering across sessions
 - "claude-md" = a convention or rule that should be added to CLAUDE.md
@@ -2768,7 +2875,8 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
       const perChunk = [];
       for (const window of windows) {
         try {
-          perChunk.push(await runExtractionCall(callFn, systemPrompt, `${window}${savedBlock}${pendingBlock}`));
+          perChunk.push(await runExtractionCall(
+            callFn, `${window}\n\n${instruction}${savedBlock}${pendingBlock}`));
         } catch (e) {
           logError(`Phase 2d: M2-B chunk extraction failed (${e.message}) — continuing with the other windows`);
           perChunk.push([]);
@@ -2776,7 +2884,12 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
       }
       extractions = mergeChunkExtractions(perChunk);
     } else {
-      extractions = await runExtractionCall(callFn, systemPrompt, `${transcript}${savedBlock}${pendingBlock}`);
+      // Instruction ahead of the saved/pending lists: the prompt itself says
+      // those lists appear "at the very end of the input", and that was true
+      // when the instruction lived in `system`. Keep it true.
+      extractions = await runExtractionCall(
+        callFn, `${instruction}${savedBlock}${pendingBlock}`,
+        { cachePrefix: transcript });
     }
   } catch (e) {
     logError(`Phase 2d: Claude extraction failed: ${e.message}`);
@@ -3043,7 +3156,11 @@ Output ONLY the JSON array, no other text. If nothing found, output [].`;
 // found all three classes filed as pattern promotions (no-gap positives,
 // truncated-transcript disclaimers, document echoes), and without the test
 // they are one refactor away from silently vanishing.
-export const QUALITY_PATTERN_SYSTEM_PROMPT = `You are analyzing a Claude Code session transcript for recurring quality patterns — issues, gaps, friction, or anti-patterns that surface during any kind of work (coding, debugging, planning, auditing, reviewing). Identify patterns worth learning from: things that keep going wrong, systematic gaps, workflow friction, or quality issues that a team member should watch for in future sessions.
+// NAME IS NOW HISTORICAL (act:25b2c277): this rides AFTER the cached transcript
+// as the user-message instruction, not in `system`. Kept under the old name —
+// watchtower-contracts.md, templates/CLAUDE.md, a ring2 comment and
+// ring2-pattern-gate.test.mjs all refer to it by this identifier.
+export const QUALITY_PATTERN_SYSTEM_PROMPT = `You are analyzing the Claude Code session transcript above for recurring quality patterns — issues, gaps, friction, or anti-patterns that surface during any kind of work (coding, debugging, planning, auditing, reviewing). Identify patterns worth learning from: things that keep going wrong, systematic gaps, workflow friction, or quality issues that a team member should watch for in future sessions.
 
 Only report PROBLEMATIC patterns:
 - Do NOT emit a section for behavior that was correct — a "no gap" observation is not a pattern.
@@ -3071,14 +3188,21 @@ async function qualityPatternCapture(compressed, projectPath) {
     }
   }
 
-  const systemPrompt = QUALITY_PATTERN_SYSTEM_PROMPT;
-
+  // Cache-group member (act:25b2c277 follow-up). This phase read the most-recent
+  // 30K chars — ~7.5K tokens against a 200K-token window. That number is a
+  // LEFTOVER, not a choice: every phase once read `compressed.slice(0, N)` (the
+  // session's BEGINNING), act:edd79e15 flipped them all to recentSlice and
+  // raised the budget to SINGLE_CALL_TRANSCRIPT_BUDGET for the four passes it
+  // called knowledge-critical, and this one kept its old size. Widening it
+  // finishes that fix and joins the shared entry; the "Session transcript:"
+  // label is dropped so the cached block is byte-identical to the group's.
   const userMessage = triageHistory
-    ? `Session transcript:\n${recentSlice(compressed, 30000)}\n\nAudit triage history:\n${triageHistory.slice(0, 10000)}`
-    : `Session transcript:\n${recentSlice(compressed, 30000)}`;
+    ? `${QUALITY_PATTERN_SYSTEM_PROMPT}\n\nAudit triage history:\n${triageHistory.slice(0, 10000)}`
+    : QUALITY_PATTERN_SYSTEM_PROMPT;
 
   try {
-    const response = await claudeCall(systemPrompt, userMessage);
+    const response = await claudeCall(SHARED_PREFACE, userMessage,
+      { cachePrefix: cacheableTranscript(compressed) });
 
     if (response.includes('No recurring patterns detected')) {
       log('Phase 2e: No quality patterns detected');
@@ -3115,15 +3239,17 @@ async function methodologyCapture(compressed, project, threadIds = []) {
   }
 
   try {
+    // Cache-group member (act:25b2c277 follow-up) — same 30K leftover as 2e.
     const response = await claudeCall(
-      `You are checking whether a Claude Code session established a NEW reusable methodology — a new skill, convention, workflow pattern, or rule that should be codified for future sessions. Routine work, bug fixes, and using existing patterns do NOT count. Only report genuinely new methodology that was created or established in this session.
+      SHARED_PREFACE,
+      `You are checking whether the Claude Code session above established a NEW reusable methodology — a new skill, convention, workflow pattern, or rule that should be codified for future sessions. Routine work, bug fixes, and using existing patterns do NOT count. Only report genuinely new methodology that was created or established in this session.
 
 VERIFICATION REQUIREMENT: a methodology only counts if the session produced a durable artifact for it — a file that was created or edited to encode the methodology (a SKILL.md, a rules file, a convention doc, a template, or a test/harness file whose header documents the procedure). Merely discussing or following a pattern does not count. Name the artifact path relative to the project root.
 
 If a new methodology was established, output JSON: {"found": true, "title": "short description", "content": "what the methodology is and how to apply it", "artifact_path": "relative/path/to/the/file"}
 If nothing new was established, output JSON: {"found": false}
 Output ONLY the JSON object.`,
-      recentSlice(compressed, 30000),
+      { cachePrefix: cacheableTranscript(compressed) },
     );
 
     const jsonMatch = response.match(/\{[\s\S]*\}/);
@@ -3196,7 +3322,7 @@ async function upstreamFriction(compressed, project, threadIds = [], { callFn = 
   const projectPath = project.path;
   log('Phase 2g: Upstream friction');
 
-  const systemPrompt = `You are analyzing a Claude Code session transcript for friction with Claude Code itself (bugs, limitations, confusing behavior, missing features, workarounds). Only report genuine CC friction, not user errors or project-specific issues.
+  const instruction = `You are analyzing the Claude Code session transcript above for friction with Claude Code itself (bugs, limitations, confusing behavior, missing features, workarounds). Only report genuine CC friction, not user errors or project-specific issues.
 
 For each finding, decide what can actually be DONE about it, and route it:
 
@@ -3214,7 +3340,9 @@ If NO friction found, output exactly: []
 Be conservative. False positives waste time. Output ONLY the JSON array.`;
 
   try {
-    const response = await callFn(systemPrompt, recentSlice(compressed, 40000));
+    // Cache-group member (act:25b2c277 follow-up) — 40K was the same leftover.
+    const response = await callFn(SHARED_PREFACE, instruction,
+      { cachePrefix: cacheableTranscript(compressed) });
     const jsonMatch = response.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
       log('Phase 2g: No upstream friction (parse failure)');
@@ -3305,7 +3433,10 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
 // process; silence is the expected common case.
 
 const ADVISOR_MAX_FINDINGS = 2;          // per member per session
-const ADVISOR_TRANSCRIPT_SLICE = SINGLE_CALL_TRANSCRIPT_BUDGET; // M2: full recent transcript (was 40_000 front-slice)
+// ADVISOR_TRANSCRIPT_SLICE / LENS_TRANSCRIPT_SLICE were both aliases of
+// SINGLE_CALL_TRANSCRIPT_BUDGET and are now dead: every transcript-sending
+// phase derives its slice from cacheableTranscript(), the single definition
+// that makes the cached block byte-identical across the group (act:25b2c277).
 const ADVISOR_SKILL_SLICE = 8_000;       // chars of member identity
 
 function discoverSessionAdvisors(projectPath) {
@@ -3409,7 +3540,15 @@ async function advisorPass(compressed, project, sessionId, threadIds = [],
     }
   }
 
-  const transcriptSlice = recentSlice(compressed, ADVISOR_TRANSCRIPT_SLICE);
+  // Cache-group member (act:25b2c277) — the biggest single win here: four
+  // advisors previously sent this same transcript four times, each behind a
+  // DIFFERENT `system` block (name + skill body + directive), so four full-price
+  // copies. They fan out via Promise.all below, and a cache entry only becomes
+  // available after the first response BEGINS — so these four would all miss if
+  // they were first. They are not: Phase 2b runs earlier in main() and is
+  // awaited, writing the entry before this fan-out. That ordering is load-bearing
+  // and asserted by ring3-prompt-caching.test.mjs.
+  const transcriptSlice = cacheableTranscript(compressed);
 
   const results = await Promise.all(advisors.map(async (advisor) => {
     try {
@@ -3417,7 +3556,7 @@ async function advisorPass(compressed, project, sessionId, threadIds = [],
       const skillBody = existsSync(skillPath)
         ? readFileSync(skillPath, 'utf8').slice(0, ADVISOR_SKILL_SLICE)
         : '';
-      const systemPrompt = `You are the cabinet member "${advisor.name}", running your AUTOMATIC SESSION-CLOSE pass over a finished Claude Code session transcript. Your identity:
+      const instruction = `You are the cabinet member "${advisor.name}", running your AUTOMATIC SESSION-CLOSE pass over the finished Claude Code session transcript above. Your identity:
 
 ${skillBody}
 
@@ -3429,7 +3568,8 @@ Output a JSON array: [{"title":"short title","summary":"what you observed and wh
 If nothing meets the bar, output exactly: []
 Output ONLY the JSON array, no other text.`;
 
-      const response = await callFn(systemPrompt, transcriptSlice);
+      const response = await callFn(SHARED_PREFACE, instruction,
+        { cachePrefix: transcriptSlice });
       return { advisor, findings: parseAdvisorFindings(response) };
     } catch (e) {
       logError(`Phase 2m: ${advisor.name} pass failed: ${e.message}`);
@@ -3506,7 +3646,6 @@ Output ONLY the JSON array, no other text.`;
 const RAISED_UNHANDLED_MAX = 5;   // loose-end items filed per session
 const SKILL_CANDIDATE_MAX = 3;    // skill candidates filed per session
 const CHECKLIST_CATCH_MAX = 5;    // catches recorded per session
-const LENS_TRANSCRIPT_SLICE = SINGLE_CALL_TRANSCRIPT_BUDGET; // M2: full recent transcript (was 50_000 front-slice)
 
 // parseLensFindings — shared structured-output parser for the inbox lenses.
 // Extracts the first JSON array from the model text, keeps only entries with
@@ -3554,7 +3693,8 @@ async function raisedUnhandledLens(compressed, project, sessionId, transcriptPat
   threadIds = [], { callFn = claudeCall, config = null, sessionWindow = null } = {}) {
   log('Phase 2n: Raised-but-unhandled lens');
 
-  const systemPrompt = `You are scanning a finished Claude Code session transcript for loose ends: things that were RAISED during the session but were neither completed nor recorded anywhere before it ended. Three kinds:
+  // Cache-group member (act:25b2c277): instruction after the cached transcript.
+  const instruction = `You are scanning the finished Claude Code session transcript above for loose ends: things that were RAISED during the session but were neither completed nor recorded anywhere before it ended. Three kinds:
 
 - "promise" — something the assistant or operator said would be done ("I'll also...", "we should later...", "next we need to...") that never happened this session.
 - "side-issue" — a problem or risk noticed in passing and set aside without being fixed or filed.
@@ -3573,7 +3713,8 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
 
   let findings = [];
   try {
-    const response = await callFn(systemPrompt, recentSlice(compressed, LENS_TRANSCRIPT_SLICE));
+    const response = await callFn(SHARED_PREFACE, instruction,
+      { cachePrefix: cacheableTranscript(compressed) });
     findings = parseLensFindings(response, { cap: RAISED_UNHANDLED_MAX, extraKeys: ['kind'] });
   } catch (e) {
     logError(`Phase 2n: Claude scan failed: ${e.message}`);
@@ -3657,7 +3798,8 @@ async function skillCandidateLens(compressed, project, sessionId, transcriptPath
   threadIds = [], { callFn = claudeCall, config = null, sessionWindow = null } = {}) {
   log('Phase 2o: Skill-candidate lens');
 
-  const systemPrompt = `You are scanning a finished Claude Code session transcript for REPEATED MANUAL PROCEDURES that should become a reusable Claude Code skill (slash-command). Look for a multi-step sequence the operator or assistant performed BY HAND two or more times, or an ad-hoc procedure clearly done routinely, where a skill would have automated it.
+  // Cache-group member (act:25b2c277): instruction after the cached transcript.
+  const instruction = `You are scanning the finished Claude Code session transcript above for REPEATED MANUAL PROCEDURES that should become a reusable Claude Code skill (slash-command). Look for a multi-step sequence the operator or assistant performed BY HAND two or more times, or an ad-hoc procedure clearly done routinely, where a skill would have automated it.
 
 A real candidate has:
 - a repeated, multi-step shape (not a one-off, not a single command),
@@ -3676,7 +3818,8 @@ Skill candidates are durable — they are almost never urgent. Output ONLY the J
 
   let findings = [];
   try {
-    const response = await callFn(systemPrompt, recentSlice(compressed, LENS_TRANSCRIPT_SLICE));
+    const response = await callFn(SHARED_PREFACE, instruction,
+      { cachePrefix: cacheableTranscript(compressed) });
     findings = parseLensFindings(response, { cap: SKILL_CANDIDATE_MAX, extraKeys: ['repetition'] });
   } catch (e) {
     logError(`Phase 2o: Claude scan failed: ${e.message}`);
@@ -3867,7 +4010,8 @@ async function checklistCatchLens(compressed, project, sessionId, { callFn = cla
     return { recorded: 0 };
   }
 
-  const systemPrompt = `You are inspecting a finished Claude Code session transcript for CHANGE-IMPACT CHECKLIST CATCHES. The project has a change-impact checklist organized into these dimensions:
+  // Cache-group member (act:25b2c277): instruction after the cached transcript.
+  const instruction = `You are inspecting the finished Claude Code session transcript above for CHANGE-IMPACT CHECKLIST CATCHES. The project has a change-impact checklist organized into these dimensions:
 
 ${dimensionNames.map(n => `- ${n}`).join('\n')}
 
@@ -3885,7 +4029,8 @@ Output ONLY the JSON array. If there were no catches, output exactly: [].`;
 
   let raw = [];
   try {
-    const response = await callFn(systemPrompt, recentSlice(compressed, LENS_TRANSCRIPT_SLICE));
+    const response = await callFn(SHARED_PREFACE, instruction,
+      { cachePrefix: cacheableTranscript(compressed) });
     const jsonMatch = String(response || '').match(/\[[\s\S]*\]/);
     if (jsonMatch) raw = JSON.parse(jsonMatch[0]);
   } catch (e) {
@@ -4584,6 +4729,13 @@ async function main() {
     logError(`Config error: ${e.message}`);
     process.exit(1);
   }
+
+  // Prompt caching, default ON (act:25b2c277). Opt-OUT rather than opt-in: this
+  // is a cost/quality fix on an existing call shape, not a new suppression
+  // surface, and setting it false reverts the group calls to their exact
+  // pre-caching shape (see claudeCall) — so a regression in EITHER direction
+  // rolls back with one config edit and a ring restart.
+  setPromptCaching(config.ring3?.prompt_caching !== false);
 
   // Resolve project — ONE resolution call shared by the live close and the
   // manual-reprocess path (both enter through main()); the transcript's own

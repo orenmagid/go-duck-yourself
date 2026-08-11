@@ -1146,21 +1146,31 @@ async function detectStaleWork(config) {
         });
       }
 
-      // Check for all-done projects (project-completion candidates)
+      // Check for all-done PROJECTS (project-completion candidates). Kind
+      // matters here (three-type model, plan §7/§10.3): an area never
+      // completes, so an all-done area is healthy quiet, not a candidate —
+      // and the item this files instructs a close, which the boundary
+      // refuses for areas. Pre-kind consumer schemas (opened read-only,
+      // never migrated here) fall back to the kind-blind query rather than
+      // silently detecting nothing.
       let allDoneProjects = [];
+      const allDoneSql = (kindClause) =>
+        `SELECT p.fid, p.name FROM projects p
+         WHERE p.status = 'active'${kindClause}
+         AND EXISTS (SELECT 1 FROM actions a WHERE a.project_fid = p.fid)
+         AND NOT EXISTS (
+           SELECT 1 FROM actions a
+           WHERE a.project_fid = p.fid
+           AND a.status != 'done'
+         )`;
       try {
-        allDoneProjects = db.prepare(
-          `SELECT p.fid, p.name FROM projects p
-           WHERE p.status = 'active'
-           AND EXISTS (SELECT 1 FROM actions a WHERE a.project_fid = p.fid)
-           AND NOT EXISTS (
-             SELECT 1 FROM actions a
-             WHERE a.project_fid = p.fid
-             AND a.status != 'done'
-           )`
-        ).all();
+        allDoneProjects = db.prepare(allDoneSql(" AND p.kind = 'project'")).all();
       } catch {
-        // best-effort
+        try {
+          allDoneProjects = db.prepare(allDoneSql('')).all();
+        } catch {
+          // best-effort
+        }
       }
 
       for (const proj of allDoneProjects) {
@@ -1178,7 +1188,7 @@ async function detectStaleWork(config) {
             category: 'project-completion',
             urgency: 'low',
             title: `All done: ${proj.name} in ${name}`,
-            summary: `All actions in project "${proj.name}" are marked done. Consider closing the project.`,
+            summary: `All actions in project "${proj.name}" are marked done — its outcome may be true. Consider completing it through the gate: pib_complete_project ${proj.fid} (fid-only shows the walk sheet; with zero open children it completes directly).`,
             context_anchor: `pib-db project ${proj.fid}`,
             evidence: { project_fid: proj.fid, project_name: proj.name },
           });

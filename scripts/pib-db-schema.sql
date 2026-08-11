@@ -6,10 +6,27 @@
 -- Initialize: node scripts/pib-db.mjs init
 -- Query:      node scripts/pib-db.mjs query "SELECT ..."
 
+-- CONTAINERS — two kinds in one table, one fid namespace (design:
+-- .claude/plans/work-tracker-data-model.md §7, §13; act:14876288).
+--
+-- `kind` carries the completion semantics: an 'area' is a standing
+-- responsibility that never completes ("Is Watchtower done?" has no answer);
+-- a 'project' is an outcome that completes when every child action is closed
+-- or dispositioned. The `prj:` fid prefix is the container NAMESPACE, not a
+-- kind claim — both kinds mint and keep `prj:` fids forever, because the kind
+-- is operator-mutable (reclassification) while fids are referenced from
+-- notes, plan docs, and commit history that can never be rewritten (§13).
+-- Every read surface renders `kind` beside the name so nobody ever infers
+-- kind from the prefix.
+--
+-- The old free-text `area` column (a rotted proto-category field — 62% said
+-- 'dev', nothing consumed it) was DROPPED in migration v11 (base v9); its
+-- non-NULL values live in legacy_area_values below (§14).
 CREATE TABLE IF NOT EXISTS projects (
   fid                TEXT PRIMARY KEY CHECK(fid GLOB 'prj:*'),
   name               TEXT NOT NULL,
-  area               TEXT,
+  kind               TEXT NOT NULL DEFAULT 'area'
+                       CHECK(kind IN ('area','project')),
   status             TEXT NOT NULL DEFAULT 'active'
                        CHECK(status IN ('active','paused','done','dropped','someday')),
   notes              TEXT NOT NULL DEFAULT '',
@@ -21,10 +38,31 @@ CREATE TABLE IF NOT EXISTS projects (
   tags               TEXT NOT NULL DEFAULT ''
 );
 
+-- Archive of the dropped `area` column's non-NULL values (migration v11,
+-- base v9 — §14). Pure history — no shipped code reads it; it exists because
+-- the migration runs automatically on open, and silently destroying data in
+-- an auto-migration would be a silent failure even when the data is measured
+-- junk. Empty on fresh installs.
+CREATE TABLE IF NOT EXISTS legacy_area_values (
+  tbl    TEXT NOT NULL CHECK(tbl IN ('actions','projects')),
+  fid    TEXT NOT NULL,
+  value  TEXT NOT NULL,
+  PRIMARY KEY (tbl, fid)
+);
+
+-- `resolution` is the typed completion claim (migration v12, base v10;
+-- design §16.1). Exactly two writers: completeAction stamps 'verified'
+-- (every route to it is gated — MCP hook, tracker delegation, the CLI's
+-- Bash-guard arm), and the propagation walk's typed closure stamps
+-- 'parent-outcome' (done by the fact of the parent project's outcome — a
+-- materially different claim from verified acceptance criteria, and the
+-- record must tell them apart forever, §10.2). NULL is honest: a closed row
+-- with NULL resolution predates the feature ("unknown", never coerced); an
+-- open row is NULL by definition — every reopen path clears it. The CHECK
+-- closes the vocabulary so a typo cannot mint a third resolution.
 CREATE TABLE IF NOT EXISTS actions (
   fid                TEXT PRIMARY KEY CHECK(fid GLOB 'act:*'),
   text               TEXT NOT NULL,
-  area               TEXT,
   project_fid        TEXT REFERENCES projects(fid) ON DELETE SET NULL,
   due                TEXT,
   flagged            INTEGER NOT NULL DEFAULT 0 CHECK(flagged IN (0, 1)),
@@ -37,7 +75,8 @@ CREATE TABLE IF NOT EXISTS actions (
   created            TEXT NOT NULL CHECK(created GLOB '????-??-??'),
   notes              TEXT NOT NULL DEFAULT '',
   deleted_at         TEXT,
-  trigger_condition  TEXT
+  trigger_condition  TEXT,
+  resolution         TEXT CHECK(resolution IN ('verified','parent-outcome'))
 );
 
 CREATE TABLE IF NOT EXISTS audit_runs (
@@ -73,6 +112,72 @@ CREATE TABLE IF NOT EXISTS audit_findings (
   annotations         TEXT,  -- JSON array of Stage-2 critic annotations
   rebuttal            TEXT   -- JSON object: Stage-1 member's response to challenges
 );
+
+-- Action-to-action dependency, as a real edge (act:d46f3b48; design in
+-- .claude/plans/work-tracker-data-model.md §12).
+--
+-- ONE directed row read from both ends: "A blocks B" and "B depends on A" are
+-- the same fact spoken from opposite sides. Columns are named for their ROLES,
+-- never from/to — a reversed edge is the likeliest defect in any dependency
+-- feature, and from/to offers no defense in a review or a raw SQL read.
+--
+-- NOT NULL is load-bearing and is NOT implied by the composite PRIMARY KEY.
+-- Verified on SQLite 3.51.3: a non-INTEGER PK on a rowid table accepts NULLs
+-- (two rows with a NULL blocker landed in the same table), and SQLite skips
+-- foreign-key validation entirely when the child key is NULL — so without
+-- these declarations both the duplicate defense and the dangling-target
+-- defense silently evaporate.
+--
+-- No ON DELETE clause, deliberately — the same call engagement_events makes
+-- and documents. NO ACTION means a hard delete of a referenced action fails
+-- loudly; soft delete (deleted_at) is the retirement path, and a soft-deleted
+-- endpoint suspends its edges rather than destroying them. CASCADE would also
+-- be client-dependent: foreign_keys defaults ON under better-sqlite3 and OFF
+-- under the sqlite3 CLI, so one manual delete would erase edge history through
+-- one client and orphan it through the other. Contrast trigger_checks below,
+-- which takes no FK for the opposite reason (orphan history is wanted there).
+--
+-- The row is DURABLE. An endpoint completing, reopening, or being soft-deleted
+-- never rewrites it: whether an action is blocked RIGHT NOW is derived on every
+-- read (§12.3). A stored is_blocked flag is precisely the rot this model exists
+-- to abolish — it is what happened to the `pre-launch` tag and to sort_order.
+--
+-- EXTENDING THIS: a different RELATION gets its own table, not a `kind` column
+-- here. The column names are specific to THIS relation — a containment or
+-- see-also edge would leave `blocker_fid` holding something that does not
+-- block, which is exactly the misinformation the role-naming exists to prevent.
+CREATE TABLE IF NOT EXISTS action_dependencies (
+  blocker_fid  TEXT NOT NULL REFERENCES actions(fid),
+  blocked_fid  TEXT NOT NULL REFERENCES actions(fid),
+  created      TEXT NOT NULL CHECK(created GLOB '????-??-??'),
+  PRIMARY KEY (blocker_fid, blocked_fid)
+);
+CREATE INDEX IF NOT EXISTS idx_action_deps_blocked ON action_dependencies(blocked_fid);
+CREATE INDEX IF NOT EXISTS idx_action_deps_blocker ON action_dependencies(blocker_fid);
+
+-- Append-only walk-level record of completion propagation (migration v12,
+-- base v10; design §16.5 Shape B). ONE row per walk of pib_complete_project:
+-- the project walked, the walk's shared ISO timestamp, and the FULL
+-- disposition map as JSON — every answer with its seen_status echo, plus
+-- apply-time skips — so the record shows what was decided AND what had
+-- already happened by other hands.
+--
+-- This table is why §10.2's "distinguishable forever" survives: the
+-- actions.resolution column CLEARS on reopen by design, so the column alone
+-- carries the distinction only while the row stays closed, and reparent /
+-- delete answers never touch the column at all. The event row is what makes
+-- a project-reopen's hand-reversal informed.
+--
+-- project_fid is deliberately NOT unique: a reopen-then-re-walk legitimately
+-- appends a second row. NO foreign key, following trigger_checks' documented
+-- precedent — history must survive its subject.
+CREATE TABLE IF NOT EXISTS propagation_events (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_fid  TEXT NOT NULL,
+  walked_at    TEXT NOT NULL,
+  map          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_propagation_events_project ON propagation_events(project_fid);
 
 -- Append-only history of trigger-condition evaluations.
 -- No foreign key to actions/projects: if the target row is later deleted,

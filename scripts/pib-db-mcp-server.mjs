@@ -47,13 +47,13 @@ function getDb() {
 const TOOLS = [
   {
     name: 'pib_create_project',
-    description: 'Create a new project in pib-db.',
+    description: `Create a CONTAINER for actions. Two kinds, opposite completion semantics — the test is one question: can you say when it is done? An AREA (the default) is a standing responsibility that never completes — "Is Watchtower done?" has no answer. A PROJECT is an outcome that DOES complete: its notes must state that outcome ("done when …" — that statement is the test its completion is judged against), and it can close only when every child action is closed or dispositioned. If you are about to create several actions whose titles encode their position in something bigger (Phase 2, Lane B, Child 3), that something is a project — create it and parent them via projectFid instead of putting hierarchy in titles. Note the fid prefix "prj:" is the container NAMESPACE, not a kind claim: both kinds carry prj: ids forever (the kind lives in the kind field and can be changed later via pib_update_project — ids never change).`,
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Project name' },
-        area: { type: 'string', description: 'Area (e.g., dev, ops, docs)' },
-        notes: { type: 'string', description: 'Project notes' },
+        name: { type: 'string', description: 'Container name' },
+        kind: { type: 'string', enum: ['area', 'project'], description: "Container kind: 'area' (standing responsibility, never completes — the default) or 'project' (an outcome that completes; notes must state it)" },
+        notes: { type: 'string', description: "Notes. For kind='project' this must state the outcome — it is the completion criterion. For an area, optional." },
         due: { type: 'string', description: 'Due date (YYYY-MM-DD)' },
         tags: { type: 'string', description: 'Comma-separated tags (e.g., client-visible)' },
       },
@@ -62,33 +62,58 @@ const TOOLS = [
   },
   {
     name: 'pib_update_project',
-    description: 'Update fields on an existing project.',
+    description: `Update fields on an existing container, including reclassifying it between area and project via kind — an operator judgment, one container at a time, never scripted in bulk. Completion is kind-asymmetric: status='done' is REFUSED for an area (an area never completes; use status='dropped' to stop holding the responsibility), and for a project it is refused while any child action is still open.`,
     inputSchema: {
       type: 'object',
       properties: {
-        fid: { type: 'string', description: 'Project fid (e.g., prj:abc12345)' },
+        fid: { type: 'string', description: 'Container fid (e.g., prj:abc12345 — both kinds carry prj: ids)' },
+        kind: { type: 'string', enum: ['area', 'project'], description: "Reclassify the container. Promoting to 'project' gives it a completion semantic; its notes should state the outcome." },
         tags: { type: 'string', description: 'Comma-separated tags' },
-        name: { type: 'string', description: 'New project name' },
-        status: { type: 'string', description: 'New status', enum: ['active', 'paused', 'done', 'dropped', 'someday'] },
+        name: { type: 'string', description: 'New container name' },
+        status: { type: 'string', description: "New status. 'done' is refused for areas, and for projects with open children.", enum: ['active', 'paused', 'done', 'dropped', 'someday'] },
         notes: { type: 'string', description: 'Updated notes' },
+        due: { type: 'string', description: 'Due date (YYYY-MM-DD)' },
+      },
+      required: ['fid'],
+    },
+  },
+  {
+    name: 'pib_complete_project',
+    description: `Complete a PROJECT whose outcome became true, walking its open children — the assisted path through the same open-children gate every completion hits, never a bypass. Propose-then-apply: call with just the fid and it mutates NOTHING, returning the walk sheet (every open child with its status, trigger state, and dependency degree). Then answer for EVERY child via map: [{fid, seen_status, answer}] — answer is 'parent-outcome' (done by the fact of the outcome; recorded as a typed closure distinguishable forever from a verified completion), 'reparent:<prj-fid>' (still needed; moves to a live container), or 'delete' (not needed; soft-delete). seen_status must echo the sheet; there is NO bulk default. A child whose acceptance criteria really were VERIFIED is completed first through pib_complete_action (its gate) — already-dispositioned children are then skipped, not refused. Refuses areas (they never complete), already-done projects, incomplete coverage, and stale echoes. All-or-nothing: one transaction ending in the gate.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fid: { type: 'string', description: 'Project fid (prj:... with kind=project). Areas are refused.' },
+        map: {
+          type: 'array',
+          description: 'The per-child disposition map. Omit to get the walk sheet (no mutation).',
+          items: {
+            type: 'object',
+            properties: {
+              fid: { type: 'string', description: 'Open child action fid (act:...)' },
+              seen_status: { type: 'string', description: "The status the walk sheet showed for this child — the informed-answer echo. Refused if the child's status changed since." },
+              answer: { type: 'string', description: "'parent-outcome' | 'reparent:<prj-fid>' | 'delete'" },
+            },
+            required: ['fid', 'seen_status', 'answer'],
+          },
+        },
       },
       required: ['fid'],
     },
   },
   {
     name: 'pib_list_projects',
-    description: 'List active projects.',
+    description: 'List active containers. Each row carries its kind (area = standing responsibility, never completes; project = outcome that completes) and its open-action count.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'pib_create_action',
-    description: 'Create a new action (work item). Notes MUST contain a "## Surface Area" section with at least one "- files:" or "- dirs:" line.',
+    description: 'Create a new action (work item — a single step). Notes MUST contain a "## Surface Area" section with at least one "- files:" or "- dirs:" line. If this action cannot START until another action is finished, do NOT write that in the title or notes as prose — create it, then state the dependency with pib_add_dependency, which makes it a real edge the "what can I start now" query reads. And if the title is about to encode its position in something bigger (Phase 2, Lane B, Child 3), that something is a PROJECT — create it with pib_create_project and parent this action via projectFid instead of putting hierarchy in the title.',
     inputSchema: {
       type: 'object',
       properties: {
         text: { type: 'string', description: 'Action description' },
-        area: { type: 'string', description: 'Area (e.g., dev, ops, docs)' },
-        projectFid: { type: 'string', description: 'Project fid (e.g., prj:abc12345)' },
+        projectFid: { type: 'string', description: 'Parent container fid (e.g., prj:abc12345 — an area or a project)' },
         due: { type: 'string', description: 'Due date (YYYY-MM-DD)' },
         notes: { type: 'string', description: 'Action notes. Must include ## Surface Area section with - files: or - dirs: lines.' },
       },
@@ -108,7 +133,7 @@ const TOOLS = [
   },
   {
     name: 'pib_update_action',
-    description: 'Update fields on an existing action, including reparenting it to a different project via projectFid.',
+    description: 'Update fields on an existing action, including reparenting it to a different project via projectFid. To record that this action is waiting on ANOTHER ACTION, use pib_add_dependency rather than setting status=blocked or describing the wait in text — status is a conclusion that goes stale, an edge is a fact that stays true. status=done is refused here; use pib_complete_action.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -126,7 +151,7 @@ const TOOLS = [
   },
   {
     name: 'pib_complete_action',
-    description: 'Mark an action as complete (status=done).',
+    description: "Mark an action as complete (status=done). Stamps resolution='verified' — the typed claim that its acceptance criteria were checked, which is exactly what the verification-breadcrumb gate on this tool proves. A child being closed only because its parent project's outcome became true is a different claim: that goes through pib_complete_project's walk instead.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -258,6 +283,62 @@ const TOOLS = [
     },
   },
   {
+    name: 'pib_add_dependency',
+    description: 'State that one action must finish before another can start. ONE directed edge, read from both ends: "blockerFid blocks blockedFid" and "blockedFid depends on blockerFid" are the same statement. Use this INSTEAD of writing the dependency as prose in a title, in notes, or in a trigger condition — an edge is read by pib_next_actions, prose is read by nobody. Edges may cross project and area boundaries. A cycle, a self-edge, and an unknown or deleted endpoint are all refused.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        blockerFid: { type: 'string', description: 'The action that must FINISH FIRST (e.g., act:abc12345)' },
+        blockedFid: { type: 'string', description: 'The action that WAITS for it (e.g., act:def67890)' },
+      },
+      required: ['blockerFid', 'blockedFid'],
+    },
+  },
+  {
+    name: 'pib_remove_dependency',
+    description: 'Remove a dependency edge between two actions. Note that a completed blocker does NOT need its edge removed — blockedness is derived on every read, so completing the blocker already unblocks its dependents, and the edge stays as the durable record of why the wait existed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        blockerFid: { type: 'string', description: 'The action that must finish first' },
+        blockedFid: { type: 'string', description: 'The action that waits for it' },
+      },
+      required: ['blockerFid', 'blockedFid'],
+    },
+  },
+  {
+    name: 'pib_list_dependencies',
+    description: 'Show both directions for one action: what it is waiting on (blockedBy) and what is waiting on it (blocking), plus a count of blockers that are still unfinished.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fid: { type: 'string', description: 'Action fid (e.g., act:abc12345)' },
+      },
+      required: ['fid'],
+    },
+  },
+  {
+    name: 'pib_next_actions',
+    description: 'What can I start RIGHT NOW. Returns open actions with no unfinished blocker and no unfired trigger condition — the derived answer, recomputed on every call, never stored. Prefer this over pib_list_actions when choosing what to work on: pib_list_actions returns everything open including work that cannot be started yet.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'Limit to one project fid' },
+        limit: { type: 'number', description: 'Maximum rows to return' },
+      },
+    },
+  },
+  {
+    name: 'pib_list_blocked',
+    description: 'The complement of pib_next_actions: what is waiting, and on what. Group by blocker to answer "show me everything blocked on the same gate" — the query that replaces a waiting-for folder. Covers both kinds of wait: unfinished blocker actions, and trigger conditions that have not fired.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'Limit to one project fid' },
+      },
+    },
+  },
+  {
     name: 'pib_query',
     description: 'Run an arbitrary SQL query against the pib database.',
     inputSchema: {
@@ -281,6 +362,8 @@ function handleToolCall(name, args) {
       return lib.createProject(d, args);
     case 'pib_update_project':
       return lib.updateProject(d, args);
+    case 'pib_complete_project':
+      return lib.completeProject(d, args);
     case 'pib_list_projects':
       return lib.listProjects(d);
     case 'pib_create_action':
@@ -314,6 +397,16 @@ function handleToolCall(name, args) {
       return lib.listEngagementEvents(d, args);
     case 'pib_mark_event_addressed':
       return lib.markEventAddressed(d, args);
+    case 'pib_add_dependency':
+      return lib.addDependency(d, args);
+    case 'pib_remove_dependency':
+      return lib.removeDependency(d, args);
+    case 'pib_list_dependencies':
+      return lib.listDependencies(d, args);
+    case 'pib_next_actions':
+      return lib.listStartable(d, args);
+    case 'pib_list_blocked':
+      return lib.listBlocked(d, args);
     case 'pib_query':
       return lib.query(d, args);
     default:

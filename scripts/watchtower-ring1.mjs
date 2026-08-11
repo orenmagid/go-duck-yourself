@@ -374,22 +374,30 @@ function collectPibState(projectPath) {
       pibWarnings.push(`stale-project query failed: ${m}`);
     }
 
-    // Completion candidates (all actions done)
+    // Completion candidates (all actions done) — PROJECTS only: an area
+    // never completes, so an all-done area is a healthy quiet area, not a
+    // candidate (three-type model, plan §7/§10.3). Pre-kind consumer schemas
+    // (Ring 1 opens read-only and never migrates) fall back to the kind-blind
+    // query rather than silently reporting none.
     let completionCandidates = [];
+    const candidateSql = (kindClause) =>
+      `SELECT p.fid, p.name FROM projects p
+       WHERE p.status = 'active' AND p.deleted_at IS NULL${kindClause}
+       AND EXISTS (SELECT 1 FROM actions a WHERE a.project_fid = p.fid AND a.deleted_at IS NULL)
+       AND NOT EXISTS (
+         SELECT 1 FROM actions a
+         WHERE a.project_fid = p.fid
+         AND a.deleted_at IS NULL
+         AND a.status != 'done'
+       )`;
     try {
-      completionCandidates = db.prepare(
-        `SELECT p.fid, p.name FROM projects p
-         WHERE p.status = 'active' AND p.deleted_at IS NULL
-         AND EXISTS (SELECT 1 FROM actions a WHERE a.project_fid = p.fid AND a.deleted_at IS NULL)
-         AND NOT EXISTS (
-           SELECT 1 FROM actions a
-           WHERE a.project_fid = p.fid
-           AND a.deleted_at IS NULL
-           AND a.status != 'done'
-         )`
-      ).all();
+      completionCandidates = db.prepare(candidateSql(" AND p.kind = 'project'")).all();
     } catch {
-      // best-effort
+      try {
+        completionCandidates = db.prepare(candidateSql('')).all();
+      } catch {
+        // best-effort
+      }
     }
 
     // Per-project breakdown for portfolio pulse
@@ -1595,7 +1603,7 @@ function assembleSummary(projectStates, config, extraAttention = []) {
     }
     if (ps.pib && ps.pib.completionCandidates && ps.pib.completionCandidates.length > 0) {
       for (const c of ps.pib.completionCandidates) {
-        attention.push(`${ps.name}/${c.name}: all actions done — close?`);
+        attention.push(`${ps.name}/${c.name}: all actions done — complete it? (pib_complete_project ${c.fid})`);
       }
     }
     if (ps.orphanedWorktrees && ps.orphanedWorktrees.length > 0) {
@@ -1937,7 +1945,7 @@ function assembleProjectState(ps) {
   // backlog-hygiene nudge (act:5e8a9e89) — surfaced here in the per-project
   // deep file so the nudge reads one source instead of re-querying pib.
   if (ps.pib && ps.pib.staleProjects && ps.pib.staleProjects.length > 0) {
-    issues.push(`${ps.pib.staleProjects.length} stale project(s)`);
+    issues.push(`${ps.pib.staleProjects.length} stale container(s)`);
   }
   if (ps.pib && ps.pib.completionCandidates && ps.pib.completionCandidates.length > 0) {
     issues.push(`${ps.pib.completionCandidates.length} completion candidate(s)`);
