@@ -405,6 +405,22 @@
     .kind-tag.area { color: #4dabf7; border-color: #1c7ed655; }
     .flow-figure { font-size: 11px; color: #5c5f66; }
 
+    /* Containment (§17) is rendered as a LINE on each card — a project names
+       the area it serves, an area names how many projects it holds — never as
+       a tree. The two kinds stay in one list ordered by where the work is;
+       indentation would force taxonomic ordering, which is the wrong pairing
+       for the surface people arrive at ready to work. Deliberately quiet: the
+       relationship is context, not the card's headline. */
+    .container-rel {
+      font-size: 11px; color: #5c5f66;
+      border-left: 1px solid #2c2e33; padding-left: 8px; margin-left: 2px;
+    }
+    /* A parent that was deleted SUSPENDS the link rather than clearing it
+       (§12.3) — so the card says so instead of quietly rendering as a root,
+       which is the silent failure the retained pointer exists to prevent. */
+    .container-rel.suspended { color: #e8590c; }
+    .rollup-note { color: #4dabf7; }
+
     /* The typed resolution (§16.1): a child closed because its parent
        project's outcome became true is a materially different claim from one
        whose acceptance criteria were verified, and every read surface renders
@@ -598,6 +614,13 @@
     // State
     let projects = [];
     let actions = [];
+    // Every undeleted container, regardless of status tab. `projects` is what
+    // the current tab DISPLAYS; this is what the parent/child RELATIONSHIPS are
+    // resolved against. They are different questions, and answering the second
+    // with the first is act:59d45d14 — a live area rendering as "area deleted"
+    // on the Done tab, and an area's 30-day figure dropping to zero the moment
+    // the child project holding its closed work was completed.
+    let allContainers = [];
     let ready = { rows: [], danglingEdges: 0, staleBlockedStatus: [], releasedByTrigger: [] };
     let blocked = { rows: [] };
     let currentView = 'projects';
@@ -608,8 +631,9 @@
     // Fetch data
     async function load() {
       try {
-        const [projRes, actRes, statsRes, metaRes, readyRes, blockedRes] = await Promise.all([
+        const [projRes, allRes, actRes, statsRes, metaRes, readyRes, blockedRes] = await Promise.all([
           fetch(`/api/projects?status=${currentStatus}`),
+          fetch('/api/projects?status=all'),
           fetch('/api/actions?status=all'),
           fetch('/api/stats'),
           fetch('/api/meta'),
@@ -617,6 +641,7 @@
           fetch('/api/blocked'),
         ]);
         projects = await projRes.json();
+        allContainers = await allRes.json();
         actions = await actRes.json();
         ready = await readyRes.json();
         blocked = await blockedRes.json();
@@ -675,7 +700,7 @@
               <span class="project-name">${esc(p.name)}</span>
               <div class="project-meta">
                 <span class="kind-tag ${p.kind === 'project' ? 'project' : 'area'}">${p.kind === 'project' ? 'project' : 'area'}</span>
-                <span class="badge badge-someday" title="waiting">waiting</span>
+                <span class="badge badge-someday" title="${esc(p.trigger_condition || '')}">${p.last_result ? 'waiting (last check: ' + esc(p.last_result) + ')' : 'waiting (never checked)'}</span>
                 <span class="badge badge-${p.status}">${p.status}</span>
               </div>
             </div>
@@ -716,10 +741,42 @@
         return;
       }
 
+      // Containment (§17): an AREA contains PROJECTs. Two derived facts per
+      // card, both computed HERE and nowhere else — the server's /api/projects
+      // counts stay direct on purpose, and a second rollup implementation is
+      // exactly what would let the two numbers disagree on screen.
+      // Both maps are built from allContainers, NOT the displayed list: a
+      // parent or child is a relationship, and it does not stop existing
+      // because the current tab filters it out. Against the complete list the
+      // "absent means deleted" inference below is true — /api/projects already
+      // excludes only soft-deleted rows (act:59d45d14).
+      const relatives = allContainers.length ? allContainers : projects;
+      const childrenOf = new Map();
+      for (const c of relatives) {
+        if (!c.parent_fid) continue;
+        if (!childrenOf.has(c.parent_fid)) childrenOf.set(c.parent_fid, []);
+        childrenOf.get(c.parent_fid).push(c);
+      }
+      const nameOf = new Map(relatives.map(c => [c.fid, c.name]));
+
       for (const p of filtered) {
-        const projectActions = actions.filter(a => a.project_fid === p.fid);
+        // An area's work is its OWN actions plus the actions of the projects
+        // inside it. A direct-only count would make carving a project out of
+        // an area LOWER the area's number — reporting the reorganisation as
+        // loss, which is the confusion nesting exists to end. A project rolls
+        // up nothing: containers nest exactly one level.
+        const kids = childrenOf.get(p.fid) || [];
+        const memberFids = new Set([p.fid, ...kids.map(c => c.fid)]);
+        const projectActions = actions.filter(a => memberFids.has(a.project_fid));
+        const directActions = actions.filter(a => a.project_fid === p.fid);
         const open = projectActions.filter(a => !a.completed);
         const done = projectActions.filter(a => a.completed);
+        // The HEADER figures roll up; the BODY rows stay DIRECT. Rolling up
+        // the rows too would print the same action under its project's card
+        // and again under its area's — the relationship is stated as a line
+        // on the card, never as duplicated structure (§17.4).
+        const openDirect = directActions.filter(a => !a.completed);
+        const doneDirect = directActions.filter(a => a.completed);
         const expanded = expandedProjects.has(p.fid);
 
         const card = document.createElement('div');
@@ -738,14 +795,30 @@
         const cutoff30 = new Date(Date.now() - 30 * 86400000).toISOString();
         const closed30 = done.filter(a => a.completed_at && String(a.completed_at) >= cutoff30).length;
 
+        // The relationship is rendered as a LINE on each card, never as a tree
+        // (§17.4). The two kinds stay in ONE list ordered by where the work
+        // is; indentation would force taxonomic ordering, and at ~49
+        // containers with most areas holding no projects it would buy
+        // structure on a handful of rows and cost an indent on every row.
+        const parentName = p.parent_fid ? nameOf.get(p.parent_fid) : null;
+        const parentLine = p.parent_fid
+          ? (parentName
+              ? `<span class="container-rel" title="This project serves that area.">in ${esc(parentName)}</span>`
+              : `<span class="container-rel suspended" title="This project names an area that has been deleted. The link is suspended, not cleared — undeleting the area restores it.">area deleted</span>`)
+          : '';
+        const childLine = kids.length > 0
+          ? `<span class="container-rel" title="${esc(kids.map(c => c.name).join(', '))}">${kids.length} project${kids.length === 1 ? '' : 's'}</span>`
+          : '';
+
         card.innerHTML = `
           <div class="project-header" data-fid="${p.fid}">
             <span class="project-name">${esc(p.name)}</span>
             <div class="project-meta">
               <span class="kind-tag ${isProject ? 'project' : 'area'}">${isProject ? 'project' : 'area'}</span>
+              ${parentLine}${childLine}
               ${isProject
                 ? `<span>${open.length} open / ${projectActions.length} total · ${pct}%</span>`
-                : `<span class="flow-figure">${open.length} open · ${closed30} closed in 30d</span>`}
+                : `<span class="flow-figure">${open.length} open · ${closed30} closed in 30d${kids.length ? ` <span class="rollup-note" title="${openDirect.length} filed directly to this area, ${open.length - openDirect.length} in the ${kids.length} project${kids.length === 1 ? '' : 's'} inside it.">(incl. ${open.length - openDirect.length} in projects)</span>` : ''}</span>`}
               ${isProject && p.status === 'done' && open.length > 0 ? `<span class="badge-done-open" title="A child was reopened (or filed) after this project completed. Reparent the open work to a live container, or reopen the project.">${open.length} open under a done project</span>` : ''}
               ${p.trigger_condition ? `<span class="badge badge-someday" title="${esc(p.trigger_condition)}">waiting</span>` : ''}
               <span class="badge badge-${p.status}">${p.status}</span>
@@ -760,14 +833,19 @@
                 <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
               </div>
             ` : ''}
-            ${renderActionRows(open)}
-            ${done.length > 0 ? `
+            ${renderActionRows(openDirect)}
+            ${doneDirect.length > 0 ? `
               <div style="padding:6px 14px 2px;font-size:11px;color:#5c5f66;border-top:1px solid #2c2e33;">
-                Completed (${done.length})
+                Completed (${doneDirect.length})
               </div>
-              ${renderActionRows(done)}
+              ${renderActionRows(doneDirect)}
             ` : ''}
-            ${projectActions.length === 0 ? '<div style="padding:12px 14px;color:#5c5f66;font-size:12px;">No actions yet.</div>' : ''}
+            ${kids.length > 0 ? `
+              <div style="padding:8px 14px 10px;font-size:11px;color:#5c5f66;border-top:1px solid #2c2e33;">
+                ${open.length - openDirect.length} more open in ${kids.length} project${kids.length === 1 ? '' : 's'} inside this area: ${kids.map(c => esc(c.name)).join(' · ')}
+              </div>
+            ` : ''}
+            ${directActions.length === 0 && kids.length === 0 ? '<div style="padding:12px 14px;color:#5c5f66;font-size:12px;">No actions yet.</div>' : ''}
           </div>
         `;
         root.appendChild(card);
@@ -1235,30 +1313,30 @@
       btn.classList.add('active');
       currentStatus = btn.dataset.status;
       // Reload projects with new status
+      // Every branch refreshes allContainers too: relationships are resolved
+      // against the complete set on EVERY tab, not just the one that happens to
+      // fetch everything (act:59d45d14). The All tab used to fan out one fetch
+      // per status and flatten — that is now the single `status=all` query,
+      // which is also the list every other tab needs.
+      const allFetch = fetch('/api/projects?status=all').then(r => r.json());
       if (currentStatus === 'waiting') {
-        fetch('/api/triggered').then(r => r.json()).then(data => {
+        Promise.all([fetch('/api/triggered').then(r => r.json()), allFetch]).then(([data, all]) => {
           projects = data.projects || [];
           actions = data.actions || [];
+          allContainers = all;
           render();
         });
-      } else if (currentStatus === 'all') {
-        Promise.all(['active', 'done', 'paused', 'dropped', 'someday'].map(s =>
-          fetch(`/api/projects?status=${s}`).then(r => r.json())
-        )).then(results => {
-          projects = results.flat();
-          fetch('/api/actions?status=all').then(r => r.json()).then(act => {
-            actions = act;
-            render();
-          });
-        });
       } else {
-        fetch(`/api/projects?status=${currentStatus}`).then(r => r.json()).then(data => {
-          projects = data;
-          fetch('/api/actions?status=all').then(r => r.json()).then(act => {
+        const listFetch = currentStatus === 'all'
+          ? allFetch
+          : fetch(`/api/projects?status=${currentStatus}`).then(r => r.json());
+        Promise.all([listFetch, allFetch, fetch('/api/actions?status=all').then(r => r.json())])
+          .then(([list, all, act]) => {
+            projects = list;
+            allContainers = all;
             actions = act;
             render();
           });
-        });
       }
     });
 

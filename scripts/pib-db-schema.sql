@@ -22,6 +22,28 @@
 -- The old free-text `area` column (a rotted proto-category field — 62% said
 -- 'dev', nothing consumed it) was DROPPED in migration v11 (base v9); its
 -- non-NULL values live in legacy_area_values below (§14).
+--
+-- `parent_fid` NESTS the two kinds (migration v13, base v11; design §17): an
+-- AREA contains PROJECTs, which is the GTD relationship the vocabulary
+-- borrows and the flat model did not provide. Only a kind='project' row may
+-- carry a parent, and its target must be a kind='area' row — so container
+-- depth is two, and project-under-project is refused. That refusal is
+-- load-bearing, not tidiness: openChildCount (the ONE predicate shared by the
+-- completion gate and the propagation walk's open set, §16.3) counts ACTIONS,
+-- so a project holding an open child PROJECT would complete straight over it.
+--
+-- Read the enforcement honestly, because only half of it is here. The CHECK
+-- below is structural and fires in BOTH directions (an area cannot be given a
+-- parent; a parented project cannot be demoted to an area). The foreign key
+-- refuses a parent that does not exist — FK enforcement is ON under
+-- better-sqlite3 and OFF under the bare sqlite3 CLI, and there is NO ON
+-- DELETE clause, following action_dependencies' precedent (soft-delete is the
+-- retirement path; a soft-deleted parent RETAINS its children's pointers and
+-- is reported as suspended rather than silently re-rooting them, §12.3). But
+-- "the parent must be an AREA" — the rule carrying both the two-level
+-- guarantee and acyclicity — is NOT expressible in a row-level CHECK, because
+-- it reads another row. It lives in createProject and updateProject, inside
+-- one immediate transaction (§12.7's addDependency race, verbatim).
 CREATE TABLE IF NOT EXISTS projects (
   fid                TEXT PRIMARY KEY CHECK(fid GLOB 'prj:*'),
   name               TEXT NOT NULL,
@@ -35,8 +57,28 @@ CREATE TABLE IF NOT EXISTS projects (
   due                TEXT,
   deleted_at         TEXT,
   trigger_condition  TEXT,
-  tags               TEXT NOT NULL DEFAULT ''
+  tags               TEXT NOT NULL DEFAULT '',
+  parent_fid         TEXT REFERENCES projects(fid)
+                       CHECK(parent_fid IS NULL OR kind = 'project')
 );
+-- The containment index (idx_projects_parent) is created ONLY by migration v13
+-- (CONTAINER_PARENT_INDEXES in pib-db-lib.mjs), deliberately NOT here.
+--
+-- init() is `exec(this file)` and THEN migrate(). On a pre-existing database
+-- `CREATE TABLE IF NOT EXISTS projects` is a no-op, so parent_fid does not exist
+-- yet, and a standalone CREATE INDEX over it throws before migrate() can add the
+-- column — taking down every install on every existing consumer. That shipped
+-- once and was caught in QA before release; see act:e1c0261d.
+--
+-- The general rule it taught: this file may only declare an index over a column
+-- it creates ITSELF in the same run. An index over a MIGRATION-added column
+-- belongs to the migration, which is the one path that runs on both fresh
+-- databases (from user_version 0) and existing ones.
+--
+-- Note for any future migration that rebuilds or drops parent_fid: the index
+-- must be dropped FIRST. SQLite refuses the column drop while an index depends
+-- on it ("error in index idx_projects_parent after drop column"), which is not
+-- a hypothetical — it is the order the v11 test fixture had to learn.
 
 -- Archive of the dropped `area` column's non-NULL values (migration v11,
 -- base v9 — §14). Pure history — no shipped code reads it; it exists because

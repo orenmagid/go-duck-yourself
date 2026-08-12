@@ -29,15 +29,28 @@ function getDb() {
   if (db) return db;
   const require = createRequire(import.meta.url);
   const Database = require('better-sqlite3');
-  db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
+
+  // Memoize ONLY after init succeeds (act:e1c0261d). This assigned to `db`
+  // first, so when init threw, `if (db) return db` handed the broken handle back
+  // forever — the first caller saw the real error and every later one saw a
+  // downstream symptom that no longer named the cause, with no self-heal for the
+  // life of the process. A local until it is known good makes the failure
+  // retryable instead of terminal.
+  const handle = new Database(DB_PATH);
+  handle.pragma('journal_mode = WAL');
+  handle.pragma('foreign_keys = ON');
 
   // Ensure schema exists, then apply pending migrations. Both are cheap:
   // the schema file is idempotent (CREATE TABLE IF NOT EXISTS) and migrate()
   // short-circuits when PRAGMA user_version is already current.
   const schemaPath = join(__dirname, 'pib-db-schema.sql');
-  lib.init(db, { schemaPath });
+  try {
+    lib.init(handle, { schemaPath });
+  } catch (e) {
+    try { handle.close(); } catch { /* nothing to salvage */ }
+    throw e;
+  }
+  db = handle;
   return db;
 }
 
@@ -47,12 +60,13 @@ function getDb() {
 const TOOLS = [
   {
     name: 'pib_create_project',
-    description: `Create a CONTAINER for actions. Two kinds, opposite completion semantics — the test is one question: can you say when it is done? An AREA (the default) is a standing responsibility that never completes — "Is Watchtower done?" has no answer. A PROJECT is an outcome that DOES complete: its notes must state that outcome ("done when …" — that statement is the test its completion is judged against), and it can close only when every child action is closed or dispositioned. If you are about to create several actions whose titles encode their position in something bigger (Phase 2, Lane B, Child 3), that something is a project — create it and parent them via projectFid instead of putting hierarchy in titles. Note the fid prefix "prj:" is the container NAMESPACE, not a kind claim: both kinds carry prj: ids forever (the kind lives in the kind field and can be changed later via pib_update_project — ids never change).`,
+    description: `Create a CONTAINER for actions. Two kinds, opposite completion semantics — the test is one question: can you say when it is done? An AREA (the default) is a standing responsibility that never completes — "Is Watchtower done?" has no answer. A PROJECT is an outcome that DOES complete: its notes must state that outcome ("done when …" — that statement is the test its completion is judged against), and it can close only when every child action is closed or dispositioned. If you are about to create several actions whose titles encode their position in something bigger (Phase 2, Lane B, Child 3), that something is a project — create it and parent them via projectFid instead of putting hierarchy in titles. An area CONTAINS projects: give a project the area it serves via parentFid, and that area's lists and counts roll up to include it. Containers nest exactly one level — an area holds projects, a project holds actions, and a project may not contain another project. Note the fid prefix "prj:" is the container NAMESPACE, not a kind claim: both kinds carry prj: ids forever (the kind lives in the kind field and can be changed later via pib_update_project — ids never change).`,
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Container name' },
         kind: { type: 'string', enum: ['area', 'project'], description: "Container kind: 'area' (standing responsibility, never completes — the default) or 'project' (an outcome that completes; notes must state it)" },
+        parentFid: { type: 'string', description: "The AREA this project serves (e.g., prj:abc12345). Only a kind='project' may name one, and the target must be an area — an area is always a root. Optional: a project with no area is legal, just unhomed." },
         notes: { type: 'string', description: "Notes. For kind='project' this must state the outcome — it is the completion criterion. For an area, optional." },
         due: { type: 'string', description: 'Due date (YYYY-MM-DD)' },
         tags: { type: 'string', description: 'Comma-separated tags (e.g., client-visible)' },
@@ -62,12 +76,13 @@ const TOOLS = [
   },
   {
     name: 'pib_update_project',
-    description: `Update fields on an existing container, including reclassifying it between area and project via kind — an operator judgment, one container at a time, never scripted in bulk. Completion is kind-asymmetric: status='done' is REFUSED for an area (an area never completes; use status='dropped' to stop holding the responsibility), and for a project it is refused while any child action is still open.`,
+    description: `Update fields on an existing container, including reclassifying it between area and project via kind, and naming the area a project serves via parentFid — both operator judgments, one container at a time, never scripted in bulk. Completion is kind-asymmetric: status='done' is REFUSED for an area (an area never completes; use status='dropped' to stop holding the responsibility), and for a project it is refused while any child action is still open. Containment and kind interact, and each refusal says how to proceed: demoting a project that names an area is refused unless the same call clears it (parentFid=null); promoting an area that HOLDS projects is refused, because a project cannot contain another project; and parking an area (paused/someday/dropped) that still holds live projects is refused, because it would hide their parent from every container list while they hold live work.`,
     inputSchema: {
       type: 'object',
       properties: {
         fid: { type: 'string', description: 'Container fid (e.g., prj:abc12345 — both kinds carry prj: ids)' },
         kind: { type: 'string', enum: ['area', 'project'], description: "Reclassify the container. Promoting to 'project' gives it a completion semantic; its notes should state the outcome." },
+        parentFid: { type: 'string', description: "The AREA this project serves. Only a kind='project' may name one and the target must be an area; pass null to clear it (which is also how you demote a parented project back to an area, in the same call)." },
         tags: { type: 'string', description: 'Comma-separated tags' },
         name: { type: 'string', description: 'New container name' },
         status: { type: 'string', description: "New status. 'done' is refused for areas, and for projects with open children.", enum: ['active', 'paused', 'done', 'dropped', 'someday'] },
@@ -103,7 +118,7 @@ const TOOLS = [
   },
   {
     name: 'pib_list_projects',
-    description: 'List active containers. Each row carries its kind (area = standing responsibility, never completes; project = outcome that completes) and its open-action count.',
+    description: 'List active containers. Each row carries its kind (area = standing responsibility, never completes; project = outcome that completes), the area it sits in if any (parent_fid/parent_name), how many projects it holds, and BOTH open-action counts: open_actions is what is filed directly to it, open_actions_rolled also counts the actions of projects inside it. For an area the rolled figure is the real size of the responsibility.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -128,6 +143,7 @@ const TOOLS = [
       properties: {
         status: { type: 'string', enum: ['open', 'in-progress', 'blocked', 'deferred', 'done'], description: 'Filter by status' },
         project: { type: 'string', description: 'Filter by project fid' },
+        scope: { type: 'string', enum: ['direct', 'rolled-up'], description: "How 'project' is read when it names an AREA: 'direct' (default) counts only actions filed straight to it; 'rolled-up' also counts the actions of projects filed under it — what \"everything under this area\" means." },
       },
     },
   },
@@ -220,6 +236,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         includeDone: { type: 'boolean', description: 'Include items already marked done. Default false.' },
+        includeReleased: { type: 'boolean', description: 'Also include items whose trigger already fired or became obsolete. Default false — the list means STILL WAITING, judged by the last recorded trigger check, so it can never contradict pib_next_actions.' },
       },
     },
   },
@@ -325,6 +342,7 @@ const TOOLS = [
       properties: {
         project: { type: 'string', description: 'Limit to one project fid' },
         limit: { type: 'number', description: 'Maximum rows to return' },
+        scope: { type: 'string', enum: ['direct', 'rolled-up'], description: "How 'project' is read when it names an AREA: 'direct' (default) counts only actions filed straight to it; 'rolled-up' also counts the actions of projects filed under it — what \"everything under this area\" means." },
       },
     },
   },
@@ -335,6 +353,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         project: { type: 'string', description: 'Limit to one project fid' },
+        scope: { type: 'string', enum: ['direct', 'rolled-up'], description: "How 'project' is read when it names an AREA: 'direct' (default) counts only actions filed straight to it; 'rolled-up' also counts the actions of projects filed under it — what \"everything under this area\" means." },
       },
     },
   },

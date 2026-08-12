@@ -151,6 +151,79 @@ function openPibDb(projectPath) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Trigger-check recording (act:4eabb7e8)
+// ---------------------------------------------------------------------------
+// `openPibDb` is deliberately read-only — the rings observe, the human triages
+// — and that stays true of every other ring duty. Recording a trigger
+// EVALUATION is the one exception, because the evaluation IS the observation:
+// `pib_next_actions` and the work tracker's Ready view decide "still waiting?"
+// from the last `trigger_checks` row, and if the component that does the
+// evaluating never writes one, the answer is frozen forever. So this opens its
+// own short-lived writable handle, appends one row, and closes it.
+
+// The releasing vocabulary, kept in step with TRIGGER_RELEASING_RESULTS in
+// pib-db-lib.mjs. The ring cannot import that module (it runs from the
+// watchtower runtime against ARBITRARY consumer checkouts, whose library copy
+// may be the base or the engagement overlay), so this is a deliberate
+// duplication of a closed 2-value vocabulary — asserted against the library by
+// test/watchtower-trigger-checks/.
+export const TRIGGER_RELEASING_RESULTS = ['triggered', 'condition-obsolete'];
+
+/**
+ * Map the model's one-word verdict onto pib-db's trigger-result vocabulary
+ * ('triggered' | 'still-waiting' | 'needs-info' | 'condition-obsolete').
+ *
+ * Anything unrecognized becomes 'needs-info', never 'still-waiting': an
+ * unparseable answer is an absence of judgement, and recording it as a
+ * confident "keep waiting" would be a stored conclusion of exactly the kind
+ * this whole predicate exists to avoid.
+ */
+export function classifyTriggerVerdict(firstLine) {
+  const s = String(firstLine || '').toUpperCase();
+  if (s.includes('OBSOLETE')) return 'condition-obsolete';
+  if (s.includes('TRIGGERED')) return 'triggered';
+  if (s.includes('STILL_WAITING') || s.includes('STILL WAITING')) return 'still-waiting';
+  return 'needs-info';
+}
+
+/**
+ * Append one `trigger_checks` row for an evaluated action.
+ *
+ * Mirrors `markTriggerChecked` in pib-db-lib.mjs — same table, same columns,
+ * same vocabulary — which is the contract owner. Raw SQL rather than an import
+ * for the reason above; the drift test pins the pair.
+ *
+ * NEVER throws: a ring that dies on a locked database stops evaluating every
+ * remaining project. A failure is logged and the rotation moves on.
+ */
+export function recordTriggerCheck(item, result, reasoning) {
+  const Database = loadBetterSqlite3(item.projectPath);
+  if (!Database) {
+    logError(`recordTriggerCheck ${item.fid}: better-sqlite3 unavailable`);
+    return false;
+  }
+  let db = null;
+  try {
+    // 5000 is also better-sqlite3's default busy timeout — stated explicitly so
+    // the busy wait is visible at the call site, not so it differs from stock.
+    // Measured (QA drain of dec-47fe8f5f): deleting this option changes no
+    // behavior; setting it to 0 loses contended evaluations. Don't read it as a
+    // tuned value, and don't "simplify" it to 0.
+    db = new Database(join(item.projectPath, 'pib.db'), { timeout: 5000 });
+    db.prepare(`
+      INSERT INTO trigger_checks (target_table, target_fid, checked_at, result, notes)
+      VALUES ('actions', ?, ?, ?, ?)
+    `).run(item.fid, new Date().toISOString(), result, `ring2-fast: ${reasoning}`.slice(0, 2000));
+    return true;
+  } catch (e) {
+    logError(`recordTriggerCheck ${item.fid}: ${String(e.message).split('\n')[0]}`);
+    return false;
+  } finally {
+    if (db) { try { db.close(); } catch { /* already closed */ } }
+  }
+}
+
 // ===================================================================
 // FAST TIER (--fast, every 5 minutes)
 // ===================================================================
@@ -175,11 +248,36 @@ async function evaluateDeferredTriggers(config) {
     try {
       let rows = [];
       try {
-        rows = db.prepare(
-          "SELECT fid, text, trigger_condition, notes FROM actions WHERE status = 'deferred' AND trigger_condition IS NOT NULL AND trigger_condition != ''"
-        ).all();
-      } catch {
-        // trigger_condition column may not exist
+        // Select the trigger HISTORY alongside the condition (act:4eabb7e8).
+        // Two things ride on it:
+        //   - ALREADY-RELEASED items are excluded. A fired trigger leaves the
+        //     action `deferred` until a human acts on it, so without this the
+        //     same action is re-evaluated and re-filed on every rotation
+        //     forever — burning an API call each time.
+        //   - `last_checked_at` IS the rotation key, read from the database
+        //     the verdict lives in. The old sidecar (state/trigger-checks.json)
+        //     was a SECOND record of "when did we last look", holding a
+        //     timestamp and no verdict at all — which is why the Ready view
+        //     could never read it.
+        rows = db.prepare(`
+          SELECT a.fid, a.text, a.trigger_condition, a.notes,
+            (SELECT checked_at FROM trigger_checks WHERE target_fid = a.fid ORDER BY checked_at DESC, id DESC LIMIT 1) AS last_checked_at,
+            (SELECT result     FROM trigger_checks WHERE target_fid = a.fid ORDER BY checked_at DESC, id DESC LIMIT 1) AS last_result
+          FROM actions a
+          WHERE a.status = 'deferred'
+            AND a.deleted_at IS NULL
+            AND a.completed = 0
+            AND a.trigger_condition IS NOT NULL
+            AND a.trigger_condition != ''
+            AND COALESCE((SELECT result FROM trigger_checks WHERE target_fid = a.fid ORDER BY checked_at DESC, id DESC LIMIT 1), '')
+                NOT IN (${TRIGGER_RELEASING_RESULTS.map(r => `'${r}'`).join(', ')})
+        `).all();
+      } catch (e) {
+        // A pre-trigger_checks schema (or missing column) is legitimate on an
+        // old consumer — but log it, because a silent empty result here is
+        // indistinguishable from "nothing to evaluate" and that ambiguity is
+        // what let this whole signal die unnoticed for five weeks.
+        logError(`Trigger collect skipped for ${name}: ${String(e.message).split('\n')[0]}`);
       }
 
       for (const row of rows) {
@@ -190,6 +288,7 @@ async function evaluateDeferredTriggers(config) {
           text: row.text,
           triggerCondition: row.trigger_condition,
           notes: row.notes || '',
+          lastCheckedAt: row.last_checked_at || null,
         });
       }
     } finally {
@@ -202,22 +301,15 @@ async function evaluateDeferredTriggers(config) {
     return;
   }
 
-  // Rotate by least-recently-checked using state file
-  const checkedPath = join(WATCHTOWER_DIR, 'state', 'trigger-checks.json');
-  let checked = {};
-  if (existsSync(checkedPath)) {
-    try {
-      checked = JSON.parse(readFileSync(checkedPath, 'utf8'));
-    } catch {
-      checked = {};
-    }
-  }
-
-  // Sort by least-recently-checked
+  // Rotate by least-recently-checked, read from the trigger_checks history
+  // itself (act:4eabb7e8) — ONE record of when we last looked, in the same
+  // place as what we concluded. Never-checked items sort FIRST, which is
+  // deliberate: those are precisely the ones structurally unreachable by the
+  // Ready view until a first row exists for them.
   triggerItems.sort((a, b) => {
-    const aTime = checked[a.fid] || 0;
-    const bTime = checked[b.fid] || 0;
-    return aTime - bTime;
+    const aTime = a.lastCheckedAt ? Date.parse(a.lastCheckedAt) : 0;
+    const bTime = b.lastCheckedAt ? Date.parse(b.lastCheckedAt) : 0;
+    return (Number.isNaN(aTime) ? 0 : aTime) - (Number.isNaN(bTime) ? 0 : bTime);
   });
 
   // Cap at FAST_TRIGGER_EVAL_CAP
@@ -252,7 +344,18 @@ async function evaluateDeferredTriggers(config) {
       const firstLine = result.split('\n')[0].trim().toUpperCase();
       const reasoning = result.split('\n').slice(1).join('\n').trim() || 'No reasoning provided.';
 
-      checked[item.fid] = Date.now();
+      // RECORD THE VERDICT WHERE THE READ SURFACES LOOK (act:4eabb7e8).
+      // This is the write that had no author between 2026-07-02 and this fix:
+      // /orient's deferred-check phase used to produce these rows and left the
+      // default path at the watchtower transition, so `trigger_checks` went
+      // silent while `pib_next_actions` and the Ready view kept reading it.
+      // Eight of thirty open trigger-carrying actions had no row at all and
+      // were unreachable no matter what happened in the world.
+      //
+      // Written BEFORE the inbox filing below, deliberately: the durable fact
+      // is the evaluation, and a failure to file a queue item must not also
+      // lose the verdict.
+      recordTriggerCheck(item, classifyTriggerVerdict(firstLine), reasoning);
 
       if (firstLine.includes('TRIGGERED')) {
         log(`Fast: trigger FIRED for ${item.fid} — ${item.text}`);
@@ -285,9 +388,6 @@ async function evaluateDeferredTriggers(config) {
       logError(`Trigger eval failed for ${item.fid}: ${e.message}`);
     }
   }
-
-  // Save checked state
-  atomicWrite(checkedPath, JSON.stringify(checked, null, 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,6 +1191,18 @@ async function detectStaleWork(config) {
       // Check for stale projects (no action completion in 14+ days)
       const staleThreshold = new Date(Date.now() - SLOW_STALE_DAYS * 86400000).toISOString().slice(0, 10);
 
+      // The active-container filter stays DIRECT under container nesting
+      // (schema v11, plan §17), and this is the right answer rather than a
+      // missed rollup: the set is scoped to the whole PROJECT (repo), not to
+      // one container, and a child project is itself a `status = 'active'` row
+      // — so its actions are already in this set by their own membership.
+      // Rolling up would re-add rows that are already here and change nothing
+      // but the cost. (The one case nesting does raise — an active child
+      // project whose parent AREA has been parked — is deliberately left
+      // counted: parking a parent does not park its children, the boundary
+      // makes that a gate the operator must acknowledge, and treating a live
+      // child project's work as inactive would HIDE work rather than surface
+      // it, which is the failure this detector exists to prevent.)
       let activeActions = [];
       try {
         activeActions = db.prepare(
@@ -1153,23 +1265,46 @@ async function detectStaleWork(config) {
       // refuses for areas. Pre-kind consumer schemas (opened read-only,
       // never migrated here) fall back to the kind-blind query rather than
       // silently detecting nothing.
+      //
+      // Action membership stays DIRECT under container nesting (v11, plan
+      // §17), deliberately: the candidate is a `kind='project'` row, and a
+      // project may not hold child projects — containers nest exactly one
+      // level — so a project's own actions ARE all of its work.
+      //
+      // What nesting DOES change is the live-child-container clause. The item
+      // this files tells the operator to run `pib_complete_project`, and that
+      // verb now REFUSES a container holding a live child container (§17.3).
+      // Filing a nudge toward a call the gate will reject is the "the surface
+      // prescribed a fix the boundary won't perform" shape, so the check moves
+      // in front of the filing. It rides on the RICHEST arm only — see the
+      // variant list below, where NO_LIVE_CHILD_CONTAINER appears solely
+      // alongside IS_PROJECT. It never combines with the kind-blind arm, and
+      // would be vacuous there anyway: a schema old enough to lack `kind`
+      // lacks `parent_fid` too, so it has no nesting to guard against.
       let allDoneProjects = [];
-      const allDoneSql = (kindClause) =>
+      const allDoneSql = (extraClauses) =>
         `SELECT p.fid, p.name FROM projects p
-         WHERE p.status = 'active'${kindClause}
+         WHERE p.status = 'active'${extraClauses}
          AND EXISTS (SELECT 1 FROM actions a WHERE a.project_fid = p.fid)
          AND NOT EXISTS (
            SELECT 1 FROM actions a
            WHERE a.project_fid = p.fid
            AND a.status != 'done'
          )`;
-      try {
-        allDoneProjects = db.prepare(allDoneSql(" AND p.kind = 'project'")).all();
-      } catch {
+      const IS_PROJECT = " AND p.kind = 'project'";
+      const NO_LIVE_CHILD_CONTAINER =
+        " AND NOT EXISTS (SELECT 1 FROM projects c" +
+        " WHERE c.parent_fid = p.fid AND c.deleted_at IS NULL AND c.status != 'done')";
+      // Widest schema first, then drop one column's clause at a time: v11 knows
+      // both, v10 knows only `kind`, pre-v10 knows neither. A schema with no
+      // `parent_fid` has no nesting either, so the narrower arm is the COMPLETE
+      // answer there rather than a degraded one.
+      for (const extra of [IS_PROJECT + NO_LIVE_CHILD_CONTAINER, IS_PROJECT, '']) {
         try {
-          allDoneProjects = db.prepare(allDoneSql('')).all();
+          allDoneProjects = db.prepare(allDoneSql(extra)).all();
+          break;
         } catch {
-          // best-effort
+          // this consumer's schema lacks a column named above — try the next
         }
       }
 

@@ -40,7 +40,20 @@ const PROJECT_NAME = getProjectName();
 
 const db = new Database(DB_PATH, { readonly: false });
 db.pragma('journal_mode = WAL');
-lib.migrate(db);
+// A fail-closed schema refusal (act:b7d81b52) must read as a diagnosis, not as
+// an unhandled crash. This server IS the surface that went dead on both
+// consumers the lineage collision hit — an operator arriving here needs the
+// cause and the fix, not a stack trace pointing at a library line.
+try {
+  lib.migrate(db);
+} catch (err) {
+  console.error(err.message);
+  console.error('');
+  console.error(`  database: ${DB_PATH}`);
+  console.error('  Inspect without migrating: node scripts/pib-db.mjs verify-schema');
+  console.error('  The work tracker cannot start against a schema it does not understand.');
+  process.exit(1);
+}
 
 // ---------------------------------------------------------------------------
 // The completion contract, enforced HERE (act:cbf19c3f)
@@ -186,18 +199,37 @@ const server = createServer(async (req, res) => {
       return res.end(html);
     }
 
-    // GET /api/projects — list projects with action counts
+    // GET /api/projects — list projects with action counts.
+    //
+    // These three counts are DIRECT: actions whose project_fid is exactly this
+    // container. They keep that meaning deliberately (a test pins open_actions
+    // for the done-with-open-children case). Once areas hold projects (§17)
+    // the card also needs a ROLLED-UP figure — an area's own actions plus its
+    // projects' — and that is computed in the UI, which already derives every
+    // card number from the full actions payload and needs the same pass for
+    // the 30-day flow figure. One rollup, in one place: do NOT add a second
+    // one here and wire the card to it. `p.*` carries parent_fid, which is all
+    // the client needs to do it.
+    // `status=all` returns every undeleted container regardless of status. The
+    // UI needs that as a SEPARATE payload from the one it displays: parent and
+    // child links are relationships, not rows of the current tab, and deriving
+    // them from a status-filtered list is what made a live area render as
+    // "area deleted" on the Done tab and zeroed an area's 30-day figure once
+    // its child project was completed (act:59d45d14). Against a complete list
+    // the UI's "absent means deleted" inference is TRUE — this query already
+    // excludes only soft-deleted rows.
     if (req.method === 'GET' && url.pathname === '/api/projects') {
       const status = url.searchParams.get('status') || 'active';
+      const all = status === 'all';
       const rows = db.prepare(`
         SELECT p.*,
           (SELECT COUNT(*) FROM actions a WHERE a.project_fid = p.fid AND a.completed = 0 AND a.deleted_at IS NULL) as open_actions,
           (SELECT COUNT(*) FROM actions a WHERE a.project_fid = p.fid AND a.completed = 1) as done_actions,
           (SELECT COUNT(*) FROM actions a WHERE a.project_fid = p.fid AND a.deleted_at IS NULL) as total_actions
         FROM projects p
-        WHERE p.deleted_at IS NULL AND p.status = ?
+        WHERE p.deleted_at IS NULL${all ? '' : ' AND p.status = ?'}
         ORDER BY p.created DESC
-      `).all(status);
+      `).all(...(all ? [] : [status]));
       return json(res, rows);
     }
 
@@ -384,7 +416,13 @@ const server = createServer(async (req, res) => {
     if (req.method === 'PATCH' && url.pathname.startsWith('/api/project/')) {
       const fid = decodeURIComponent(url.pathname.slice('/api/project/'.length));
       const body = await readBody(req);
-      const allowed = ['name', 'status', 'kind', 'notes', 'due', 'tags'];
+      // parentFid is on the allowlist because the demote refusal PRESCRIBES
+      // it: reclassifying a nested project back to an area is refused unless
+      // the same call clears the parent. Without the field here, this route
+      // would refuse a legal write and tell the caller to send something it
+      // drops — §12.8's first defect, verbatim. Delegation means it inherits
+      // every containment gate for free.
+      const allowed = ['name', 'status', 'kind', 'notes', 'due', 'tags', 'parentFid'];
       const patch = { fid };
       for (const key of allowed) {
         if (body[key] !== undefined) patch[key] = body[key];
@@ -406,7 +444,8 @@ const server = createServer(async (req, res) => {
     // GET /api/triggered — deferred items with trigger conditions
     if (req.method === 'GET' && url.pathname === '/api/triggered') {
       const includeDone = url.searchParams.get('includeDone') === 'true';
-      return json(res, lib.listTriggered(db, { includeDone }));
+      const includeReleased = url.searchParams.get('includeReleased') === 'true';
+      return json(res, lib.listTriggered(db, { includeDone, includeReleased }));
     }
 
     // POST /api/trigger-checked — record a trigger evaluation

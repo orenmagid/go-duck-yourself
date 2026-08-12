@@ -274,6 +274,61 @@ function collectGitState(projectPath) {
 // pib-db queries
 // ---------------------------------------------------------------------------
 
+// Rolled-up container membership (schema v11 nesting, plan §17): a container's
+// work is its OWN actions plus the actions of any project filed under it. A
+// direct `a.project_fid = p.fid` join now UNDER-REPORTS an area whose work has
+// been carved into child projects — which would make the reorganisation read as
+// loss, the exact confusion nesting exists to end (§17.3).
+//
+// Hand-written rather than imported from pib-db-lib's containerScopeClause():
+// the watchtower runtime tier ships only `watchtower-*` scripts, so a pib-db-lib
+// import dies with ERR_MODULE_NOT_FOUND under launchd cron (the same reason the
+// pib-db-path resolver is re-spelled in this file). Kept deliberately
+// byte-parallel with that helper's 'rolled-up' branch — if one changes, change
+// both. `p` is the container alias in every caller below.
+// Members of a container for STALENESS: its own actions plus those of its
+// ACTIVE children. The child-status filter is load-bearing, and its only
+// consumer is the stale query below — the open counts elsewhere are direct and
+// unaffected. Without it, a paused/someday/dropped child's open actions roll up
+// into the parent and keep it stale forever, while the child itself is invisible
+// on every attention surface (the outer query takes only active containers). The
+// operator is told an area is stale and finds nothing to clear — and the
+// system's own park verb produces exactly that state (act:fb700bd6).
+const rolledMemberSql = (a) =>
+  `(${a}.project_fid = p.fid OR ${a}.project_fid IN ` +
+  `(SELECT c.fid FROM projects c WHERE c.parent_fid = p.fid AND c.deleted_at IS NULL ` +
+  `AND c.status = 'active'))`;
+
+// Run the first query variant this consumer's schema actually supports. Ring 1
+// opens consumer dbs READ-ONLY and never migrates them, so a query naming a
+// column the consumer hasn't reached yet (`kind` before v10, `parent_fid`
+// before v11) must degrade to the narrower-but-correct answer rather than
+// throwing and reporting nothing — the data-integrity-0001 failure shape.
+// Returns the last error when every variant failed, so the caller decides
+// whether that is a surfaced warning or best-effort silence.
+// A variant may only be abandoned because THIS CONSUMER'S SCHEMA lacks the
+// column it names — that is the whole purpose of the list. Falling through on
+// any error at all means a typo in the richer arm degrades to the narrower
+// answer permanently and silently, which is data-integrity-0001's swallow
+// wearing a fallback's clothes: the ring keeps reporting, the number is just
+// quietly worse, and no test can see the difference (act:fb700bd6).
+const SCHEMA_TOO_OLD_RE = /no such column|no such table/i;
+
+function firstWorkingQuery(db, variants, params = []) {
+  let lastError = null;
+  for (const sql of variants) {
+    try {
+      return { rows: db.prepare(sql).all(...params) };
+    } catch (e) {
+      lastError = e;
+      // Anything that is NOT a missing column/table is a broken query. Surface
+      // it instead of pretending the consumer is on an older schema.
+      if (!SCHEMA_TOO_OLD_RE.test(e.message || '')) return { error: e };
+    }
+  }
+  return { error: lastError };
+}
+
 function collectPibState(projectPath) {
   const dbPath = join(projectPath, 'pib.db');
   if (!existsSync(dbPath)) {
@@ -330,18 +385,30 @@ function collectPibState(projectPath) {
     const flaggedCount = flaggedActions.length;
 
     // Deferred actions waiting on triggers — standing state, not attention.
-    // Orient's deferred-check evaluates these every session; reported in the
-    // per-project deep file, never in the summary's attention list.
+    // Ring 2's fast tier evaluates these on rotation and records each verdict
+    // as a trigger_checks row; reported in the per-project deep file, never in
+    // the summary's attention list.
+    //
+    // STILL WAITING means the last recorded verdict did not release it
+    // (act:4eabb7e8) — not merely that a trigger_condition exists. Counting
+    // presence made this number disagree with the Ready view and with the work
+    // tracker's Waiting tab, both of which read the trigger HISTORY; an action
+    // whose trigger had already fired kept being counted as waiting forever,
+    // because nothing can ever clear trigger_condition.
     let deferredTriggerCount = 0;
     try {
-      deferredTriggerCount = db.prepare(
-        "SELECT COUNT(*) as count FROM actions WHERE status = 'deferred' AND trigger_condition IS NOT NULL AND deleted_at IS NULL"
-      ).get().count;
+      deferredTriggerCount = db.prepare(`
+        SELECT COUNT(*) as count FROM actions a
+        WHERE a.status = 'deferred' AND a.deleted_at IS NULL
+          AND a.trigger_condition IS NOT NULL
+          AND COALESCE((SELECT result FROM trigger_checks WHERE target_fid = a.fid ORDER BY checked_at DESC, id DESC LIMIT 1), '')
+              NOT IN ('triggered', 'condition-obsolete')
+      `).get().count;
     } catch {
-      // trigger_condition column may not exist in older schemas
+      // trigger_condition / trigger_checks may not exist in older schemas
     }
 
-    // Stale projects: an active project that still has OPEN work but has
+    // Stale projects: an active container that still has OPEN work but has
     // COMPLETED nothing in STALE_DAYS. Mirrors orient's canonical definition
     // (MAX(completed_at) older than the threshold, or none) using columns that
     // actually exist. The prior predicate filtered on `a.updated_at`, a column
@@ -349,27 +416,51 @@ function collectPibState(projectPath) {
     // every single tick, the bare catch swallowed it, and staleProjects stayed
     // [] permanently (data-integrity-0001: the /briefing backlog-hygiene nudge
     // could never fire).
+    //
+    // BOTH halves roll up to child projects (v11 nesting), and both are
+    // load-bearing — this count feeds /briefing's backlog-hygiene nudge, so a
+    // wrong answer here nags the operator about containers that are healthy:
+    //   - the COMPLETION half, or an area whose direct actions are quiet but
+    //     whose child project closes work weekly reads as stale. That is the
+    //     reorganisation being reported as decay, which is precisely the cost
+    //     nesting exists to remove (§17.0).
+    //   - the OPEN half, or an area whose work has been carved out ENTIRELY has
+    //     no direct open action left, drops out of the predicate, and goes
+    //     silently un-checked forever (§17.7's "a carved area goes quiet").
+    // Rolling up one side without the other trades one wrong answer for the
+    // other, so both move together.
+    //
+    // A stale area and a stale child project each get their own line, exactly
+    // as two stale siblings do today — nesting changes which containers are
+    // checked, never how many lines one stale container produces.
     const staleThreshold = new Date(Date.now() - STALE_DAYS * 86400000).toISOString().slice(0, 10);
     let staleProjects = [];
-    try {
-      staleProjects = db.prepare(
-        `SELECT p.fid, p.name FROM projects p
-         WHERE p.status = 'active' AND p.deleted_at IS NULL
-           AND EXISTS (
-             SELECT 1 FROM actions a
-             WHERE a.project_fid = p.fid AND a.deleted_at IS NULL AND a.completed = 0
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM actions a
-             WHERE a.project_fid = p.fid AND a.deleted_at IS NULL
-               AND a.completed_at IS NOT NULL AND a.completed_at > ?
-           )`
-      ).all(staleThreshold);
-    } catch (e) {
+    const staleSql = (memberSql) =>
+      `SELECT p.fid, p.name FROM projects p
+       WHERE p.status = 'active' AND p.deleted_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM actions a
+           WHERE ${memberSql} AND a.deleted_at IS NULL AND a.completed = 0
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM actions a
+           WHERE ${memberSql} AND a.deleted_at IS NULL
+             AND a.completed_at IS NOT NULL AND a.completed_at > ?
+         )`;
+    // Pre-v11 consumers have no `parent_fid`; they also have no nesting, so the
+    // direct predicate is the COMPLETE answer there, not a degraded one.
+    const staleResult = firstWorkingQuery(
+      db,
+      [staleSql(rolledMemberSql('a')), staleSql('a.project_fid = p.fid')],
+      [staleThreshold]
+    );
+    if (staleResult.rows) {
+      staleProjects = staleResult.rows;
+    } else {
       // SURFACE it — the swallowed error here masked a dead query for weeks
-      // (data-integrity-0001). Now that the predicate uses only stable columns,
-      // a throw means the query is genuinely broken, not a known-absent column.
-      const m = String(e && e.message).split('\n')[0];
+      // (data-integrity-0001). Both variants failing means the query is
+      // genuinely broken, not that a known-absent column was named.
+      const m = String(staleResult.error && staleResult.error.message).split('\n')[0];
       logError(`collectPibState ${projectPath}: stale-project query failed: ${m}`);
       pibWarnings.push(`stale-project query failed: ${m}`);
     }
@@ -379,10 +470,27 @@ function collectPibState(projectPath) {
     // candidate (three-type model, plan §7/§10.3). Pre-kind consumer schemas
     // (Ring 1 opens read-only and never migrates) fall back to the kind-blind
     // query rather than silently reporting none.
+    //
+    // Action membership stays DIRECT here, and that is the right answer rather
+    // than an oversight: the candidate is a `kind='project'` row, a project may
+    // not hold child projects (containers nest exactly one level), so a
+    // project's actions ARE all of its work. Rolling up would only ever pull in
+    // rows that the boundary refuses to create.
+    //
+    // What nesting DOES change is the third clause: this item tells the operator
+    // to run `pib_complete_project`, and that verb now REFUSES a container
+    // holding a live child container (§17.3's guard). Nudging toward a call the
+    // gate will reject is the "gate refuses a legal-looking write and the
+    // surface prescribed it" shape, so the live-child check moves up here.
+    // It rides on the RICHEST arm only — see the variant list below, where
+    // NO_LIVE_CHILD_CONTAINER appears solely alongside IS_PROJECT. It never
+    // combines with the kind-blind arm, and would be vacuous there anyway: a
+    // schema old enough to lack `kind` lacks `parent_fid` too, so it has no
+    // nesting to guard against.
     let completionCandidates = [];
-    const candidateSql = (kindClause) =>
+    const candidateSql = (extraClauses) =>
       `SELECT p.fid, p.name FROM projects p
-       WHERE p.status = 'active' AND p.deleted_at IS NULL${kindClause}
+       WHERE p.status = 'active' AND p.deleted_at IS NULL${extraClauses}
        AND EXISTS (SELECT 1 FROM actions a WHERE a.project_fid = p.fid AND a.deleted_at IS NULL)
        AND NOT EXISTS (
          SELECT 1 FROM actions a
@@ -390,34 +498,54 @@ function collectPibState(projectPath) {
          AND a.deleted_at IS NULL
          AND a.status != 'done'
        )`;
-    try {
-      completionCandidates = db.prepare(candidateSql(" AND p.kind = 'project'")).all();
-    } catch {
-      try {
-        completionCandidates = db.prepare(candidateSql('')).all();
-      } catch {
-        // best-effort
-      }
-    }
+    const IS_PROJECT = " AND p.kind = 'project'";
+    const NO_LIVE_CHILD_CONTAINER =
+      " AND NOT EXISTS (SELECT 1 FROM projects c" +
+      " WHERE c.parent_fid = p.fid AND c.deleted_at IS NULL AND c.status != 'done')";
+    // Widest schema first, then drop one column's clause at a time: v11 knows
+    // both, v10 knows only `kind`, pre-v10 knows neither.
+    const candidateResult = firstWorkingQuery(db, [
+      candidateSql(IS_PROJECT + NO_LIVE_CHILD_CONTAINER),
+      candidateSql(IS_PROJECT),
+      candidateSql(''),
+    ]);
+    // best-effort: every variant failing leaves the list empty, as before.
+    if (candidateResult.rows) completionCandidates = candidateResult.rows;
 
-    // Per-project breakdown for portfolio pulse
+    // Per-container breakdown for portfolio pulse
+    //
+    // open_count uses the same canonical predicate as the total (completed = 0)
+    // so per-container counts sum consistently with it; the JOIN filters
+    // soft-deleted rows so tombstoned actions never inflate the pulse
+    // (data-integrity-0001).
+    //
+    // The counts stay DIRECT: rolling them up in place would count every
+    // nested action twice — once under its project and again under its area —
+    // and break the documented sum-consistency with the canonical total.
+    //
+    // `parent_fid` rides along so a consumer reading a breakdown row can tell
+    // a root container from a nested one and roll up for itself; it is a raw
+    // column, not a derived figure. ROLLED COUNTS WERE DELIBERATELY NOT ADDED
+    // HERE. They were drafted and removed: `projectBreakdown` never reaches
+    // the markdown state file, and its only in-repo consumer is an existential
+    // over `blocked_count`, so a rolled figure would be computed every tick
+    // and read by nothing — `sort_order` in miniature, in the one design whose
+    // governing cautionary tale is exactly that (plan §6). If a consumer hook
+    // ever needs the rolled number, `parent_fid` is enough to derive it, and
+    // THEN the field has a reader.
     let projectBreakdown = [];
-    try {
-      // open_count uses the same canonical predicate as the total (completed = 0)
-      // so per-project counts sum consistently with it; the JOIN filters
-      // soft-deleted rows so tombstoned actions never inflate the pulse
-      // (data-integrity-0001).
-      projectBreakdown = db.prepare(
-        `SELECT p.fid, p.name,
-           SUM(CASE WHEN a.completed = 0 THEN 1 ELSE 0 END) as open_count,
-           SUM(CASE WHEN a.completed = 0 AND a.status = 'blocked' THEN 1 ELSE 0 END) as blocked_count
-         FROM projects p
-         LEFT JOIN actions a ON a.project_fid = p.fid AND a.deleted_at IS NULL
-         GROUP BY p.fid, p.name`
-      ).all();
-    } catch {
-      // best-effort
-    }
+    const breakdownSql = (nestingCols) =>
+      `SELECT p.fid, p.name,
+         SUM(CASE WHEN a.completed = 0 THEN 1 ELSE 0 END) as open_count,
+         SUM(CASE WHEN a.completed = 0 AND a.status = 'blocked' THEN 1 ELSE 0 END) as blocked_count${nestingCols}
+       FROM projects p
+       LEFT JOIN actions a ON a.project_fid = p.fid AND a.deleted_at IS NULL
+       GROUP BY p.fid, p.name`;
+    const ROLLED_COLS = `,
+         p.parent_fid`;
+    const breakdownResult = firstWorkingQuery(db, [breakdownSql(ROLLED_COLS), breakdownSql('')]);
+    // best-effort: both variants failing leaves the list empty, as before.
+    if (breakdownResult.rows) projectBreakdown = breakdownResult.rows;
 
     // Overdue actions (due date is in the past). The `due` column is
     // unconstrained free text (TEXT, no CHECK), so a malformed value like
@@ -2259,7 +2387,7 @@ function main() {
 // pure given an injectable `exec` — the inline call sites bind safeExec to a
 // cwd; the tests bind a runner against a temp git repo (act:6f36cbe2,
 // act:a136b362).
-export { renderWorktreeCoverage, resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState, branchExclusionMatcher, DEFAULT_LONG_LIVED_BRANCHES, createBranchDivergedItem, autoResolveBranchDivergedItems, autoResolveWorktreeItems, autoReconcileCompletionReviews, autoReconcilePendingRelations, autoReconcileSignificanceItems, fileOrphanedWorktreeItem, isSafeRefName };
+export { renderWorktreeCoverage, resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState, branchExclusionMatcher, DEFAULT_LONG_LIVED_BRANCHES, createBranchDivergedItem, autoResolveBranchDivergedItems, autoResolveWorktreeItems, autoReconcileCompletionReviews, autoReconcilePendingRelations, autoReconcileSignificanceItems, fileOrphanedWorktreeItem, isSafeRefName, firstWorkingQuery, rolledMemberSql };
 
 // Entry guard so tests (and other modules) can import this file's pure
 // helpers without executing main(). realpathSync matters: node

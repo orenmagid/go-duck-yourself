@@ -81,7 +81,76 @@ function today() {
 //  12 — completion propagation: actions.resolution + propagation_events
 //       (base v10 twin — act:08c563ae; plan §16). Numbered 12 here because
 //       the patch runs two ahead — RENUMBERED, never copy-pasted.
-export const SCHEMA_VERSION = 12;
+//  13 — container nesting: projects.parent_fid, so an AREA contains PROJECTs
+//       (base v11 twin — act:e567d724; plan §17). Numbered 13 here because
+//       the patch runs two ahead — RENUMBERED, never copy-pasted. This is the
+//       tier that matters most for this migration: the live Maginnis tracker
+//       sits at user_version 12 on THIS lineage, so v13 is the number that
+//       actually reaches it.
+export const SCHEMA_VERSION = 13;
+
+// ---------------------------------------------------------------------------
+// Schema lineage — the fail-closed guard (act:b7d81b52)
+// ---------------------------------------------------------------------------
+// TWO numbering lineages stamp the same PRAGMA user_version integer: the base
+// library, and this engagement overlay whose numbers run two ahead
+// (base 9 === overlay 11 in content). A database numbered on one lineage
+// meeting code from the other reads the bare integer, skips migrations whose
+// numbers fall at or below it, and stamps itself fully migrated anyway. That
+// fired on two live consumers during the v0.56.0 walk (reflow and the
+// maginnis tracker: user_version 10, no projects.kind, dead trackers, the
+// installer reporting success). The defenses here are:
+//
+//   1. SHAPE VERIFICATION BEFORE TRUST. Every migration entry that produces
+//      a durable structural object declares it as `expect`. migrate()
+//      verifies the post-condition of every migration the stamp claims was
+//      applied — including on the current >= SCHEMA_VERSION early-return
+//      path — and REFUSES loudly on contradiction instead of no-opping into
+//      a broken shape. Coverage starts at v5, the first version where the
+//      two lineages' numbering diverges in content; below that the lineages
+//      are identical and a collision cannot manifest.
+//   2. THE LINEAGE MARKER. Every user_version stamp also records WHICH
+//      lineage stamped it (schema_lineage row), so a bare integer is never
+//      the only signal. The base library refuses to renumber a stamp the
+//      engagement lineage wrote; the overlay may adopt a base stamp (its
+//      higher-numbered entries are a superset guarded by duplicate-swallow —
+//      that is the legitimate add-engagement-to-an-existing-consumer path,
+//      and it REQUIRES engagement_events to exist before migrate() runs:
+//      lib/engagement-setup.js ensures the table before it migrates).
+//   3. verifySchema() — the full-shape check the installer runs post-install
+//      (`pib-db.mjs verify-schema`), so "install succeeded" is a claim about
+//      the schema on disk, not about the copy loop exiting zero.
+export const SCHEMA_LINEAGE = 'engagement';
+
+export const SCHEMA_LINEAGE_CREATE = `CREATE TABLE IF NOT EXISTS schema_lineage (
+  id              INTEGER PRIMARY KEY CHECK(id = 1),
+  lineage         TEXT NOT NULL CHECK(lineage IN ('base','engagement')),
+  stamped_version INTEGER NOT NULL,
+  stamped_at      TEXT NOT NULL
+)`;
+
+function tableExists(db, name) {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+}
+
+function columnExists(db, table, column) {
+  if (!tableExists(db, table)) return false;
+  return db.pragma(`table_info(${table})`).some((c) => c.name === column);
+}
+
+// One declared post-condition: { table: 'name' } | { column: 'tbl.col' } |
+// { gone: 'tbl.col' }. Returns a problem string, or null when satisfied.
+function checkExpectation(db, expect) {
+  if (expect.table) return tableExists(db, expect.table) ? null : `table ${expect.table} is missing`;
+  const [tbl, col] = (expect.column || expect.gone).split('.');
+  if (expect.column) return columnExists(db, tbl, col) ? null : `column ${expect.column} is missing`;
+  return columnExists(db, tbl, col) ? `column ${expect.gone} should have been dropped but is still present` : null;
+}
+
+export function readSchemaLineage(db) {
+  if (!tableExists(db, 'schema_lineage')) return null;
+  return db.prepare('SELECT lineage, stamped_version, stamped_at FROM schema_lineage WHERE id = 1').get() || null;
+}
 
 // The action_dependencies DDL, single-sourced. This body must stay identical
 // to the declaration in pib-db-schema.sql — a table that exists in one and not
@@ -119,6 +188,15 @@ export const PROPAGATION_EVENTS_INDEXES = [
   'CREATE INDEX IF NOT EXISTS idx_propagation_events_project ON propagation_events(project_fid)',
 ];
 
+// The containment index (v13, base v11; §17). Every rolled-up read resolves an
+// area's child projects first, so this is on the hot path of the scope helper,
+// the container cards, and the completion gate's live-child-container check —
+// not speculative. Same single-sourcing rule as the two above: the body must
+// stay identical to the declaration in pib-db-schema.sql.
+export const CONTAINER_PARENT_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_fid)',
+];
+
 // Each entry: { version, sql }. A single version may have multiple SQL
 // statements (e.g. column add + index). Statements run in array order;
 // each is wrapped in try/catch so re-running on a DB that already has
@@ -147,24 +225,24 @@ const MIGRATIONS = [
   )` },
   { version: 3, sql: "CREATE INDEX IF NOT EXISTS idx_trigger_checks_fid ON trigger_checks(target_fid)" },
   { version: 4, sql: "CREATE INDEX IF NOT EXISTS idx_trigger_checks_target_time ON trigger_checks(target_fid, checked_at DESC)" },
-  { version: 5, sql: ENGAGEMENT_EVENTS_CREATE },
+  { version: 5, sql: ENGAGEMENT_EVENTS_CREATE, expect: { table: 'engagement_events' } },
   ...ENGAGEMENT_EVENTS_INDEXES.map(sql => ({ version: 5, sql })),
-  { version: 6, sql: "ALTER TABLE projects ADD COLUMN tags TEXT NOT NULL DEFAULT ''" },
-  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_title TEXT" },
-  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_body TEXT" },
-  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_generated_at TEXT" },
-  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_generated_status TEXT" },
-  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_title TEXT" },
-  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_body TEXT" },
-  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_generated_at TEXT" },
-  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_generated_status TEXT" },
-  { version: 8, sql: "ALTER TABLE engagement_events ADD COLUMN visibility TEXT NOT NULL DEFAULT 'internal' CHECK(visibility IN ('client','internal'))" },
+  { version: 6, sql: "ALTER TABLE projects ADD COLUMN tags TEXT NOT NULL DEFAULT ''", expect: { column: 'projects.tags' } },
+  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_title TEXT", expect: { column: 'actions.client_title' } },
+  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_body TEXT", expect: { column: 'actions.client_body' } },
+  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_generated_at TEXT", expect: { column: 'actions.client_generated_at' } },
+  { version: 7, sql: "ALTER TABLE actions ADD COLUMN client_generated_status TEXT", expect: { column: 'actions.client_generated_status' } },
+  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_title TEXT", expect: { column: 'projects.client_title' } },
+  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_body TEXT", expect: { column: 'projects.client_body' } },
+  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_generated_at TEXT", expect: { column: 'projects.client_generated_at' } },
+  { version: 7, sql: "ALTER TABLE projects ADD COLUMN client_generated_status TEXT", expect: { column: 'projects.client_generated_status' } },
+  { version: 8, sql: "ALTER TABLE engagement_events ADD COLUMN visibility TEXT NOT NULL DEFAULT 'internal' CHECK(visibility IN ('client','internal'))", expect: { column: 'engagement_events.visibility' } },
   // v9: prefix legacy audit finding ids with their run id (base v7 twin —
   // act:4ec70792). Idempotent via the NOT LIKE guard. skipOn: a db that
   // predates the audit tables has nothing to prefix.
   { version: 9, sql: "UPDATE audit_findings SET id = run_id || '/' || id WHERE run_id IS NOT NULL AND run_id != '' AND id NOT LIKE run_id || '/%'", skipOn: /no such table: audit_findings/i },
   // v10: dependency as a real edge (base v8 twin — act:d46f3b48).
-  { version: 10, sql: ACTION_DEPENDENCIES_CREATE },
+  { version: 10, sql: ACTION_DEPENDENCIES_CREATE, expect: { table: 'action_dependencies' } },
   ...ACTION_DEPENDENCIES_INDEXES.map(sql => ({ version: 10, sql })),
   // v11: the middle type (base v9 twin — act:14876288). Every existing
   // container defaults to 'area' — the DEFAULT is the whole classification
@@ -172,28 +250,117 @@ const MIGRATIONS = [
   // judgment (§7.2) and no migration may do it. Archive INSERTs run BEFORE
   // the drops, OR IGNORE for pre-pragma re-runs; skipOn covers databases
   // where `area` is already gone.
-  { version: 11, sql: "ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'area' CHECK(kind IN ('area','project'))" },
+  { version: 11, sql: "ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'area' CHECK(kind IN ('area','project'))", expect: { column: 'projects.kind' } },
   { version: 11, sql: `CREATE TABLE IF NOT EXISTS legacy_area_values (
   tbl    TEXT NOT NULL CHECK(tbl IN ('actions','projects')),
   fid    TEXT NOT NULL,
   value  TEXT NOT NULL,
   PRIMARY KEY (tbl, fid)
-)` },
+)`, expect: { table: 'legacy_area_values' } },
   { version: 11, sql: "INSERT OR IGNORE INTO legacy_area_values (tbl, fid, value) SELECT 'projects', fid, area FROM projects WHERE area IS NOT NULL", skipOn: /no such column: area/i },
   { version: 11, sql: "INSERT OR IGNORE INTO legacy_area_values (tbl, fid, value) SELECT 'actions', fid, area FROM actions WHERE area IS NOT NULL", skipOn: /no such column: area/i },
-  { version: 11, sql: "ALTER TABLE projects DROP COLUMN area", skipOn: /no such column/i },
-  { version: 11, sql: "ALTER TABLE actions DROP COLUMN area", skipOn: /no such column/i },
+  { version: 11, sql: "ALTER TABLE projects DROP COLUMN area", skipOn: /no such column/i, expect: { gone: 'projects.area' } },
+  { version: 11, sql: "ALTER TABLE actions DROP COLUMN area", skipOn: /no such column/i, expect: { gone: 'actions.area' } },
   // v12: completion propagation (base v10 twin — act:08c563ae; §16). The
   // resolution column is the per-row typed-closure claim; NO backfill — a
   // closed row with NULL resolution honestly predates the feature. The CHECK
   // closes the vocabulary at the schema layer.
-  { version: 12, sql: "ALTER TABLE actions ADD COLUMN resolution TEXT CHECK(resolution IN ('verified','parent-outcome'))" },
-  { version: 12, sql: PROPAGATION_EVENTS_CREATE },
+  { version: 12, sql: "ALTER TABLE actions ADD COLUMN resolution TEXT CHECK(resolution IN ('verified','parent-outcome'))", expect: { column: 'actions.resolution' } },
+  { version: 12, sql: PROPAGATION_EVENTS_CREATE, expect: { table: 'propagation_events' } },
   ...PROPAGATION_EVENTS_INDEXES.map(sql => ({ version: 12, sql })),
+  // v13 (base v11): container nesting (act:e567d724; §17). RENUMBERED from
+  // base's 11 — copying base's number here would be silently fatal on exactly
+  // the installs that carry this file. NO backfill and no DEFAULT: every
+  // existing container stays a root, because nesting is operator judgment and
+  // no migration may do it. Measured on SQLite 3.51.3: the added CHECK is a
+  // ROW SCAN, so a violating row rolls the migration back rather than
+  // half-applying it; a re-run raises "duplicate column name", which
+  // migrate()'s existing swallow already matches — no skipOn needed.
+  { version: 13, sql: "ALTER TABLE projects ADD COLUMN parent_fid TEXT REFERENCES projects(fid) CHECK(parent_fid IS NULL OR kind = 'project')", expect: { column: 'projects.parent_fid' } },
+  ...CONTAINER_PARENT_INDEXES.map(sql => ({ version: 13, sql })),
 ];
+
+// The post-condition of every migration the stamp claims was applied.
+// Returns problem strings; empty means the stamp and the shape agree.
+function verifyStampedShape(db, current) {
+  const problems = [];
+  for (const m of MIGRATIONS) {
+    if (m.version > current || !m.expect) continue;
+    const p = checkExpectation(db, m.expect);
+    if (p) problems.push(`v${m.version}: ${p}`);
+  }
+  return problems;
+}
+
+function schemaMismatchMessage(db, current, problems) {
+  const marker = readSchemaLineage(db);
+  const engagementInSchema = tableExists(db, 'engagement_events');
+  return [
+    'PIB SCHEMA MISMATCH — refusing to run migrations (fail-closed; act:b7d81b52).',
+    `This database's version stamp (user_version ${current}) contradicts the schema shape on disk,`,
+    'so the stamp cannot be trusted: migrations keyed on it would be skipped or misapplied, and',
+    'the database would then be stamped fully migrated anyway. That silent path is what killed',
+    'two consumers during the v0.56.0 walk; this refusal replaces it.',
+    '',
+    `  library lineage:    ${SCHEMA_LINEAGE} (head v${SCHEMA_VERSION})`,
+    `  db lineage marker:  ${marker ? `${marker.lineage} (stamped v${marker.stamped_version} at ${marker.stamped_at})` : 'absent (stamp predates lineage recording)'}`,
+    `  engagement_events:  ${engagementInSchema ? 'present in schema' : 'not in schema'}`,
+    '  contradictions:',
+    ...problems.map((p) => `    - ${p}`),
+    '',
+    engagementInSchema && SCHEMA_LINEAGE === 'base'
+      ? 'This database was numbered on the ENGAGEMENT overlay lineage (its versions run two ahead of base), but the installed library is the BASE one — the module list in .ccrc.json is not the tell, the schema is. Fix: reinstall with the engagement module enabled so the overlay library, which understands this numbering, runs the migration. If engagement was removed deliberately, repair the schema by hand first (act:b7d81b52 holds the verified recipe).'
+      : 'Fix: restore the pre-upgrade snapshot if one exists, or repair the schema by hand so the shape matches the stamp (act:b7d81b52 holds the verified recipe), then re-run.',
+  ].join('\n');
+}
+
+// Full-shape check against THIS library's head — the post-install self-check
+// (`pib-db.mjs verify-schema`). Read-only; never migrates.
+export function verifySchema(db) {
+  const version = db.pragma('user_version', { simple: true });
+  const problems = [];
+  for (const m of MIGRATIONS) {
+    if (!m.expect) continue;
+    const p = checkExpectation(db, m.expect);
+    if (p) problems.push(`v${m.version}: ${p}`);
+  }
+  if (version < SCHEMA_VERSION) {
+    problems.push(`user_version ${version} is behind this library's head v${SCHEMA_VERSION} — migrate() has not completed`);
+  }
+  return {
+    ok: problems.length === 0,
+    version,
+    head: SCHEMA_VERSION,
+    lineage: SCHEMA_LINEAGE,
+    marker: readSchemaLineage(db),
+    problems,
+  };
+}
 
 export function migrate(db) {
   const current = db.pragma('user_version', { simple: true });
+
+  // FAIL-CLOSED GUARD (act:b7d81b52) — runs BEFORE the early return, so a
+  // stamp at or past head cannot silently no-op over a broken shape. A fresh
+  // or pre-pragma database (current 0) has claimed nothing, so there is
+  // nothing to verify.
+  if (current > 0) {
+    const marker = readSchemaLineage(db);
+    // Which lineages' stamps may this library renumber and advance? The
+    // overlay may adopt a base stamp (that is the legitimate add-engagement
+    // path — its higher-numbered entries are a superset, guarded by
+    // duplicate-swallow). The base library must NEVER renumber an
+    // engagement stamp: the integer means something else there.
+    const adoptable = SCHEMA_LINEAGE === 'engagement' ? ['base', 'engagement'] : ['base'];
+    if (marker && current < SCHEMA_VERSION && !adoptable.includes(marker.lineage)) {
+      throw new Error(schemaMismatchMessage(db, current, [
+        `user_version ${current} was stamped by the '${marker.lineage}' lineage, which this '${SCHEMA_LINEAGE}' library cannot renumber`,
+      ]));
+    }
+    const problems = verifyStampedShape(db, current);
+    if (problems.length) throw new Error(schemaMismatchMessage(db, current, problems));
+  }
+
   if (current >= SCHEMA_VERSION) return { from: current, to: current, applied: 0 };
 
   // Wrap in a transaction so a real mid-migration failure (disk full,
@@ -213,6 +380,17 @@ export function migrate(db) {
         if (!/already exists|duplicate column/i.test(msg)) throw e;
       }
     }
+    // Verify the whole declared shape BEFORE stamping — a skipOn that
+    // wrongly swallowed a real failure must roll the stamp back with it,
+    // never certify a shape that is not there.
+    const post = verifyStampedShape(db, SCHEMA_VERSION);
+    if (post.length) throw new Error(schemaMismatchMessage(db, current, post));
+    // Stamp the lineage beside the version, atomically: a bare integer is
+    // never again the only signal of which numbering wrote it.
+    db.exec(SCHEMA_LINEAGE_CREATE);
+    db.prepare(`INSERT INTO schema_lineage (id, lineage, stamped_version, stamped_at) VALUES (1, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET lineage = excluded.lineage, stamped_version = excluded.stamped_version, stamped_at = excluded.stamped_at`)
+      .run(SCHEMA_LINEAGE, SCHEMA_VERSION, today());
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
     return applied;
   });
@@ -623,7 +801,9 @@ export function createAction(db, { text, projectFid, due, notes }) {
   return result;
 }
 
-export function listActions(db, { status, project } = {}) {
+export function listActions(db, { status, project, scope } = {}) {
+  const scopeError = validateScope(scope);
+  if (scopeError) return scopeError;
   const conditions = ['a.deleted_at IS NULL'];
   const params = [];
 
@@ -634,12 +814,13 @@ export function listActions(db, { status, project } = {}) {
     conditions.push('a.completed = 0');
   }
   if (project) {
-    conditions.push('a.project_fid = ?');
-    params.push(project);
+    const clause = containerScopeClause(project, scope);
+    conditions.push(clause.sql);
+    params.push(...clause.params);
   }
 
   const rows = db.prepare(`
-    SELECT a.fid, a.text, a.due, a.flagged, a.status, a.completed, a.resolution, p.name as project, p.kind as project_kind, a.tags
+    SELECT a.fid, a.text, a.due, a.flagged, a.status, a.completed, a.resolution, a.project_fid, p.name as project, p.kind as project_kind, a.tags
     FROM actions a
     LEFT JOIN projects p ON a.project_fid = p.fid
     WHERE ${conditions.join(' AND ')}
@@ -864,16 +1045,187 @@ function validateProjectOutcome(kind, notes, { reclassifying = false } = {}) {
 // what its status says, and no status is exempt from answering.
 const OPEN_CHILD_PREDICATE_SQL = 'a.project_fid = ? AND a.completed = 0 AND a.deleted_at IS NULL';
 
+// DELIBERATELY NOT parent-scoped, and this is load-bearing (§17.3). Nesting
+// gives "in this container" two readings: membership for READING is rolled up
+// (an area's lists and figures include its projects' actions — see
+// containerScopeSql), and membership for COMPLETION is direct and stays
+// direct. Scoping this predicate would make the walk recursive and give an
+// area an open-children count it must never have, and it would break §16.3's
+// guarantee that the gate's count and the walk's open set are ONE definition.
+// A live CHILD CONTAINER is a separate concern with its own guard below —
+// never a row in this count.
 function openChildCount(db, fid) {
   return db.prepare(
     `SELECT COUNT(*) AS n FROM actions a WHERE ${OPEN_CHILD_PREDICATE_SQL}`
   ).get(fid).n;
 }
 
-export function createProject(db, { name, kind, notes, due, tags }) {
+// ---------------------------------------------------------------------------
+// Containment — an AREA contains PROJECTs (v11; §17)
+// ---------------------------------------------------------------------------
+// The schema carries two of the three invariants: an area may not CARRY a
+// parent (row-level CHECK, structural, fires in both directions), and the
+// parent must EXIST (foreign key, pragma-gated). The third — **the parent
+// must be an AREA** — is not expressible in a row-level CHECK because it
+// reads another row, and it is the one that carries BOTH the two-level
+// guarantee and acyclicity. Measured on SQLite 3.51.3: a project→project
+// parent, and a self-parent, pass the CHECK and the FK alike. So it lives
+// here, and both container writers run their parent/kind read-and-write in
+// ONE immediate transaction — three processes hold concurrent write handles
+// on this file, and two racing calls could otherwise each pass their pre-read
+// and mint a third level with no error anywhere (§12.7's addDependency race,
+// same shape, same fix).
+//
+// Every refusal returns this library's {error} shape BEFORE any SQL runs.
+// The constraints are the backstop, not the teacher: a CHECK violation
+// escapes as a thrown SqliteError, which the MCP server renders as a bare
+// constraint string and the work-tracker server turns into a deliberately
+// generic 500 — so an operator using the tracker's kind dropdown would get
+// no information at all.
+
+// Child CONTAINERS of a container. `liveOnly` excludes done ones, which is
+// what every gate wants: a done child project is settled and constrains
+// nothing. Soft-deleted children are always excluded — they are tombstones.
+function childProjects(db, fid, { liveOnly = true } = {}) {
+  return db.prepare(`
+    SELECT fid, name, status FROM projects
+    WHERE parent_fid = ? AND deleted_at IS NULL
+      ${liveOnly ? "AND status != 'done'" : ''}
+    ORDER BY name
+  `).all(fid);
+}
+
+// Resolve and validate a proposed parent. Mirrors updateAction's projectFid
+// guard and addDependency's resolveEndpoint (§12.5) — same refusals, same
+// shape, so a reader who knows one knows all three.
+function resolveParentTarget(db, parentFid, childFid) {
+  const fidError = validateFid(parentFid);
+  if (fidError) return { error: fidError };
+  if (!parentFid.startsWith('prj:')) {
+    return { error: { message: `A parent must be a container fid (prj:...), got ${parentFid}. Actions are parented with projectFid on the action, not here.` } };
+  }
+  // Self-parent gets its own message. It is NOT covered by the kind rule —
+  // measured: the row satisfies the CHECK (it IS a project) and satisfies the
+  // FK (the target DOES exist), exactly like the dependency self-edge.
+  if (parentFid === childFid) {
+    return { error: { message: `A container cannot be its own parent (${parentFid}).` } };
+  }
+  const row = db.prepare('SELECT fid, name, kind, status FROM projects WHERE fid = ? AND deleted_at IS NULL').get(parentFid);
+  if (!row) {
+    return { error: { message: `Parent ${parentFid} not found (or deleted). A project names the AREA it serves; that area must exist.` } };
+  }
+  if (row.kind !== 'area') {
+    return { error: { message: `Cannot parent under ${parentFid} (${row.name}): it is a project, and a project cannot contain another project. Containers nest exactly one level — an area holds projects, a project holds actions. Parent this under an AREA, or leave it a root.` } };
+  }
+  // §16.3's enter-invariant, one level up: an open action may not ENTER a done
+  // container, and neither may a live project. An area cannot normally reach
+  // 'done' (the kind gate refuses it), but legacy done-areas exist in real
+  // trackers — 40 on this repo's own when the kind column shipped.
+  if (row.status === 'done') {
+    return { error: { message: `Cannot parent under ${parentFid} (${row.name}): that area is marked done, and live work may not enter a done container. Reopen it first (pib_update_project ${parentFid} status='active'), or parent this elsewhere.` } };
+  }
+  return { row };
+}
+
+// Container statuses that hide a container from the active surfaces. Parking
+// an area that still holds live projects makes their parent vanish from every
+// container list while they hold live work — §4's pathology with the parent
+// hidden rather than closed. `done` is handled by the completion gates.
+const PARKED_CONTAINER_STATUSES = ['paused', 'someday', 'dropped'];
+
+// Nesting gives "in this container" two readings, and they are NOT
+// interchangeable (§17.3, §17.5). 'direct' means what the container filter has
+// always meant — actions whose project_fid is exactly this container — and is
+// the DEFAULT, so no existing caller's meaning changes. 'rolled-up' adds the
+// actions of any project whose parent is this container, which is what
+// "everything under Live Ops" means once areas hold projects.
+//
+// The rejected alternative, recorded: silently widening the filter so an area
+// always rolled up. It changes the meaning of every existing call site at
+// once, on the surface (`listStartable`) that is the payoff of the whole
+// data-model rebuild. An explicit parameter costs one argument at the three
+// call sites that want it and leaves every other caller provably untouched.
+// (The design draft also rejected an explicit parameter by citing sort_order
+// — a category error: sort_order rotted because it was a STORED COLUMN nobody
+// wrote, and a call argument stores nothing and cannot rot.)
+export const CONTAINER_SCOPES = ['direct', 'rolled-up'];
+
+function containerScopeClause(fid, scope) {
+  if (scope === 'rolled-up') {
+    return {
+      sql: '(a.project_fid = ? OR a.project_fid IN (SELECT c.fid FROM projects c WHERE c.parent_fid = ? AND c.deleted_at IS NULL))',
+      params: [fid, fid],
+    };
+  }
+  return { sql: 'a.project_fid = ?', params: [fid] };
+}
+
+function validateScope(scope) {
+  if (scope === undefined || CONTAINER_SCOPES.includes(scope)) return null;
+  return { error: { message: `scope must be one of ${CONTAINER_SCOPES.join(', ')}, got "${scope}". 'direct' counts only actions filed straight to this container; 'rolled-up' also counts the actions of projects inside it.` } };
+}
+
+// A rolled-up result must SAY it rolled up, or it is indistinguishable from a
+// bug — §6's rule that a derived answer nothing displays is sort_order with
+// extra steps. Computed from the rows already returned, never a second query.
+//
+// Two ways that sentence used to state a false quantity (act:f07b0f37), and it
+// is the ONE sentence whose whole job is to be trusted as evidence:
+//
+//   - With no container named, it still said "under this container". There was
+//     no container; `project_fid === undefined` matched only ORPHAN actions and
+//     counted them as "filed directly", while every real container in the
+//     result became a "project inside it". Measured: childProjects 4 on a
+//     database holding 3 containers.
+//   - The rows handed in are already LIMIT-capped, so the counts described the
+//     PAGE while claiming to describe the container. Measured on one area: "5
+//     under this container — 2 direct, 3 in 2 project(s)" unlimited, versus "2
+//     ... 0 in 0 project(s)" at limit 2.
+//
+// Fixed by refusing to speak in the first case and naming the cap in the
+// second. Still no second query: a capped view says it is capped rather than
+// pretending its numbers are the whole.
+function rollupSummary(rows, fid, scope, { capped = false } = {}) {
+  if (scope !== 'rolled-up') return null;
+  // A rollup is a claim ABOUT A CONTAINER. With none named there is nothing for
+  // work to be "inside", so there is no honest sentence to write.
+  if (!fid) return null;
+  const direct = rows.filter((r) => r.project_fid === fid).length;
+  const viaProjects = rows.length - direct;
+  const containers = new Set(rows.filter((r) => r.project_fid !== fid).map((r) => r.project_fid));
+  const head = capped
+    ? `${rows.length} shown under this container (capped — more may exist)`
+    : `${rows.length} under this container`;
+  return {
+    direct,
+    viaProjects,
+    childProjects: containers.size,
+    capped,
+    message: `${head} — ${direct} filed directly, ${viaProjects} in ${containers.size} project(s) inside it.`,
+  };
+}
+
+// Thrown inside a container writer's transaction to abort it, then converted
+// back to this library's documented {error} shape by the caller. Same device
+// as the walk's WalkRefusal, and for the same reason: better-sqlite3 rolls
+// back only on THROW, so a gate that merely RETURNED an error inside the
+// transaction would let the write commit and then hand back the refusal
+// (§16.4's flagship inversion). Anything else that throws mid-write
+// propagates — a genuine defect must never be dressed up as a refusal.
+class ContainmentRefusal extends Error {}
+
+export function createProject(db, { name, kind, notes, due, tags, parentFid }) {
   const k = kind === undefined ? 'area' : kind;
   const kindError = validateKind(k);
   if (kindError) return kindError;
+  // Containment (§17). An area is always a root; only a project may name the
+  // area it serves. Refused here rather than left to the CHECK so the caller
+  // gets the reason instead of a constraint string.
+  if (parentFid !== undefined && parentFid !== null && parentFid !== '') {
+    if (k !== 'project') {
+      return { error: { message: `Only a project may name a parent — an area is always a root, because an area holds projects rather than sitting inside one. Create this as kind='project' (stating its outcome in notes), or drop parentFid.` } };
+    }
+  }
   // A project's notes ARE its acceptance criteria (§10.3). It needs no
   // ## Acceptance Criteria scaffold and never a ## Surface Area (a project
   // changes no files itself), but an outcome it must state. An area states
@@ -882,38 +1234,97 @@ export function createProject(db, { name, kind, notes, due, tags }) {
   const outcomeError = validateProjectOutcome(k, notes);
   if (outcomeError) return outcomeError;
   const fid = generateFid('prj');
-  db.prepare(`
-    INSERT INTO projects (fid, name, kind, notes, due, tags, created)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(fid, name, k, notes || '', due || null, tags || '', today());
-  return { fid, name, kind: k, message: `Created ${k} ${fid}: ${name}` };
+  const parent = parentFid || null;
+
+  // The parent check and the INSERT run in ONE immediate transaction. Separate,
+  // a concurrent reclassification of the target area to 'project' between the
+  // two would mint a project inside a project — and unlike a dangling parent,
+  // an illegal third level has no report (§12.7's reasoning, verbatim).
+  let parentRow = null;
+  const tx = db.transaction(() => {
+    if (parent) {
+      const resolved = resolveParentTarget(db, parent, fid);
+      if (resolved.error) throw new ContainmentRefusal(resolved.error.message);
+      parentRow = resolved.row;
+    }
+    db.prepare(`
+      INSERT INTO projects (fid, name, kind, notes, due, tags, created, parent_fid)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(fid, name, k, notes || '', due || null, tags || '', today(), parent);
+  });
+  try { tx.immediate(); }
+  catch (e) {
+    if (e instanceof ContainmentRefusal) return { error: { message: e.message } };
+    throw e;
+  }
+
+  const result = { fid, name, kind: k, parent_fid: parent, message: `Created ${k} ${fid}: ${name}` };
+  if (parentRow) result.message += ` (in ${parentRow.name})`;
+  return result;
 }
 
-export function updateProject(db, { fid, tags, name, status, notes, due, kind, client_title, client_body, client_generated_at, client_generated_status }) {
+export function updateProject(db, { fid, tags, name, status, notes, due, kind, parentFid, client_title, client_body, client_generated_at, client_generated_status }) {
+  // A caller may deliberately CLEAR the parent (parentFid: null), which is
+  // different from not mentioning it — case 1 below turns on exactly that.
+  const parentProvided = parentFid !== undefined;
+  const parentTarget = parentProvided ? (parentFid || null) : undefined;
+
+  let outcome;
+  // EVERYTHING — the gating reads and the write — runs in ONE immediate
+  // transaction (§17.1). Read-then-write with no transaction is what let two
+  // concurrent callers each pass their own pre-read and mint a third
+  // container level with no error anywhere; `.immediate()` because a deferred
+  // transaction upgrading mid-call can die un-retried on a snapshot conflict
+  // (§16.4). Refusals THROW so they unwind — a gate that merely returned
+  // inside the transaction would let the write commit first (§16.4's
+  // flagship inversion).
+  const tx = db.transaction(() => {
   // Reads that gate the write need the current row (kind, status). Fetched
   // once, up front; the absent-row answer stays identical to the old path.
-  const row = db.prepare('SELECT fid, kind, status, notes FROM projects WHERE fid = ? AND deleted_at IS NULL').get(fid);
+  const row = db.prepare('SELECT fid, name, kind, status, notes, parent_fid FROM projects WHERE fid = ? AND deleted_at IS NULL').get(fid);
   if (!row) {
-    return { error: { message: `Project ${fid} not found` } };
+    throw new ContainmentRefusal(`Project ${fid} not found`);
   }
 
   if (kind !== undefined) {
     const kindError = validateKind(kind);
-    if (kindError) return kindError;
+    if (kindError) throw new ContainmentRefusal(kindError.error.message);
     // The outcome gate, on the arm that actually mints projects (act:f9baa1c0).
     // Effective notes: what this call writes if it writes any, else what the
     // row already carries — a container that already states its outcome does
     // not have to restate it to be promoted.
     const outcomeError = validateProjectOutcome(
       kind, notes !== undefined ? notes : row.notes, { reclassifying: true });
-    if (outcomeError) return outcomeError;
+    if (outcomeError) throw new ContainmentRefusal(outcomeError.error.message);
     // Reclassification is the OPERATOR's verb (§7.2) — this function is its
     // one legal write path. Demoting a completed container to 'area' would
     // mint the incoherent state "a done thing that cannot be done"; reopen
     // first, then reclassify.
     const statusAfter = status !== undefined ? status : row.status;
     if (kind === 'area' && statusAfter === 'done') {
-      return { error: { message: `Cannot reclassify ${fid} to an area while it is done — an area never completes, so a done area is a contradiction. Reopen it (status='active') first, or keep it a project.` } };
+      throw new ContainmentRefusal(`Cannot reclassify ${fid} to an area while it is done — an area never completes, so a done area is a contradiction. Reopen it (status='active') first, or keep it a project.`);
+    }
+    // CONTAINMENT case 1 (§17.2): demoting a PARENTED project to an area.
+    // An area is always a root, so the parent must go — but orphaning it
+    // silently would destroy a stated fact (which area this served) with no
+    // record. Refuse unless the SAME call clears it, which is the shape
+    // validateProjectOutcome's reclassify arm already uses. The CHECK would
+    // also catch this, with a message that teaches nothing.
+    if (kind === 'area' && row.parent_fid && !(parentProvided && parentTarget === null)) {
+      throw new ContainmentRefusal(`Cannot reclassify ${fid} to an area while it names a parent — an area is always a root. Clear the parent in the same call (kind='area' with parentFid=null) if this responsibility now stands on its own, or leave it a project inside its area.`);
+    }
+    // CONTAINMENT case 2 (§17.2): promoting an area that HOLDS projects.
+    // Containers nest exactly one level, so this would leave live projects
+    // inside a project. Symmetric to the reclassify-while-done gate below:
+    // the completion gate fires on a STATUS write, so the gate that fires on
+    // a KIND write has to be written separately or the path is ungated.
+    // Counts done children too — the rule is about depth, not liveness.
+    if (kind === 'project' && row.kind === 'area') {
+      const held = childProjects(db, fid, { liveOnly: false });
+      if (held.length > 0) {
+        const names = held.slice(0, 3).map((c) => `${c.name} (${c.fid})`).join(', ');
+        throw new ContainmentRefusal(`Cannot reclassify ${fid} (${row.name}) to a project: ${held.length} project(s) name it as their area — ${names}${held.length > 3 ? ', …' : ''} — and a project cannot contain another project. Move them out first (pib_update_project <child> parentFid=null, or point them at a different area), or leave this an area.`);
+      }
     }
     // The symmetric gate (§16.0, checkpoint find): the completion gate below
     // fires only when status='done' is written IN THE CALL, so reclassifying a
@@ -924,9 +1335,21 @@ export function updateProject(db, { fid, tags, name, status, notes, due, kind, c
     if (kind === 'project' && status === undefined && row.status === 'done') {
       const open = openChildCount(db, fid);
       if (open > 0) {
-        return { error: { message: `Cannot reclassify ${fid} to a project while it is done with ${open} open child action(s) — that would mint a completed project over open children. Reopen it first (status='active'), reclassify it, and when its outcome really is true, complete it through the gate (pib_complete_project walks the open children).` } };
+        throw new ContainmentRefusal(`Cannot reclassify ${fid} to a project while it is done with ${open} open child action(s) — that would mint a completed project over open children. Reopen it first (status='active'), reclassify it, and when its outcome really is true, complete it through the gate (pib_complete_project walks the open children).`);
       }
     }
+  }
+
+  // CONTAINMENT cases 3 and 4 (§17.2): setting or changing the parent. The
+  // kind this call is WRITING decides whether a parent is legal at all, so a
+  // reclassify-and-parent call is judged as what it is becoming.
+  if (parentProvided && parentTarget !== null) {
+    const effectiveKind = kind !== undefined ? kind : row.kind;
+    if (effectiveKind !== 'project') {
+      throw new ContainmentRefusal(`Only a project may name a parent — an area is always a root, because an area holds projects rather than sitting inside one. Reclassify this to a project first (kind='project', stating its outcome in notes), or drop parentFid.`);
+    }
+    const resolved = resolveParentTarget(db, parentTarget, fid);
+    if (resolved.error) throw new ContainmentRefusal(resolved.error.message);
   }
 
   // The two completion gates (§10.3). Evaluated against the kind this same
@@ -935,11 +1358,40 @@ export function updateProject(db, { fid, tags, name, status, notes, due, kind, c
   if (status === 'done') {
     const effectiveKind = kind !== undefined ? kind : row.kind;
     if (effectiveKind === 'area') {
-      return { error: { message: `Cannot complete ${fid}: it is an area, and an area never completes — it is a standing responsibility, not an outcome ("Is Watchtower done?" has no answer). If this container is really an outcome that finishes, reclassify it first (kind='project', stating the outcome in its notes), then complete it. To stop holding the responsibility, use status='dropped'.` } };
+      throw new ContainmentRefusal(`Cannot complete ${fid}: it is an area, and an area never completes — it is a standing responsibility, not an outcome ("Is Watchtower done?" has no answer). If this container is really an outcome that finishes, reclassify it first (kind='project', stating the outcome in its notes), then complete it. To stop holding the responsibility, use status='dropped'.`);
     }
     const open = openChildCount(db, fid);
     if (open > 0) {
-      return { error: { message: `Cannot complete ${fid}: ${open} child action(s) are still open. A project completes only when every child is closed or explicitly dispositioned. Complete each verified child individually (pib_complete_action), or run the walk: pib_complete_project ${fid} — it shows every open child, takes a per-child answer (done by this outcome / still needed, move it / not needed, delete it), and completes the project through this same gate.` } };
+      throw new ContainmentRefusal(`Cannot complete ${fid}: ${open} child action(s) are still open. A project completes only when every child is closed or explicitly dispositioned. Complete each verified child individually (pib_complete_action), or run the walk: pib_complete_project ${fid} — it shows every open child, takes a per-child answer (done by this outcome / still needed, move it / not needed, delete it), and completes the project through this same gate.`);
+    }
+    // A live CHILD CONTAINER is not in openChildCount — that predicate counts
+    // ACTIONS and deliberately stays direct (§17.3). Without this, a project
+    // holding an open child project completes straight over it: measured at
+    // the design checkpoint, and it is §4's Pre-Launch Readiness pathology one
+    // level up, on the flagship verb. Only reachable if the two-level rule was
+    // bypassed (raw SQL, or a future sub-project relaxation) — a report is
+    // cheap insurance against a defense that lives in one function.
+    const liveChildren = childProjects(db, fid, { liveOnly: true });
+    if (liveChildren.length > 0) {
+      const names = liveChildren.slice(0, 3).map((c) => `${c.name} (${c.fid})`).join(', ');
+      throw new ContainmentRefusal(`Cannot complete ${fid}: ${liveChildren.length} container(s) still sit inside it — ${names}${liveChildren.length > 3 ? ', …' : ''}. Containers are meant to nest only one level, so this should not be reachable; close or move those out, and report how they got there.`);
+    }
+  }
+
+  // CONTAINMENT case 5 (§17.2): parking an area that still holds live
+  // projects. `listProjects` shows only active containers, so this hides the
+  // parent from every container surface while its children hold live work —
+  // §4's pathology with the parent hidden rather than closed. Note this
+  // function's own completion refusal RECOMMENDS status='dropped', so the
+  // route into this state is one the system itself suggests.
+  if (status !== undefined && PARKED_CONTAINER_STATUSES.includes(status)) {
+    const effectiveKind = kind !== undefined ? kind : row.kind;
+    if (effectiveKind === 'area') {
+      const liveChildren = childProjects(db, fid, { liveOnly: true });
+      if (liveChildren.length > 0) {
+        const names = liveChildren.slice(0, 3).map((c) => `${c.name} (${c.fid})`).join(', ');
+        throw new ContainmentRefusal(`Cannot set ${fid} (${row.name}) to '${status}': ${liveChildren.length} live project(s) name it as their area — ${names}${liveChildren.length > 3 ? ', …' : ''}. Parking the area hides their parent from every container surface while they still hold live work. Finish or park those projects first, or move them to an area that stays active.`);
+      }
     }
   }
 
@@ -951,6 +1403,7 @@ export function updateProject(db, { fid, tags, name, status, notes, due, kind, c
   if (notes !== undefined) { sets.push('notes = ?'); params.push(notes); }
   if (due !== undefined) { sets.push('due = ?'); params.push(due || null); }
   if (kind !== undefined) { sets.push('kind = ?'); params.push(kind); }
+  if (parentProvided) { sets.push('parent_fid = ?'); params.push(parentTarget); }
   if (client_title !== undefined) { sets.push('client_title = ?'); params.push(client_title || null); }
   if (client_body !== undefined) { sets.push('client_body = ?'); params.push(client_body || null); }
   if (client_generated_at !== undefined) { sets.push('client_generated_at = ?'); params.push(client_generated_at || null); }
@@ -965,25 +1418,64 @@ export function updateProject(db, { fid, tags, name, status, notes, due, kind, c
     sets.push('completed_at = NULL');
   }
   if (sets.length === 0) {
-    return { error: { message: 'No fields to update. Use tags, name, status, notes, due, kind, client_title, client_body, client_generated_at, or client_generated_status.' } };
+    throw new ContainmentRefusal('No fields to update. Use tags, name, status, notes, due, kind, parentFid, client_title, client_body, client_generated_at, or client_generated_status.');
   }
   params.push(fid);
   const result = db.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE fid = ? AND deleted_at IS NULL`).run(...params);
   if (result.changes === 0) {
-    return { error: { message: `Project ${fid} not found` } };
+    throw new ContainmentRefusal(`Project ${fid} not found`);
   }
-  return { fid, message: `Updated ${fid}` };
+  outcome = { fid, message: `Updated ${fid}` };
+  });
+
+  try { tx.immediate(); }
+  catch (e) {
+    if (e instanceof ContainmentRefusal) return { error: { message: e.message } };
+    throw e;
+  }
+  return outcome;
 }
 
 export function listProjects(db) {
+  // The parent join deliberately does NOT filter on par.deleted_at. Adding
+  // that filter is the obvious way to write this and it is wrong: a child
+  // whose parent was soft-deleted would render as a ROOT, silently losing the
+  // very fact this column exists to record. §12.3's rule — the pointer is the
+  // durable fact, liveness is derived, and a suspension is reported LOUDLY,
+  // never swallowed. So: join unconditionally, carry the tombstone out as
+  // parent_deleted, and count them as their own line, exactly as
+  // listDependencies reports danglingEdges.
+  //
+  // open_actions stays DIRECT (what it has always meant) and
+  // open_actions_rolled adds the child projects' actions, because an area's
+  // work is its own actions plus the actions of the projects inside it. A
+  // direct-only figure would make carving a project out of an area LOWER the
+  // area's number — reporting the reorganisation as loss, which is the exact
+  // confusion nesting exists to end (§17.3).
   const rows = db.prepare(`
     SELECT p.fid, p.name, p.kind, p.status, p.due, p.notes, p.tags, p.deleted_at,
-      (SELECT COUNT(*) FROM actions a WHERE a.project_fid = p.fid AND a.completed = 0 AND a.deleted_at IS NULL) as open_actions
+      p.parent_fid,
+      par.name AS parent_name,
+      (par.fid IS NOT NULL AND par.deleted_at IS NOT NULL) AS parent_deleted,
+      (SELECT COUNT(*) FROM projects c WHERE c.parent_fid = p.fid AND c.deleted_at IS NULL) AS child_projects,
+      (SELECT COUNT(*) FROM actions a WHERE a.project_fid = p.fid AND a.completed = 0 AND a.deleted_at IS NULL) as open_actions,
+      (SELECT COUNT(*) FROM actions a
+        WHERE a.completed = 0 AND a.deleted_at IS NULL
+          AND (a.project_fid = p.fid
+               OR a.project_fid IN (SELECT c.fid FROM projects c WHERE c.parent_fid = p.fid AND c.deleted_at IS NULL))
+      ) as open_actions_rolled
     FROM projects p
+    LEFT JOIN projects par ON par.fid = p.parent_fid
     WHERE p.status = 'active' AND p.deleted_at IS NULL
     ORDER BY p.created DESC
   `).all();
-  return { rows };
+  const suspendedParents = rows.filter((r) => r.parent_deleted).map((r) => r.fid);
+  const result = { rows };
+  if (suspendedParents.length > 0) {
+    result.suspendedParents = suspendedParents;
+    result.message = `${suspendedParents.length} container(s) name a parent that has been deleted — their parent is suspended, not cleared: ${suspendedParents.join(', ')}`;
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,12 +1654,23 @@ export function deferWithTrigger(db, { fid, triggerCondition, cascade = false } 
     // Children with their own trigger_condition already carry their own
     // return condition; cascade leaves them alone so the parent's trigger
     // doesn't overwrite their independent wait state.
-    const openChildren = db.prepare(`SELECT fid FROM actions WHERE project_fid = ? AND status NOT IN ('done','deferred') AND trigger_condition IS NULL AND deleted_at IS NULL`).all(fid);
+    //
+    // The child scope is ROLLED UP (§17.2 case 6). Direct-only was the shape
+    // before nesting existed, and after it the failure is silent and total:
+    // an area whose work has all been carved into child projects has ZERO
+    // direct actions, so it reports nothing to cascade, parks to 'someday',
+    // and — since listProjects shows only active containers — disappears
+    // while its projects hold live work. §4's pathology with the parent
+    // hidden rather than closed.
+    const scoped = containerScopeClause(fid, 'rolled-up');
+    const openChildren = db.prepare(
+      `SELECT a.fid FROM actions a WHERE ${scoped.sql} AND a.status NOT IN ('done','deferred') AND a.trigger_condition IS NULL AND a.deleted_at IS NULL`
+    ).all(...scoped.params);
     if (openChildren.length > 0 && !cascade) {
       return {
         error: {
           error: 'has_open_children',
-          message: `Project ${fid} has ${openChildren.length} open action(s) without their own trigger. Pass cascade: true to defer them alongside.`,
+          message: `Project ${fid} has ${openChildren.length} open action(s) without their own trigger (counting any inside projects filed under it). Pass cascade: true to defer them alongside.`,
           openChildren: openChildren.map(c => c.fid),
         },
       };
@@ -1181,23 +1684,59 @@ export function deferWithTrigger(db, { fid, triggerCondition, cascade = false } 
   }
 
   const newStatus = table === 'projects' ? 'someday' : 'deferred';
-  db.prepare(`UPDATE ${table} SET status = ?, trigger_condition = ? WHERE fid = ?`).run(newStatus, triggerCondition, fid);
+  if (table === 'projects') {
+    // The container's STATUS write routes through updateProject — the one
+    // legal write path for that column (§17.2 case 6). This function used to
+    // compose its own UPDATE, making it a second writer of container status
+    // that no kind, completion or parking gate ever saw: the shape
+    // act:4e0de399 and act:cbf19c3f each spent a build retiring for actions.
+    // trigger_condition stays this function's own write — it is that column's
+    // only writer by design (§12.7) — and the two run in one transaction so a
+    // refused park cannot leave a trigger stamped on an unparked container.
+    let parked;
+    const tx = db.transaction(() => {
+      parked = updateProject(db, { fid, status: newStatus });
+      if (parked.error) throw new ContainmentRefusal(parked.error.message);
+      db.prepare('UPDATE projects SET trigger_condition = ? WHERE fid = ?').run(triggerCondition, fid);
+    });
+    try { tx.immediate(); }
+    catch (e) {
+      if (e instanceof ContainmentRefusal) return { error: { error: 'refused', message: e.message } };
+      throw e;
+    }
+  } else {
+    db.prepare(`UPDATE ${table} SET status = ?, trigger_condition = ? WHERE fid = ?`).run(newStatus, triggerCondition, fid);
+  }
 
   return { fid, table, triggerCondition, status: newStatus, cascaded, message: `Deferred ${fid} with trigger` };
 }
 
-export function listTriggered(db, { includeDone = false } = {}) {
+/**
+ * Items carrying a trigger condition.
+ *
+ * DEFAULT = still WAITING, judged by the same `waitingOnTriggerSql` predicate
+ * the Ready view uses (act:4eabb7e8). It previously returned everything with a
+ * non-NULL trigger_condition, so an action whose trigger had already fired was
+ * listed as "waiting" here while `listStartable` simultaneously offered it as
+ * startable — two surfaces contradicting each other about one row. Released
+ * items are not lost: pass `includeReleased` to see them, and every row now
+ * carries `waiting_on_trigger` + `last_result` so a caller can render the
+ * distinction rather than infer it from presence.
+ */
+export function listTriggered(db, { includeDone = false, includeReleased = false } = {}) {
+  const notReleased = (alias) => (includeReleased ? '1=1' : waitingOnTriggerSql(alias));
   const actionsWhere = includeDone
-    ? 'a.trigger_condition IS NOT NULL AND a.deleted_at IS NULL'
-    : "a.trigger_condition IS NOT NULL AND a.deleted_at IS NULL AND a.status != 'done' AND (a.completed IS NULL OR a.completed = 0)";
+    ? `a.trigger_condition IS NOT NULL AND a.deleted_at IS NULL AND ${notReleased('a')}`
+    : `a.trigger_condition IS NOT NULL AND a.deleted_at IS NULL AND a.status != 'done' AND (a.completed IS NULL OR a.completed = 0) AND ${notReleased('a')}`;
   const projectsWhere = includeDone
-    ? 'p.trigger_condition IS NOT NULL AND p.deleted_at IS NULL'
-    : "p.trigger_condition IS NOT NULL AND p.deleted_at IS NULL AND p.status != 'done'";
+    ? `p.trigger_condition IS NOT NULL AND p.deleted_at IS NULL AND ${notReleased('p')}`
+    : `p.trigger_condition IS NOT NULL AND p.deleted_at IS NULL AND p.status != 'done' AND ${notReleased('p')}`;
 
   const actions = db.prepare(`
-    SELECT a.fid, a.text, a.trigger_condition, a.status, p.name AS project_name,
+    SELECT a.fid, a.text, a.trigger_condition, a.status, p.name AS project_name, p.kind AS project_kind,
       (SELECT checked_at FROM trigger_checks WHERE target_fid = a.fid ORDER BY checked_at DESC LIMIT 1) AS last_checked,
-      (SELECT result FROM trigger_checks WHERE target_fid = a.fid ORDER BY checked_at DESC LIMIT 1) AS last_result
+      ${lastTriggerResultSql('a')} AS last_result,
+      ${waitingOnTriggerSql('a')} AS waiting_on_trigger
     FROM actions a
     LEFT JOIN projects p ON a.project_fid = p.fid
     WHERE ${actionsWhere}
@@ -1205,9 +1744,10 @@ export function listTriggered(db, { includeDone = false } = {}) {
   `).all();
 
   const projects = db.prepare(`
-    SELECT p.fid, p.name, p.trigger_condition, p.status,
+    SELECT p.fid, p.name, p.kind, p.trigger_condition, p.status,
       (SELECT checked_at FROM trigger_checks WHERE target_fid = p.fid ORDER BY checked_at DESC LIMIT 1) AS last_checked,
-      (SELECT result FROM trigger_checks WHERE target_fid = p.fid ORDER BY checked_at DESC LIMIT 1) AS last_result
+      ${lastTriggerResultSql('p')} AS last_result,
+      ${waitingOnTriggerSql('p')} AS waiting_on_trigger
     FROM projects p
     WHERE ${projectsWhere}
     ORDER BY last_checked IS NOT NULL, last_checked ASC
@@ -1436,16 +1976,27 @@ const TRIGGER_RELEASING_RESULTS = ['triggered', 'condition-obsolete'];
 // SQL fragments, defined ONCE. Both `startable` and `blocked` are built from
 // these, so the two predicates cannot drift apart; re-typing either at a second
 // call site is how that happens.
-const LAST_TRIGGER_RESULT_SQL = `(
+//
+// Parameterized by table alias (act:4eabb7e8) so the CONTAINER surfaces can use
+// the identical rule: `listTriggered` renders both actions (`a`) and projects
+// (`p`), and it previously keyed on trigger_condition's mere PRESENCE. That let
+// one action be "startable" in the Ready view and "waiting" in the Waiting view
+// simultaneously — the two views disagreeing about the same row, which is worse
+// than either answer alone.
+export const lastTriggerResultSql = (alias = 'a') => `(
   SELECT result FROM trigger_checks
-  WHERE target_fid = a.fid
+  WHERE target_fid = ${alias}.fid
   ORDER BY checked_at DESC, id DESC LIMIT 1
 )`;
 
-const WAITING_ON_TRIGGER_SQL = `(
-  a.trigger_condition IS NOT NULL
-  AND COALESCE(${LAST_TRIGGER_RESULT_SQL}, '') NOT IN (${TRIGGER_RELEASING_RESULTS.map(r => `'${r}'`).join(', ')})
+export const waitingOnTriggerSql = (alias = 'a') => `(
+  ${alias}.trigger_condition IS NOT NULL
+  AND COALESCE(${lastTriggerResultSql(alias)}, '') NOT IN (${TRIGGER_RELEASING_RESULTS.map(r => `'${r}'`).join(', ')})
 )`;
+
+const LAST_TRIGGER_RESULT_SQL = lastTriggerResultSql('a');
+
+const WAITING_ON_TRIGGER_SQL = waitingOnTriggerSql('a');
 
 // An edge constrains only while it is LIVE (both endpoints present and not
 // tombstoned) and its blocker is UNFINISHED. The INNER JOIN is deliberate: a
@@ -1649,17 +2200,20 @@ export function listDanglingEdges(db) {
  * died because nothing wrote it and no view paid off for it, and it turned
  * out to be READ by five shipped surfaces while written by none.
  */
-export function listStartable(db, { project, limit } = {}) {
+export function listStartable(db, { project, limit, scope } = {}) {
+  const scopeError = validateScope(scope);
+  if (scopeError) return scopeError;
   const params = [];
   let projectClause = '';
   if (project) {
-    projectClause = 'AND a.project_fid = ?';
-    params.push(project);
+    const clause = containerScopeClause(project, scope);
+    projectClause = `AND ${clause.sql}`;
+    params.push(...clause.params);
   }
   const cap = Number.isInteger(limit) && limit > 0 ? limit : null;
 
   const rows = db.prepare(`
-    SELECT a.fid, a.text, a.status, a.due, a.flagged, p.name AS project, p.kind AS project_kind,
+    SELECT a.fid, a.text, a.status, a.due, a.flagged, a.project_fid, p.name AS project, p.kind AS project_kind,
       a.trigger_condition IS NOT NULL AS had_trigger,
       ${LAST_TRIGGER_RESULT_SQL} AS last_trigger_result,
       (a.status = 'blocked') AS status_says_blocked
@@ -1675,7 +2229,7 @@ export function listStartable(db, { project, limit } = {}) {
   `).all(...params);
 
   const dangling = listDanglingEdges(db);
-  return {
+  const result = {
     rows,
     count: rows.length,
     // Startable despite a status that still says blocked — the stale
@@ -1685,6 +2239,12 @@ export function listStartable(db, { project, limit } = {}) {
     releasedByTrigger: rows.filter(r => r.had_trigger).map(r => r.fid),
     danglingEdges: dangling.count,
   };
+  // `capped` only when the limit was actually reached — a result that happens
+  // to be shorter than the cap is complete, and saying otherwise would be its
+  // own false note.
+  const rollup = rollupSummary(rows, project, scope, { capped: Boolean(cap) && rows.length === cap });
+  if (rollup) result.rollup = rollup;
+  return result;
 }
 
 /**
@@ -1700,16 +2260,19 @@ export function listStartable(db, { project, limit } = {}) {
  * action lists. Anything that IS waiting is here, whether the wait is an
  * unfinished blocker or an unfired trigger.
  */
-export function listBlocked(db, { project } = {}) {
+export function listBlocked(db, { project, scope } = {}) {
+  const scopeError = validateScope(scope);
+  if (scopeError) return scopeError;
   const params = [];
   let projectClause = '';
   if (project) {
-    projectClause = 'AND a.project_fid = ?';
-    params.push(project);
+    const clause = containerScopeClause(project, scope);
+    projectClause = `AND ${clause.sql}`;
+    params.push(...clause.params);
   }
 
   const rows = db.prepare(`
-    SELECT a.fid, a.text, a.status, p.name AS project,
+    SELECT a.fid, a.text, a.status, a.project_fid, p.name AS project,
       (SELECT COUNT(*) FROM action_dependencies d JOIN actions b ON b.fid = d.blocker_fid
        WHERE d.blocked_fid = a.fid AND b.deleted_at IS NULL AND b.completed = 0) AS unmet_blockers,
       (SELECT GROUP_CONCAT(d.blocker_fid) FROM action_dependencies d JOIN actions b ON b.fid = d.blocker_fid
@@ -1725,7 +2288,10 @@ export function listBlocked(db, { project } = {}) {
     ORDER BY unmet_blockers DESC, a.created DESC
   `).all(...params);
 
-  return { rows, count: rows.length };
+  const result = { rows, count: rows.length };
+  const rollup = rollupSummary(rows, project, scope);
+  if (rollup) result.rollup = rollup;
+  return result;
 }
 
 // Unanchored twin of FID_PATTERN, for finding fids EMBEDDED in prose. The

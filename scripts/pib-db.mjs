@@ -12,7 +12,8 @@
 //   node scripts/pib-db.mjs update-action act:abc --status in-progress
 //   node scripts/pib-db.mjs complete-action act:abc123
 //   node scripts/pib-db.mjs create-project "My Area"                          # area (default): never completes
-//   node scripts/pib-db.mjs create-project "Ship X" --kind project --notes "done when …"
+//   node scripts/pib-db.mjs create-project "Ship X" --kind project --notes "done when …" --parent prj:abc
+//                                                     # …and the AREA it serves
 //   node scripts/pib-db.mjs complete-project prj:abc                          # walk sheet (no mutation) or close if no open children
 //   node scripts/pib-db.mjs complete-project prj:abc --map-file map.json      # apply the per-child disposition map
 //   node scripts/pib-db.mjs list-projects               # Active projects
@@ -21,7 +22,7 @@
 //   node scripts/pib-db.mjs next-actions [--project prj:abc] [--limit 20]
 //   node scripts/pib-db.mjs list-blocked [--project prj:abc]
 //   node scripts/pib-db.mjs propose-dependencies      # read-only backfill proposals
-//   node scripts/pib-db.mjs list-triggered [--include-done]
+//   node scripts/pib-db.mjs list-triggered [--include-done] [--include-released]
 //   node scripts/pib-db.mjs mark-trigger-checked act:abc --result <value> [--notes "<text>"]
 //   node scripts/pib-db.mjs add-event --engagement prj:abc --kind note --author consultant --allowed-authors "consultant,ed"
 //   node scripts/pib-db.mjs list-events [--engagement prj:abc] [--target act:xyz] [--unaddressed-only] [--exclude-soft-deleted]
@@ -29,6 +30,7 @@
 //   node scripts/pib-db.mjs ingest-findings <run-dir>   # Ingest audit findings
 //   node scripts/pib-db.mjs triage <finding-id> <status> [notes]
 //   node scripts/pib-db.mjs triage-history              # Suppression list JSON
+//   node scripts/pib-db.mjs verify-schema               # Shape vs stamp check (read-only)
 //
 // Environment:
 //   PIB_DB_PATH  — path to SQLite file. Overrides everything. Otherwise the
@@ -52,17 +54,18 @@ let db;
 
 function getDb() {
   if (db) return db;
+  // The CONNECTION, in its own try: this catch diagnoses better-sqlite3, so
+  // only better-sqlite3 failures may reach it. The migration below is
+  // deliberately OUTSIDE it — a schema refusal told to "npm install
+  // better-sqlite3" sends the reader to fix a module that is already fine,
+  // and burying the diagnosis is the exact failure mode act:b7d81b52 is
+  // about.
   try {
     const require = createRequire(import.meta.url);
     const Database = require('better-sqlite3');
     db = new Database(DB_PATH);
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
-    // Apply any pending migrations. Cheap: short-circuits when user_version
-    // is already current. Skipped only for `init` which runs init() itself
-    // (which also calls migrate internally).
-    if (process.argv[2] !== 'init') lib.migrate(db);
-    return db;
   } catch (err) {
     if (err.code === 'ERR_DLOPEN_FAILED') {
       console.error('Error: better-sqlite3 native module version mismatch.');
@@ -75,6 +78,24 @@ function getDb() {
     if (err.message) console.error(`  (${err.message.split('\n')[0]})`);
     process.exit(1);
   }
+
+  // Apply any pending migrations. Cheap: short-circuits when user_version
+  // is already current. Skipped only for `init` which runs init() itself
+  // (which also calls migrate internally). A fail-closed refusal prints its
+  // own full diagnosis verbatim — it already names the cause, the
+  // contradictions, and the fix.
+  if (process.argv[2] !== 'init') {
+    try {
+      lib.migrate(db);
+    } catch (err) {
+      console.error(err.message);
+      console.error('');
+      console.error(`  database: ${DB_PATH}`);
+      console.error('  Inspect without migrating: node scripts/pib-db.mjs verify-schema');
+      process.exit(1);
+    }
+  }
+  return db;
 }
 
 /**
@@ -192,7 +213,7 @@ switch (command) {
   }
   case 'list-triggered': {
     const { flags } = parseFlags(args);
-    printResult(lib.listTriggered(getDb(), { includeDone: flags['include-done'] === true }));
+    printResult(lib.listTriggered(getDb(), { includeDone: flags['include-done'] === true, includeReleased: flags['include-released'] === true }));
     break;
   }
   case 'mark-trigger-checked': {
@@ -240,13 +261,21 @@ switch (command) {
   }
   case 'create-project': {
     const { flags, positional } = parseFlags(args);
-    printResult(lib.createProject(getDb(), { name: positional[0], ...flags }));
+    // --parent is the operator-facing spelling of parentFid (the AREA this
+    // project serves). Spread alone would only accept --parentFid.
+    const parentFid = typeof flags.parent === 'string' ? flags.parent : undefined;
+    printResult(lib.createProject(getDb(), { name: positional[0], ...flags, ...(parentFid !== undefined ? { parentFid } : {}) }));
     break;
   }
   case 'update-project': {
     const fid = args[0];
     const { flags } = parseFlags(args.slice(1));
-    printResult(lib.updateProject(getDb(), { fid, ...flags }));
+    // --parent <area-fid> names the area; --parent "" CLEARS it. The empty
+    // string must stay distinguishable from "not mentioned", because clearing
+    // the parent is exactly what demoting a nested project back to an area
+    // requires in the same call.
+    const parentFid = typeof flags.parent === 'string' ? flags.parent : undefined;
+    printResult(lib.updateProject(getDb(), { fid, ...flags, ...(parentFid !== undefined ? { parentFid: parentFid || null } : {}) }));
     break;
   }
   case 'complete-project': {
@@ -306,12 +335,16 @@ switch (command) {
     printFull(lib.listStartable(getDb(), {
       project: typeof flags.project === 'string' ? flags.project : undefined,
       limit: flags.limit !== undefined ? parseInt(flags.limit, 10) : undefined,
+      scope: typeof flags.scope === 'string' ? flags.scope : undefined,
     }));
     break;
   }
   case 'list-blocked': {
     const { flags } = parseFlags(args);
-    printFull(lib.listBlocked(getDb(), { project: typeof flags.project === 'string' ? flags.project : undefined }));
+    printFull(lib.listBlocked(getDb(), {
+      project: typeof flags.project === 'string' ? flags.project : undefined,
+      scope: typeof flags.scope === 'string' ? flags.scope : undefined,
+    }));
     break;
   }
   case 'propose-dependencies':
@@ -327,6 +360,16 @@ switch (command) {
   case 'triage-history':
     printResult(lib.triageHistory(getDb()));
     break;
+  case 'verify-schema': {
+    // The post-install self-check (act:b7d81b52). Deliberately NOT routed
+    // through getDb(): getDb() runs migrate(), and this command's whole job
+    // is to inspect a database the migration runner might refuse. Read-only
+    // by construction; exits 1 when the shape and the stamp disagree.
+    const res = lib.verifySchema(getReadOnlyDb());
+    console.log(JSON.stringify(res, null, 2));
+    if (!res.ok) process.exit(1);
+    break;
+  }
   default:
     console.log(`Usage: pib-db.mjs <command>
 
@@ -334,13 +377,18 @@ Commands:
   init                              Create/migrate the database
   query "SQL"                       Run a SQL query
   create-action "text" [--projectFid X] [--due X] [--notes X]  Create an action
-  list-actions [--status X] [--project X]  List actions (default: open)
+  list-actions [--status X] [--project X] [--scope direct|rolled-up]
+                                    List actions (default: open). --scope rolled-up
+                                    reads an AREA as including its projects' actions.
   update-action <fid> [--status X] [--text X] [--tags X] [--notes X] [--projectFid prj:X]
                                     (--projectFid reparents; the target project must exist)
   complete-action <fid>             Mark action complete (status=done)
   defer-with-trigger <fid> --trigger "<text>" [--cascade]
                                     Defer with a return condition
-  list-triggered [--include-done]   List items waiting on triggers
+  list-triggered [--include-done] [--include-released]
+                                    Items STILL waiting on a trigger (the last recorded
+                                    check did not release them). --include-released also
+                                    shows those whose trigger already fired
   mark-trigger-checked <fid> --result <value> [--notes "<text>"]
                                     Record trigger evaluation (triggered|still-waiting|needs-info|condition-obsolete)
   add-event --engagement prj:X --kind <kind> --author <a> --allowed-authors "a,b,c"
@@ -355,17 +403,18 @@ Commands:
                                     Remove that edge (a COMPLETED blocker needs no removal —
                                     blockedness is derived, so completing it already unblocks)
   list-dependencies <fid>           What this action waits on, and what waits on it
-  next-actions [--project X] [--limit N]
+  next-actions [--project X] [--limit N] [--scope direct|rolled-up]
                                     What can I start right now (no unfinished blocker,
                                     no unfired trigger) — the derived answer
-  list-blocked [--project X]        What is waiting, and on what
+  list-blocked [--project X] [--scope direct|rolled-up]
+                                    What is waiting, and on what
   propose-dependencies              Propose edges from dependencies written as prose.
                                     Read-only: prints proposals, writes nothing
-  create-project "name" [--kind area|project] [--notes X] [--tags X]
+  create-project "name" [--kind area|project] [--notes X] [--tags X] [--parent prj:X]
                                     Create a container. Default kind: area (never
                                     completes). kind=project is an outcome that
                                     completes — notes must state it
-  update-project <fid> [--kind area|project] [--tags X] [--name X] [--status X] [--notes X] [--due X]
+  update-project <fid> [--kind area|project] [--tags X] [--name X] [--status X] [--notes X] [--due X] [--parent prj:X | --parent ""]
                                     (--kind reclassifies; done refused for areas
                                     and for projects with open children)
   complete-project <fid> [--map-file map.json | --map '<json>']
@@ -376,10 +425,13 @@ Commands:
                                     open child — answer is parent-outcome |
                                     reparent:<prj-fid> | delete. All-or-nothing,
                                     ends at the same completion gate
-  list-projects                     List active containers (each row carries kind)
+  list-projects                     List active containers (kind, the area each sits
+                                    in, and both open counts: direct and rolled up)
   ingest-findings <run-dir>         Ingest audit findings from a run directory
   triage <finding-id> <status>      Triage a finding (approved/rejected/deferred/fixed)
   triage-history                    Output suppression list as JSON
+  verify-schema                     Check the schema shape against this library's
+                                    expectations (read-only; exits 1 on mismatch)
 
 Environment:
   PIB_DB_PATH   Path to SQLite file (default: ./pib.db)`);
