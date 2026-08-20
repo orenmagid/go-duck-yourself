@@ -218,6 +218,22 @@ export function projectCursorTimeline(thread) {
       why: (h && h.cursor && h.cursor.why) || '',
       open_questions: (h && h.cursor && h.cursor.open_questions) || '',
     })),
+    // recolor_log (appendThreadRecolor, watchtower-lib.mjs) is the human-
+    // CONFIRMED record that an earlier entry now means something different
+    // — literally a supersede-by-reinterpretation edge. Before this it was
+    // written but never read by any surface (act:1be47d42 field report,
+    // 2026-08-17: 231 confirmed reinterpretations across 67 threads, all
+    // write-only). Exposed here so lineage mode can render it next to the
+    // recorded/inferred edges it already distinguishes.
+    recolors: Array.isArray(t.recolor_log) ? t.recolor_log.map((r) => ({
+      ts: (r && r.ts) || null,
+      prior_session_id: (r && r.prior_session_id) ?? null,
+      prior_date: (r && r.prior_date) ?? null,
+      new_session_id: (r && r.new_session_id) ?? null,
+      verb: (r && r.verb) ?? null,
+      explanation: (r && r.explanation) ?? null,
+      confirmed_via: (r && r.confirmed_via) ?? null,
+    })) : [],
   };
 }
 

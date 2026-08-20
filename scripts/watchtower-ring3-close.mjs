@@ -55,6 +55,7 @@ import {
   log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
   updateThreadFile, currentCursor, resolveProjectIdentity, VERIFY_UI_PATHS,
+  VERIFY_UI_EXCLUDE_PATHS, resolveUiPaths,
   projectThreadCursorLines, authoredClaudeDirs, claudeChurnIsDisposable,
   buildLastSessionBlock, upsertLastSessionSection, recordSuppression, recordApiUsage,
   recentSlice,
@@ -69,7 +70,7 @@ import {
 import * as watchtowerLib from './watchtower-lib.mjs';
 // Direct queue import (precedent: ring2 imports expireItem this way) —
 // watchtower-lib deliberately not extended for this (lane separation).
-import { listItems, supersedeItem } from './watchtower-queue.mjs';
+import { listItems, supersedeItem, annotateItemEvidence } from './watchtower-queue.mjs';
 // Shared prospective-commitment seam (act:aa554774) — /close files them
 // forward as actions; Phase 2d uses the SAME definition to decline to
 // duplicate what the sweep already filed.
@@ -726,11 +727,16 @@ export function selectEarnedThreads(threads, {
 // - Anchors are validated: a proposal must cite an ACTUAL prior entry
 //   (session_id + date checked against the on-disk history snapshot); a
 //   hallucinated anchor drops the proposal, logged, never filed.
-// - DURABLE filing exclusion: relation_key = thread|prior_session|new_
-//   session|verb, checked across ALL queue statuses with NO time window —
-//   a dismissed judgment about a static corpus must never re-nag (not even
-//   after RESOLUTION_CORPUS_DAYS), and a reprocess replay produces the same
-//   key and files nothing.
+// - DURABLE filing exclusion: relation_key = thread|prior_session|verb,
+//   checked across ALL queue statuses with NO time window — a dismissed
+//   judgment about a static corpus must never re-nag (not even after
+//   RESOLUTION_CORPUS_DAYS), and a reprocess replay produces the same key
+//   and files nothing. The key deliberately does NOT include the noticing
+//   session: it identifies the ANCHOR being reinterpreted, not who noticed
+//   it, so a second session independently spotting the same anchor dedups
+//   against the first proposal instead of filing a new one (act:1be47d42
+//   field report, 2026-08-17 — including sessionId made this durable only
+//   WITHIN a session, silently).
 
 const PRIOR_HISTORY_CAP = 5;      // last K prior cursor entries shown per thread
 const RECOLOR_FIELD_SLICE = 300;  // per-field char bound in the prompt
@@ -801,22 +807,50 @@ export function validateRecolorProposals(proposals, priorBySlug) {
 }
 
 // File one significance-change proposal. Durable relation_key exclusion:
-// ALL statuses, no time window (see the block comment above). Returns the
-// filed (or existing) item id.
+// ALL statuses, no time window (see the block comment above).
+//
+// The key is the ANCHOR being reinterpreted plus how (thread + prior entry +
+// verb) — never the noticing session. Including sessionId here made the key
+// dedup only within a single session, so every later session that
+// independently noticed the same earlier entry filed a fresh proposal
+// against it; measured live at 12 of 120 pending items were true duplicates
+// once sessionId was removed from the comparison (act:1be47d42 field
+// report, 2026-08-17). Returns the filed (or existing) item id.
 export function fileSignificanceProposal({ project, threadSlug, anchor, verb, explanation, sessionId }) {
-  const key = `${threadSlug}|${anchor.session_id}|${sessionId}|${verb}`;
+  const key = `${threadSlug}|${anchor.session_id}|${verb}`;
   const existing = listItems({ category: 'significance-change' })
     .find((i) => i.evidence && i.evidence.relation_key === key);
-  if (existing) return existing.id;
+  if (existing) {
+    // A second noticing carries evidence too — the fact that an independent
+    // session reached the same conclusion strengthens the proposal, and
+    // silently discarding that (the pre-fix behavior) is why act:de0b090a's
+    // acceptance criteria asks for it explicitly. annotateItemEvidence is
+    // additive and PENDING-fenced, so this is a no-op once the item is
+    // dispositioned rather than reopening a decided question.
+    try {
+      const also = Array.isArray(existing.evidence?.also_noticed_by) ? existing.evidence.also_noticed_by : [];
+      if (sessionId && !also.includes(sessionId) && sessionId !== existing.evidence?.new_session_id) {
+        annotateItemEvidence(existing.id, { also_noticed_by: [...also, sessionId] });
+      }
+    } catch { /* additive corroboration only — never blocks returning the existing id */ }
+    return existing.id;
+  }
   const priorExcerpt = (anchor.cursor && typeof anchor.cursor.what === 'string')
     ? anchor.cursor.what.slice(0, 200) : '';
+  // The title must identify the ANCHOR, not just the thread + date — two
+  // different anchors on the same thread otherwise render as the same title
+  // and a reader dismisses distinct real proposals as one repeated item
+  // (the same field report measured this: 5 of 7 near-identical titles on
+  // one thread were genuinely distinct anchors). A short prior-session
+  // marker disambiguates without needing the full id.
+  const anchorMarker = typeof anchor.session_id === 'string' ? anchor.session_id.slice(0, 8) : 'unknown';
   return createItem({
     project: project.name,
     project_path: project.path,
     ...(project.unresolved ? { project_unresolved: true } : {}),
     category: 'significance-change',
     urgency: 'normal',
-    title: `Recolor: this session ${verb} a ${anchor.date} entry of "${threadSlug}"`,
+    title: `Recolor: this session ${verb} the ${anchor.date} entry (${anchorMarker}) of "${threadSlug}"`,
     summary: explanation,
     context_anchor: `session ${sessionId}`,
     evidence: {
@@ -4377,10 +4411,16 @@ export function resolveSessionProject({ cwd, transcriptPath }, config, deps = {}
 // ---------------------------------------------------------------------------
 
 // Pure: from the session's changed paths, is it UI-touching but scenario-silent?
-export function detectUncoveredUi(changedPaths, uiPaths = VERIFY_UI_PATHS) {
+// excludePaths VETOES a positive uiPaths match (a job/service/mailer path is
+// never UI-touching even if it happens to sit under an otherwise-UI prefix) —
+// the safety net the 2026-08-17 field report asked for (act:1be47d42).
+export function detectUncoveredUi(changedPaths, uiPaths = VERIFY_UI_PATHS, excludePaths = VERIFY_UI_EXCLUDE_PATHS) {
   const list = Array.isArray(changedPaths) ? changedPaths : [];
-  const touchedUi = list.filter(
-    (p) => typeof p === 'string' && uiPaths.some((u) => p.includes(u)));
+  const touchedUi = list.filter((p) => {
+    if (typeof p !== 'string') return false;
+    if (excludePaths.some((x) => p.includes(x))) return false;
+    return uiPaths.some((u) => p.includes(u));
+  });
   const touchedFeature = list.some(
     (p) => typeof p === 'string' && p.endsWith('.feature'));
   return { uncovered: touchedUi.length > 0 && !touchedFeature, uiPaths: touchedUi };
@@ -4558,7 +4598,8 @@ export function verifyCoverageLens(project, sessionStartIso, sessionId, deps = {
   const out = runGit(
     `git log --since=${JSON.stringify(sessionStartIso)} --name-only --pretty=format: --no-renames`) || '';
   const changed = [...new Set(out.split('\n').map((s) => s.trim()).filter(Boolean))];
-  const { uncovered, uiPaths } = detectUncoveredUi(changed);
+  const { paths: resolvedUiPaths, exclude: resolvedExcludePaths } = resolveUiPaths(deps.config);
+  const { uncovered, uiPaths } = detectUncoveredUi(changed, resolvedUiPaths, resolvedExcludePaths);
   if (!uncovered) return { filed: 0 };
 
   const reloadItem = deps.reloadItem || defaultReloadQueueItem;
@@ -4939,7 +4980,7 @@ async function main() {
   if (config.defaults?.verify_coverage !== false) {
     try {
       const r = verifyCoverageLens(
-        project, sessionStartIso, args.sessionId);
+        project, sessionStartIso, args.sessionId, { config });
       stats.itemsFiled += r.filed;
     } catch (e) {
       logError(`Phase 2q failed: ${e.message}`);

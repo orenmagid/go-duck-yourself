@@ -1123,7 +1123,38 @@ export const PROJECT_STATE_LAST_SESSION_HEADER = '## Last Session';
 // scan (Ring 2) and the verify-coverage lens (Ring 3) must agree on what counts
 // as "UI-touching" — single source of truth so the two rings never drift.
 // (act:1be47d42)
-export const VERIFY_UI_PATHS = ['webapp/frontend/', 'components/', 'pages/', 'app/'];
+//
+// Bare 'app/' is deliberately NOT in this list. It is a substring match
+// (`path.includes(u)`), so on any app/-rooted backend (Rails, Django-style
+// layouts) it matches every model, job, service, and mailer — measured at
+// roughly 2x the intended firing rate on a live Rails+React project, whose
+// three most-hit "UI" paths were a controller, a background job, and a
+// service class, none with a browser surface (act:1be47d42 field report,
+// 2026-08-17). A consumer needing a literal `app/`-rooted frontend
+// convention (e.g. a Next.js app router) should set `defaults.verify_ui_paths`
+// rather than relying on this default.
+export const VERIFY_UI_PATHS = ['webapp/frontend/', 'components/', 'pages/'];
+
+// Backend-only directory names that should never count as UI-touching even
+// under a broad or consumer-supplied uiPaths entry — the safety net the
+// same field report asked for independent of narrowing the positive list.
+export const VERIFY_UI_EXCLUDE_PATHS = ['/jobs/', '/services/', '/mailers/', '/workers/'];
+
+// Durable per-project override (act:1be47d42): before this, a project whose
+// default list ran too hot had no way to fix it without forking the ring
+// code, since `templates/` is installer-planted and any local edit is
+// overwritten on the next install. `defaults.verify_ui_paths` /
+// `defaults.verify_ui_paths_exclude` follow the same config.defaults.*
+// override convention as `long_lived_branches` (watchtower-ring1.mjs).
+export function resolveUiPaths(config) {
+  const paths = Array.isArray(config?.defaults?.verify_ui_paths)
+    ? config.defaults.verify_ui_paths
+    : VERIFY_UI_PATHS;
+  const exclude = Array.isArray(config?.defaults?.verify_ui_paths_exclude)
+    ? config.defaults.verify_ui_paths_exclude
+    : VERIFY_UI_EXCLUDE_PATHS;
+  return { paths, exclude };
+}
 const RING3_LAST_SESSION_ATTRIBUTION = /^_\d{4}-\d{2}-\d{2} \(.+\)_$/;
 
 // Line-anchored header search: the header must start a line and be the

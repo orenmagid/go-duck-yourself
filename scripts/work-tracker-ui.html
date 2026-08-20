@@ -160,6 +160,19 @@
     }
     .action-fid { font-family: monospace; }
 
+    /* Tag chips. The library projects `tags` on every action read now
+       (listActions, listStartable, listBlocked); this is what displays it, so
+       the column is not a field nothing renders. */
+    .action-tag {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 9px;
+      background: #2c2e33;
+      color: #909296;
+      font-size: 10px;
+      flex-shrink: 0;
+    }
+
     /* Badges */
     .badge {
       display: inline-block;
@@ -897,14 +910,22 @@
         // soft-deleted, and the operator needs to know that happened.
         notes.push(`${ready.danglingEdges} dependency edge(s) point at a deleted or missing action and no longer constrain anything.`);
       }
+      // The two safety-net summaries are computed over the WHOLE matching set,
+      // not the page (see listStartable's header). /api/ready sends no limit,
+      // so today they are the same set — but the note must not claim "here"
+      // for rows the page never showed if that ever changes. The library says
+      // which denominator it used; this reads it rather than assuming.
+      const d = ready.denominators;
+      const pageIsWhole = !d || d.matching === undefined || d.matching === d.page;
+      const across = pageIsWhole ? '' : ' (counted across the whole matching list, not just this page)';
       if (ready.releasedByTrigger && ready.releasedByTrigger.length) {
-        notes.push(`${ready.releasedByTrigger.length} item(s) are here because a trigger condition was evaluated and found to have fired.`);
+        notes.push(`${ready.releasedByTrigger.length} item(s) are startable because a trigger condition was evaluated and found to have fired${across}.`);
       }
       if (ready.staleBlockedStatus && ready.staleBlockedStatus.length) {
         // The derived answer CORRECTING a stored conclusion — the whole point
         // of the model. Without this line the row shows an unexplained red
         // "blocked" badge from the generic renderer and reads as a bug.
-        notes.push(`${ready.staleBlockedStatus.length} item(s) still say "blocked" but nothing actually blocks them any more — the status is stale, not the list.`);
+        notes.push(`${ready.staleBlockedStatus.length} item(s) still say "blocked" but nothing actually blocks them any more — the status is stale, not the list${across}.`);
       }
       const noteHtml = notes.length
         ? `<div class="orphan-header" style="opacity:.75;font-weight:normal;">${notes.map(esc).join('<br>')}</div>`
@@ -937,6 +958,7 @@
             <div class="action-sub">
               <span class="action-fid">${esc(a.fid)}</span>
               ${a.project ? `<span>${esc(a.project)}</span>` : ''}
+              ${renderTags(a.tags)}
               ${a.unmet_blockers ? `<span class="badge badge-blocked">waiting on ${a.unmet_blockers} action${a.unmet_blockers === 1 ? '' : 's'}: ${esc(a.blocker_fids || '')}</span>` : ''}
               ${a.waiting_on_trigger ? `<span class="badge badge-someday">trigger not fired${a.last_trigger_result ? ' (last check: ' + esc(a.last_trigger_result) + ')' : ' (never checked)'}</span>` : ''}
             </div>
@@ -954,6 +976,18 @@
       root.innerHTML = renderActionRows(flagged, true);
     }
 
+    // Comma-separated `tags` -> chips. One helper, used by every list that
+    // draws an action, so the Ready, Blocked, project and all-actions views
+    // label a row the same way.
+    function renderTags(tags) {
+      if (!tags) return '';
+      return String(tags).split(',')
+        .map(t => t.trim())
+        .filter(Boolean)
+        .map(t => `<span class="action-tag">${esc(t)}</span>`)
+        .join('');
+    }
+
     function renderActionRows(items, showProject = false) {
       return items.map(a => `
         <div class="action-row ${a.completed ? 'completed' : ''}" data-action-fid="${a.fid}">
@@ -965,6 +999,7 @@
               ${a.status !== 'open' && a.status !== 'done' ? `<span class="badge badge-${a.status}">${a.status}</span>` : ''}
               ${a.completed && a.resolution === 'parent-outcome' ? `<span class="badge-parent-outcome" title="Closed because its parent project's outcome became true — its own acceptance criteria were never individually verified.">closed by parent outcome</span>` : ''}
               ${showProject && a.project_name ? `<span>${esc(a.project_name)}</span>` : ''}
+              ${renderTags(a.tags)}
               ${a.due ? `<span>due ${esc(a.due)}</span>` : ''}
               ${a.notes ? `<span style="cursor:pointer;color:#7048e8;" data-notes="${a.fid}">notes</span>` : ''}
             </div>

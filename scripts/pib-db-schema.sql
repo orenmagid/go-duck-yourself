@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS actions (
   notes              TEXT NOT NULL DEFAULT '',
   deleted_at         TEXT,
   trigger_condition  TEXT,
-  resolution         TEXT CHECK(resolution IN ('verified','parent-outcome'))
+  resolution         TEXT CHECK(resolution IN ('verified','parent-outcome')),
+  needs              TEXT CHECK(needs IS NULL OR needs IN ('code-fix','qa-verify','decision','operator','event-gated'))
 );
 
 CREATE TABLE IF NOT EXISTS audit_runs (

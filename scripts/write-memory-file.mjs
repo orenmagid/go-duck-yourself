@@ -65,7 +65,7 @@ export function normalizeSlug(input) {
  * @param {string} [opts.cwd] — override cwd (for tests)
  * @param {string} [opts.settingsPath] — override settings.json path
  * @param {Date|string} [opts.date] — override "today" for testing
- * @returns {{filePath: string, slug: string, indexed: boolean, bytesWritten: number}}
+ * @returns {{filePath: string, slug: string, indexed: boolean, indexReason: string, indexPointer?: string, bytesWritten: number}}
  */
 export function writeMemoryFile(opts = {}) {
   if (!opts.content || typeof opts.content !== 'string') {
@@ -107,12 +107,14 @@ export function writeMemoryFile(opts = {}) {
   fs.renameSync(tmpPath, filePath);
 
   const description = opts.description || extractFirstLine(opts.content) || title;
-  const indexed = updateMemoryIndex({ memoryDir, fileName, title, description });
+  const indexResult = updateMemoryIndex({ memoryDir, fileName, title, description });
 
   return {
     filePath,
     slug: finalSlug,
-    indexed,
+    indexed: indexResult.indexed,
+    indexReason: indexResult.reason,
+    ...(indexResult.pointer ? { indexPointer: indexResult.pointer } : {}),
     bytesWritten: Buffer.byteLength(body, 'utf8'),
   };
 }
@@ -151,11 +153,12 @@ function extractFirstLine(text) {
 function regionPointerCovers(indexBody, fileName) {
   try {
     const vm = require('./validate-memory.mjs');
-    if (typeof vm.parseRegionPointers !== 'function' || typeof vm.globToRegex !== 'function') return false;
-    return vm.parseRegionPointers(indexBody)
-      .some((p) => vm.globToRegex(p.glob).test(fileName));
+    if (typeof vm.parseRegionPointers !== 'function' || typeof vm.globToRegex !== 'function') return null;
+    const hit = vm.parseRegionPointers(indexBody)
+      .find((p) => vm.globToRegex(p.glob).test(fileName));
+    return hit ? hit.glob : null;
   } catch {
-    return false; // fail open — write the line
+    return null; // fail open — write the line
   }
 }
 
@@ -165,7 +168,14 @@ function regionPointerCovers(indexBody, fileName) {
  * anywhere (Topic files OR Curated entries section), or when an existing
  * region pointer's glob already covers it.
  *
- * Returns true if MEMORY.md was modified, false if no change needed.
+ * `indexed: false` is not one outcome — it is two DIFFERENT and both
+ * deliberate ones (already referenced elsewhere; already reachable via a
+ * region pointer), and conflating them is what made 27 field reports
+ * disagree about whether it was a bug, a budget failure, or correct
+ * behavior. `reason` names which one, so a caller never has to guess or
+ * "repair" a non-problem by hand-adding a line that wasn't needed.
+ *
+ * @returns {{indexed: boolean, reason: 'added'|'already-indexed'|'covered-by-region-pointer', pointer?: string}}
  */
 function updateMemoryIndex({ memoryDir, fileName, title, description }) {
   const indexPath = path.join(memoryDir, MEMORY_INDEX_FILE);
@@ -173,13 +183,14 @@ function updateMemoryIndex({ memoryDir, fileName, title, description }) {
 
   // Idempotency: don't re-index a file already referenced anywhere.
   if (body.includes(`(${fileName})`) || body.includes(`**${fileName}**`)) {
-    return false;
+    return { indexed: false, reason: 'already-indexed' };
   }
 
   // Already reachable via a region pointer — an index line would add budget
   // without adding reachability. This is what makes bulk sign-off survivable.
-  if (regionPointerCovers(body, fileName)) {
-    return false;
+  const coveringPointer = regionPointerCovers(body, fileName);
+  if (coveringPointer) {
+    return { indexed: false, reason: 'covered-by-region-pointer', pointer: coveringPointer };
   }
 
   const entry = `- [${title}](${fileName}) — ${description}`;
@@ -194,7 +205,7 @@ function updateMemoryIndex({ memoryDir, fileName, title, description }) {
   const tmp = indexPath + '.tmp-' + process.pid;
   fs.writeFileSync(tmp, body, 'utf8');
   fs.renameSync(tmp, indexPath);
-  return true;
+  return { indexed: true, reason: 'added' };
 }
 
 // CLI mode: `node scripts/write-memory-file.mjs --slug foo "content..."`

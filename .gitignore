@@ -4,3 +4,7 @@ system-status.md
 .claude/
 .cursorindexingignore
 .specstory/
+pib.db
+pib.db-shm
+pib.db-wal
+pib.db.*

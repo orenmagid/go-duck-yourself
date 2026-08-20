@@ -84,6 +84,7 @@ const TOOLS = [
         kind: { type: 'string', enum: ['area', 'project'], description: "Reclassify the container. Promoting to 'project' gives it a completion semantic; its notes should state the outcome." },
         parentFid: { type: 'string', description: "The AREA this project serves. Only a kind='project' may name one and the target must be an area; pass null to clear it (which is also how you demote a parented project back to an area, in the same call)." },
         tags: { type: 'string', description: 'Comma-separated tags' },
+        needs: { type: 'string', enum: ['code-fix', 'qa-verify', 'decision', 'operator', 'event-gated'], description: 'What kind of work this item needs — a DIFF (code-fix), a RUN against a live stack (qa-verify), a CALL only the operator can make (decision), the operator\'s hands (operator), or an event in the world (event-gated). The QA-debt payer selects on it; pass null to clear.' },
         name: { type: 'string', description: 'New container name' },
         status: { type: 'string', description: "New status. 'done' is refused for areas, and for projects with open children.", enum: ['active', 'paused', 'done', 'dropped', 'someday'] },
         notes: { type: 'string', description: 'Updated notes' },
@@ -137,13 +138,14 @@ const TOOLS = [
   },
   {
     name: 'pib_list_actions',
-    description: 'List actions. Default: open actions. Filter by status or project.',
+    description: 'List actions. Default: open actions. Filter by status, by project, or by unfiled (the actions with no container at all).',
     inputSchema: {
       type: 'object',
       properties: {
         status: { type: 'string', enum: ['open', 'in-progress', 'blocked', 'deferred', 'done'], description: 'Filter by status' },
         project: { type: 'string', description: 'Filter by project fid' },
         scope: { type: 'string', enum: ['direct', 'rolled-up'], description: "How 'project' is read when it names an AREA: 'direct' (default) counts only actions filed straight to it; 'rolled-up' also counts the actions of projects filed under it — what \"everything under this area\" means." },
+        unfiled: { type: 'boolean', description: 'Return only the actions with NO container (project_fid IS NULL) — the ones no container view can reach. NOT the same as the /spring-clean orphan heuristic, which means "the container is dropped, done, or deleted". Cannot be combined with project: the two ask opposite questions and the pair is refused rather than silently returning nothing.' },
       },
     },
   },
@@ -336,7 +338,7 @@ const TOOLS = [
   },
   {
     name: 'pib_next_actions',
-    description: 'What can I start RIGHT NOW. Returns open actions with no unfinished blocker and no unfired trigger condition — the derived answer, recomputed on every call, never stored. Prefer this over pib_list_actions when choosing what to work on: pib_list_actions returns everything open including work that cannot be started yet.',
+    description: 'What can I start RIGHT NOW. Returns open actions with no unfinished blocker and no unfired trigger condition — the derived answer, recomputed on every call, never stored. Prefer this over pib_list_actions when choosing what to work on: pib_list_actions returns everything open including work that cannot be started yet. When "limit" caps the page, the safety-net summaries (staleBlockedStatus, releasedByTrigger) still describe the WHOLE matching set and can name actions the page does not show; the response\'s "denominators" field says which set each number used.',
     inputSchema: {
       type: 'object',
       properties: {

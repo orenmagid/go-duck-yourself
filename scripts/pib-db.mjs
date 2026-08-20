@@ -9,6 +9,7 @@
 //   node scripts/pib-db.mjs query "SELECT * FROM ..."   # Run a query
 //   node scripts/pib-db.mjs create-action "Do the thing" --projectFid prj:abc
 //   node scripts/pib-db.mjs list-actions [--status X]   # Open actions (or filtered)
+//   node scripts/pib-db.mjs list-actions --unfiled      # Actions with NO container
 //   node scripts/pib-db.mjs update-action act:abc --status in-progress
 //   node scripts/pib-db.mjs complete-action act:abc123
 //   node scripts/pib-db.mjs create-project "My Area"                          # area (default): never completes
@@ -139,6 +140,50 @@ function parseFlags(args) {
 }
 
 /**
+ * Read a BARE BOOLEAN switch straight from argv, before parseFlags sees it.
+ *
+ * parseFlags assigns the NEXT TOKEN as any flag's value (it has to — an empty
+ * `--tags ""` is a legitimate value), so `--unfiled --project prj:x` yields
+ * `{ unfiled: '--project' }` with `project` never set and the fid dropped into
+ * positionals. The conflict refusal could not fire, and the operator would
+ * silently get an unfiled list with their filter vanished.
+ *
+ * The house `=== 'true' || '1' || true` coercion does not rescue that call
+ * either: it maps every non-matching value to FALSE and never refuses, so the
+ * same command returns the FULL unfiltered list instead — the same silent
+ * wrong answer, arguably worse. Hence reading argv directly and REFUSING
+ * anything that is not a bare switch.
+ *
+ * Returns `{ value: true | undefined }` or `{ error: '<message>' }`.
+ */
+function readBareSwitch(argv, name) {
+  const token = `--${name}`;
+  const i = argv.indexOf(token);
+  if (i === -1) return { value: undefined };
+  const next = argv[i + 1];
+  // Nothing after it, or another flag after it: a bare switch either way.
+  if (next === undefined || next.startsWith('--')) return { value: true };
+  if (next === 'true' || next === '1') return { value: true };
+  return {
+    error: `${token} is a switch, not a value — write \`${token}\` on its own (\`${token} true\` and \`${token} 1\` are also accepted). Got \`${token} ${next}\`. To turn it OFF, leave ${token} out entirely; there is no false form, because a silently-false switch is how a filter disappears without anyone noticing.`,
+  };
+}
+
+/**
+ * argv with a bare switch (and its explicit true/1 value) removed, so
+ * parseFlags reads everything after it correctly instead of swallowing the
+ * next flag as this one's value.
+ */
+function withoutBareSwitch(argv, name) {
+  const token = `--${name}`;
+  const i = argv.indexOf(token);
+  if (i === -1) return argv;
+  const next = argv[i + 1];
+  const drop = next === 'true' || next === '1' ? 2 : 1;
+  return [...argv.slice(0, i), ...argv.slice(i + drop)];
+}
+
+/**
  * Print the WHOLE result object. Used by the dependency commands, whose
  * payloads carry meaning outside `rows` — `listDependencies` has no `rows` key
  * at all (its data is blockedBy/blocking), and listStartable/listBlocked carry
@@ -189,9 +234,40 @@ switch (command) {
     printResult(result);
     break;
   }
+  case 'get-action': {
+    // Read-only ON PURPOSE, twice over. getDb() runs lib.migrate() on every
+    // non-init command, so a "lookup" through it is a WRITE path; and a
+    // default-flags open of a missing file CREATES it (measured: a wrong
+    // PIB_DB_PATH materialised pib.db + -wal + -shm before failing). A lookup
+    // must be able to say "not there" without changing anything.
+    const { positional } = parseFlags(args);
+    const fid = positional[0];
+    if (!fid) {
+      console.error('get-action: a fid is required (e.g. get-action act:df8e90e7)');
+      process.exit(1);
+    }
+    const result = lib.getAction(getReadOnlyDb(), { fid });
+    if (result.error) {
+      // NOT the usage banner. A miss is a real answer, and printing help for it
+      // reads as "the command is wrong" rather than "the action is not there".
+      console.error(`get-action: ${result.error}`);
+      process.exit(1);
+    }
+    printResult(result);
+    break;
+  }
   case 'list-actions': {
-    const { flags } = parseFlags(args);
-    printResult(lib.listActions(getDb(), flags));
+    // --unfiled is read off argv FIRST and stripped, so `--unfiled --project
+    // prj:x` reaches the library as { unfiled: true, project: 'prj:x' } and
+    // gets the library's teaching refusal — instead of parseFlags eating the
+    // --project token and dropping the fid into positionals.
+    const unfiled = readBareSwitch(args, 'unfiled');
+    if (unfiled.error) {
+      console.error(`list-actions: ${unfiled.error}`);
+      process.exit(1);
+    }
+    const { flags } = parseFlags(withoutBareSwitch(args, 'unfiled'));
+    printResult(lib.listActions(getDb(), { ...flags, ...(unfiled.value ? { unfiled: true } : {}) }));
     break;
   }
   case 'update-action': {
@@ -377,9 +453,14 @@ Commands:
   init                              Create/migrate the database
   query "SQL"                       Run a SQL query
   create-action "text" [--projectFid X] [--due X] [--notes X]  Create an action
-  list-actions [--status X] [--project X] [--scope direct|rolled-up]
+  get-action <fid>                  Print one action (read-only; exit 1 if absent)
+  list-actions [--status X] [--project X] [--scope direct|rolled-up] [--unfiled]
                                     List actions (default: open). --scope rolled-up
                                     reads an AREA as including its projects' actions.
+                                    --unfiled lists the actions with NO container —
+                                    the ones no container view can reach. It is a bare
+                                    switch and cannot be combined with --project
+                                    (the pair is refused, never silently empty).
   update-action <fid> [--status X] [--text X] [--tags X] [--notes X] [--projectFid prj:X]
                                     (--projectFid reparents; the target project must exist)
   complete-action <fid>             Mark action complete (status=done)

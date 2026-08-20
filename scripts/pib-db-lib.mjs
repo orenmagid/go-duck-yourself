@@ -87,7 +87,23 @@ function today() {
 //       tier that matters most for this migration: the live Maginnis tracker
 //       sits at user_version 12 on THIS lineage, so v13 is the number that
 //       actually reaches it.
-export const SCHEMA_VERSION = 13;
+// What an open item NEEDS — the kind of work owed, a CLOSED vocabulary.
+//
+// NOT named `kind`: that word already means area-vs-project on containers, and
+// an action whose "kind" is "action" is a trap someone will hit. NOT the same
+// axis as the planned routing column either — `handed_to` records whose hands
+// an item is in; this records what sort of work it wants.
+//
+// Mirrors QA_GAP_KINDS in watchtower-queue.mjs, which is the WRITE-TIME gate on
+// a QA drain's stamped verdict. The two are deliberately separate homes for one
+// fact with different authority: the verdict records what the drain judged AT
+// FILING (provenance, immutable — stored verdicts are unreachable by design),
+// this column records what the item CURRENTLY needs (re-judgeable). Same split
+// the schema already runs between `actions.resolution` and the verdict token.
+// Convergence plan + its detector: `.claude/plans/qa-debt-payer-build.md`.
+export const ACTION_NEEDS = ['code-fix', 'qa-verify', 'decision', 'operator', 'event-gated'];
+
+export const SCHEMA_VERSION = 14;
 
 // ---------------------------------------------------------------------------
 // Schema lineage — the fail-closed guard (act:b7d81b52)
@@ -278,6 +294,11 @@ const MIGRATIONS = [
   // migrate()'s existing swallow already matches — no skipOn needed.
   { version: 13, sql: "ALTER TABLE projects ADD COLUMN parent_fid TEXT REFERENCES projects(fid) CHECK(parent_fid IS NULL OR kind = 'project')", expect: { column: 'projects.parent_fid' } },
   ...CONTAINER_PARENT_INDEXES.map(sql => ({ version: 13, sql })),
+  // v14: what an item NEEDS (act:df8e90e7 Phase 1). No backfill and no DEFAULT —
+  // an untyped row honestly predates the feature, exactly as v9's containers and
+  // v10's resolution left theirs. The CHECK closes the vocabulary at the schema
+  // layer; ACTION_NEEDS is the same list at the boundary.
+  { version: 14, sql: "ALTER TABLE actions ADD COLUMN needs TEXT CHECK(needs IS NULL OR needs IN ('code-fix','qa-verify','decision','operator','event-gated'))", expect: { column: 'actions.needs' } },
 ];
 
 // The post-condition of every migration the stamp claims was applied.
@@ -801,9 +822,38 @@ export function createAction(db, { text, projectFid, due, notes }) {
   return result;
 }
 
-export function listActions(db, { status, project, scope } = {}) {
+// `unfiled` — the actions with NO container at all (act:4e91a632, plan §1).
+//
+// Measured: 97 open actions on a 507-action backlog carried project_fid IS
+// NULL, every one created inside a single month, 7 of them in-progress. This
+// is NOT the orphan heuristic /spring-clean already has — that one means "the
+// container is dropped, done, or deleted", a different and much rarer
+// condition (4 of that kind against 97 of this one).
+//
+// Raw SELECT is not hook-blocked, so "just use SQL" was always available (the
+// guard matches INSERT / REPLACE INTO / UPDATE / DELETE FROM only, and
+// pib_query is a sanctioned read-only path). The honest reason this is a named
+// read: no DERIVED view returns them, so every caller re-derives the
+// predicate, and the skills that cannot reach pib_query at all could not ask
+// the question in any form.
+//
+// A SEPARATE BOOLEAN, deliberately not a third `scope` value. `scope` is a
+// closed enum meaning "how `project` is read when it names an AREA"; the
+// ABSENCE of a container is not a reading of one. A third value would make
+// validateScope's error text incoherent, would need its own conflict rule
+// against `project` anyway, and would drag in rollupSummary — which has
+// already emitted a false sentence on exactly the orphan case (act:f07b0f37,
+// where `project_fid === undefined` matched only orphans and counted them as
+// "filed directly").
+export function listActions(db, { status, project, scope, unfiled } = {}) {
   const scopeError = validateScope(scope);
   if (scopeError) return scopeError;
+  // A silent empty result would read as "there are none", which is a wrong
+  // answer to a question the caller did not mean to ask. Refuse, and name the
+  // two calls that ARE supported.
+  if (unfiled && project) {
+    return { error: { message: `unfiled and project ask opposite questions, so together they can only ever return nothing: 'unfiled' means the actions with NO container, 'project' means the actions of ONE container. Pass one of them — listActions({ unfiled: true }) for the actions with no home (CLI: list-actions --unfiled), or listActions({ project: '${project}' }) for that container's actions (add scope: 'rolled-up' to include the projects filed inside an area).` } };
+  }
   const conditions = ['a.deleted_at IS NULL'];
   const params = [];
 
@@ -812,6 +862,9 @@ export function listActions(db, { status, project, scope } = {}) {
     params.push(status);
   } else {
     conditions.push('a.completed = 0');
+  }
+  if (unfiled) {
+    conditions.push('a.project_fid IS NULL');
   }
   if (project) {
     const clause = containerScopeClause(project, scope);
@@ -833,7 +886,7 @@ export function listActions(db, { status, project, scope } = {}) {
   return { rows };
 }
 
-export function updateAction(db, { fid, status, text, tags, notes, due, flagged, projectFid, client_title, client_body, client_generated_at, client_generated_status }) {
+export function updateAction(db, { fid, status, text, tags, notes, due, flagged, projectFid, needs, client_title, client_body, client_generated_at, client_generated_status }) {
   // ONE closure path, enforced by construction (act:4e0de399). This function
   // used to treat status='done' as a full close — completed=1 + completed_at,
   // identical to completeAction — while the PreToolUse completion gate matches
@@ -869,6 +922,16 @@ export function updateAction(db, { fid, status, text, tags, notes, due, flagged,
   if (status !== undefined) { sets.push('status = ?'); params.push(status); }
   if (text !== undefined) { sets.push('text = ?'); params.push(text); }
   if (tags !== undefined) { sets.push('tags = ?'); params.push(tags); }
+  // A CLOSED vocabulary, validated at the boundary as well as by the CHECK:
+  // a schema violation escapes as a throw the tracker renders as a blank 500,
+  // so the refusal is returned before the SQL runs (the house pattern).
+  if (needs !== undefined) {
+    if (needs !== null && !ACTION_NEEDS.includes(needs)) {
+      return { error: `needs must be one of: ${ACTION_NEEDS.join(' | ')} (or null to clear) — got ${JSON.stringify(needs)}` };
+    }
+    sets.push('needs = ?');
+    params.push(needs);
+  }
   if (notes !== undefined) { sets.push('notes = ?'); params.push(notes); }
   if (due !== undefined) { sets.push('due = ?'); params.push(due); }
   if (flagged !== undefined) { sets.push('flagged = ?'); params.push(flagged === 'true' || flagged === '1' || flagged === true ? 1 : 0); }
@@ -2199,6 +2262,37 @@ export function listDanglingEdges(db) {
  * surfaces (MCP tool, CLI, work-tracker Ready view) on purpose: sort_order
  * died because nothing wrote it and no view paid off for it, and it turned
  * out to be READ by five shipped surfaces while written by none.
+ *
+ * WHICH SET EACH NUMBER IN THIS RESPONSE DESCRIBES (act:4e91a632, plan §3).
+ * Four derived summaries ride on this one object and they do NOT share a
+ * denominator. Each is named here, because "computed pre-cap" read literally
+ * would also mean "pre-FILTER", and that would make a per-project Ready view
+ * print portfolio-wide counts:
+ *
+ *   staleBlockedStatus  the whole MATCHING set — after `project`/`scope`
+ *   releasedByTrigger   narrow it, before `limit` cuts the page. Both are
+ *                       SAFETY NETS: one says a stored 'blocked' status is
+ *                       stale, the other says an item is here because a
+ *                       trigger fired. A safety net scoped to the current page
+ *                       is not a safety net — the twelfth stale row does not
+ *                       stop being stale because the page held ten.
+ *   rollup              the PAGE, unchanged, keeping its `capped` honesty
+ *                       flag. It is a sentence ABOUT the rows shown ("3 under
+ *                       this container — 1 filed directly…"); hand it the
+ *                       uncapped array and `capped` silently flips to false
+ *                       while the returned list is still capped — act:f07b0f37
+ *                       in mirror image.
+ *   danglingEdges       the WHOLE DATABASE. listDanglingEdges is an
+ *                       independent whole-table query and stays one: an edge
+ *                       pointing at a tombstone is not a property of this page
+ *                       or of this container.
+ *
+ * So: `project` and `scope` DO narrow every set summarised; `limit` narrows
+ * only the page. And because one object now carries three denominators — with
+ * fid arrays that can legitimately name rows absent from `rows` — the response
+ * SAYS which denominator each field used, in `denominators`. A number whose
+ * denominator the reader has to guess is the same defect as a stored
+ * conclusion nobody rechecks.
  */
 export function listStartable(db, { project, limit, scope } = {}) {
   const scopeError = validateScope(scope);
@@ -2212,8 +2306,23 @@ export function listStartable(db, { project, limit, scope } = {}) {
   }
   const cap = Number.isInteger(limit) && limit > 0 ? limit : null;
 
-  const rows = db.prepare(`
-    SELECT a.fid, a.text, a.status, a.due, a.flagged, a.project_fid, p.name AS project, p.kind AS project_kind,
+  // `a.tags` joins the projection so a thin renderer can group or label by a
+  // tag without issuing a second query per row or writing its own SQL — which
+  // is exactly how the re-implementation this program exists to close comes
+  // back through the door. listActions has always projected it; this read had
+  // not, so the two reads of the same table disagreed about what an action is.
+  // `needs` deliberately does NOT join it: it is a different axis (what sort
+  // of work an item wants), listActions does not project it either, and adding
+  // it here alone would make the startable read richer than the general list —
+  // a fresh asymmetry in the middle of a change whose whole point is closing
+  // one. It is one line whenever a consumer names it.
+  //
+  // The cap is applied HERE, in JS, rather than as a SQL LIMIT: the two
+  // safety-net summaries need the whole matching set, and slicing one ordered
+  // result guarantees the page and the summaries describe the same snapshot.
+  // A second, uncapped query would not.
+  const matching = db.prepare(`
+    SELECT a.fid, a.text, a.status, a.due, a.flagged, a.project_fid, p.name AS project, p.kind AS project_kind, a.tags,
       a.trigger_condition IS NOT NULL AS had_trigger,
       ${LAST_TRIGGER_RESULT_SQL} AS last_trigger_result,
       (a.status = 'blocked') AS status_says_blocked
@@ -2225,23 +2334,37 @@ export function listStartable(db, { project, limit, scope } = {}) {
       a.due,
       a.flagged DESC,
       a.created DESC
-    ${cap ? 'LIMIT ' + cap : ''}
   `).all(...params);
+  const rows = cap ? matching.slice(0, cap) : matching;
 
   const dangling = listDanglingEdges(db);
   const result = {
     rows,
     count: rows.length,
     // Startable despite a status that still says blocked — the stale
-    // conclusion the derived answer corrects.
-    staleBlockedStatus: rows.filter(r => r.status_says_blocked).map(r => r.fid),
-    // Startable because a trigger was evaluated and found to have fired.
-    releasedByTrigger: rows.filter(r => r.had_trigger).map(r => r.fid),
+    // conclusion the derived answer corrects. Over the whole matching set.
+    staleBlockedStatus: matching.filter(r => r.status_says_blocked).map(r => r.fid),
+    // Startable because a trigger was evaluated and found to have fired. Over
+    // the whole matching set.
+    releasedByTrigger: matching.filter(r => r.had_trigger).map(r => r.fid),
     danglingEdges: dangling.count,
+    // The disclosure. Without it, `staleBlockedStatus` naming a fid that is
+    // not in `rows` reads as a bug rather than as the point.
+    denominators: {
+      page: rows.length,
+      matching: matching.length,
+      pageScoped: ['rows', 'count', 'rollup'],
+      matchingScoped: ['staleBlockedStatus', 'releasedByTrigger'],
+      databaseScoped: ['danglingEdges'],
+      message: matching.length > rows.length
+        ? `rows, count and rollup describe the ${rows.length} action(s) on this page. staleBlockedStatus and releasedByTrigger describe all ${matching.length} startable action(s) matching this filter, so they can name actions this page does not show. danglingEdges counts the whole database.`
+        : `rows, count and rollup describe all ${matching.length} startable action(s) matching this filter — the page is the whole set — and so do staleBlockedStatus and releasedByTrigger. danglingEdges counts the whole database.`,
+    },
   };
   // `capped` only when the limit was actually reached — a result that happens
   // to be shorter than the cap is complete, and saying otherwise would be its
-  // own false note.
+  // own false note. rollupSummary is handed the CAPPED rows on purpose: it
+  // describes the page, and this flag is how it says so.
   const rollup = rollupSummary(rows, project, scope, { capped: Boolean(cap) && rows.length === cap });
   if (rollup) result.rollup = rollup;
   return result;
@@ -2271,8 +2394,13 @@ export function listBlocked(db, { project, scope } = {}) {
     params.push(...clause.params);
   }
 
+  // `a.tags` for the same reason listStartable projects it, and in the same
+  // change on purpose: shipping it on one of the two derived reads and not the
+  // other would leave the renderer to discover which list it is holding before
+  // it can label a row. Consumer: the work tracker's Blocked view, which draws
+  // the chips beside the fid exactly as the Ready view does.
   const rows = db.prepare(`
-    SELECT a.fid, a.text, a.status, a.project_fid, p.name AS project,
+    SELECT a.fid, a.text, a.status, a.project_fid, p.name AS project, a.tags,
       (SELECT COUNT(*) FROM action_dependencies d JOIN actions b ON b.fid = d.blocker_fid
        WHERE d.blocked_fid = a.fid AND b.deleted_at IS NULL AND b.completed = 0) AS unmet_blockers,
       (SELECT GROUP_CONCAT(d.blocker_fid) FROM action_dependencies d JOIN actions b ON b.fid = d.blocker_fid

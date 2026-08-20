@@ -170,6 +170,17 @@ function openPibDb(projectPath) {
 // test/watchtower-trigger-checks/.
 export const TRIGGER_RELEASING_RESULTS = ['triggered', 'condition-obsolete'];
 
+// WHICH mechanism reached the verdict, stamped into the row's notes.
+//
+// Two mechanisms can now produce a trigger verdict — the model, and the
+// mechanical fid resolution below — and the repo's precedent when that happens
+// is to record which one did it: `actions.resolution` separates 'verified' from
+// 'parent-outcome' so a propagated close can never claim verification. Same
+// shape. A reader auditing the history must be able to tell "a model read the
+// prose and judged" from "the referenced action was looked up and found closed",
+// because only the second is re-checkable without re-running the model.
+export const TRIGGER_CHECK_AUTHOR = 'ring2-fast';
+
 /**
  * Map the model's one-word verdict onto pib-db's trigger-result vocabulary
  * ('triggered' | 'still-waiting' | 'needs-info' | 'condition-obsolete').
@@ -197,7 +208,7 @@ export function classifyTriggerVerdict(firstLine) {
  * NEVER throws: a ring that dies on a locked database stops evaluating every
  * remaining project. A failure is logged and the rotation moves on.
  */
-export function recordTriggerCheck(item, result, reasoning) {
+export function recordTriggerCheck(item, result, reasoning, author = TRIGGER_CHECK_AUTHOR) {
   const Database = loadBetterSqlite3(item.projectPath);
   if (!Database) {
     logError(`recordTriggerCheck ${item.fid}: better-sqlite3 unavailable`);
@@ -214,7 +225,7 @@ export function recordTriggerCheck(item, result, reasoning) {
     db.prepare(`
       INSERT INTO trigger_checks (target_table, target_fid, checked_at, result, notes)
       VALUES ('actions', ?, ?, ?, ?)
-    `).run(item.fid, new Date().toISOString(), result, `ring2-fast: ${reasoning}`.slice(0, 2000));
+    `).run(item.fid, new Date().toISOString(), result, `${author}: ${reasoning}`.slice(0, 2000));
     return true;
   } catch (e) {
     logError(`recordTriggerCheck ${item.fid}: ${String(e.message).split('\n')[0]}`);
@@ -222,6 +233,180 @@ export function recordTriggerCheck(item, result, reasoning) {
   } finally {
     if (db) { try { db.close(); } catch { /* already closed */ } }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Mechanical fid resolution (act:487a6db5)
+// ---------------------------------------------------------------------------
+// A trigger condition that names another item by fid states a fact the database
+// already knows. Asking the model to judge it from PROSE is how `act:f3fe595b`
+// sat parked for ~12 days on "Postmark external-domain approval lands
+// (act:1a8306c4)" — an action closed on 2026-08-04 — while the evaluator kept
+// recording `still-waiting` as recently as 2026-08-15. `classifyTriggerVerdict`
+// routes an unrecognized answer to `needs-info` rather than `still-waiting`,
+// which is the right instinct, but it catches UNCERTAINTY, not confident error:
+// the wrong verdict was well-formed, classified cleanly, and false.
+//
+// ── The retired twin, and why this one ships anyway ──────────────────────────
+// This repo already RETIRED the structurally identical inference "a cited `act:`
+// fid is closed, therefore act on this item" as false by construction: 70 of 84
+// flags fired on actions that had closed BEFORE the citing draft was even filed,
+// because the fid was PROVENANCE, not a gate. Do not read that retirement and
+// this code as a contradiction someone forgot to reconcile — the discriminator
+// is the same one that would have saved the old detector (*was the referent
+// already done when the citation was written?*), and here it is answered by the
+// COLUMN, not by inference: `trigger_condition` has exactly one writer,
+// `pib_defer_with_trigger`, whose own gate (`dependency-prose-gate.sh`) refuses
+// a local `act:` fid outright. A fid that reaches this column is a deliberate
+// override or a legacy row — in both cases a stated GATE, never a provenance
+// note. And the harm directions are opposite: over-releasing a parked item
+// costs one glance at the inbox; mis-demoting a true draft destroyed work.
+//
+// Deliberately NOT extended to prose inference. A condition with no fid still
+// goes to the model, unchanged.
+
+// A condition carrying this marker never takes the mechanical path.
+// `dependency-prose-gate.sh` exempts a whole condition on it precisely because
+// fids are minted PER-DATABASE with no namespace — so such a fid belongs to a
+// DIFFERENT tracker and may coincidentally resolve locally to an unrelated row.
+// Short-circuiting on that would be `triggered` on evidence about the wrong
+// action, which is worse than the bug being fixed.
+const FID_IS_EXTERNAL_MARKER = 'FID-IS-EXTERNAL';
+
+// Unanchored scanner for fids EMBEDDED in prose, with the word boundaries the
+// prose gate records a rationale for (they keep "fact:12345678" and a 9-hex run
+// out). The anchored twin re-validates every match before it is used for
+// anything: the scanner is allowed to be loose, the acceptance is not. Case is
+// strict lowercase, matching pib-db-lib's `FID_PATTERN` exactly — a loosened
+// case class here would accept tokens the library would reject.
+const EMBEDDED_FID_RE = /\b(?:act|prj):[a-f0-9]{8}\b/g;
+const ANCHORED_FID_RE = /^(?:act|prj):[a-f0-9]{8}$/;
+
+// Bounded, and bounded by REFUSAL rather than truncation. Silently dropping the
+// 11th fid would let a condition whose 11th referent is still open short-circuit
+// to `triggered` on incomplete evidence — the cap must never be able to
+// manufacture an over-release.
+const MAX_CITED_FIDS = 10;
+
+/**
+ * Every well-formed `act:`/`prj:` fid cited in a trigger condition, in
+ * first-appearance order, deduplicated.
+ *
+ * Returns `null` when the condition cites more than `MAX_CITED_FIDS` distinct
+ * fids — the caller reads that as "do not decide mechanically".
+ *
+ * INJECTION PROPERTY (this replaces the deleted `extractCitedActFids`, whose
+ * contract carried it): the returned tokens are the ONLY values that ever reach
+ * a lookup, they are shape-validated against the anchored pattern, and the
+ * caller binds each one as a `?` parameter. Raw `trigger_condition` text never
+ * reaches SQL, and nothing here is interpolated.
+ */
+export function extractConditionFids(condition) {
+  const text = String(condition == null ? '' : condition);
+  const seen = [];
+  for (const match of text.matchAll(EMBEDDED_FID_RE)) {
+    const token = match[0];
+    if (!ANCHORED_FID_RE.test(token)) continue;
+    if (seen.includes(token)) continue;
+    seen.push(token);
+    if (seen.length > MAX_CITED_FIDS) return null;
+  }
+  return seen;
+}
+
+/**
+ * Point-lookup one cited fid. Never throws — an old consumer schema missing a
+ * column must degrade to "no facts available" and let the model proceed, not
+ * kill the sweep for every other project.
+ */
+function lookupFidState(db, fid) {
+  const isProject = fid.startsWith('prj:');
+  try {
+    const row = isProject
+      ? db.prepare('SELECT fid, status, deleted_at FROM projects WHERE fid = ?').get(fid)
+      : db.prepare('SELECT fid, status, completed, deleted_at FROM actions WHERE fid = ?').get(fid);
+    if (!row) return { fid, found: false, deleted: false, done: false };
+    const deleted = row.deleted_at !== null && row.deleted_at !== undefined && String(row.deleted_at) !== '';
+    const done = isProject ? row.status === 'done' : (row.completed === 1 || row.status === 'done');
+    return { fid, found: true, deleted, done };
+  } catch (e) {
+    logError(`trigger fid lookup ${fid}: ${String(e.message).split('\n')[0]}`);
+    return { fid, found: false, deleted: false, done: false };
+  }
+}
+
+// WHY THIS RESOLVES FACTS INSTEAD OF DECIDING VERDICTS (act:026ab39f).
+//
+// The first shape of this feature let the database DECIDE: if every cited fid
+// was done, it returned `triggered` and skipped the model. CP3 measured that
+// against the live corpus and it fired on 2 of 30, both wrong — because a cited
+// fid is NECESSARY, not SUFFICIENT. It is usually one clause of a larger gate:
+//
+//   "Fires when ANY of: (1)… (2)… (3)… Prerequisite: act:d20df77d ships first"
+//   "act:bcb7edd4 is done AND its output shows a non-trivial rate on real data"
+//   "Mailchimp PROD arming at go-live cutover — build the reverse webhook from
+//    the plan in these notes (planned in Wave 0.8 of act:142c82fd)"
+//
+// The second shape guarded that with a residual-predicate word list. It failed
+// in BOTH directions, measured: conjunction written with punctuation slipped
+// through ("act:X is done; the smoke suite passes"), the word most likely to
+// introduce a second gate ("then") could not be added because the originating
+// specimen depends on it, and across all seven configured projects it refused
+// 33 of 33 fid-citing conditions — deciding nothing at all.
+//
+// The distinction it was reaching for is SEMANTIC, not syntactic: does the
+// prose RESTATE the gate the fid names, or state a DIFFERENT one? No regex can
+// tell those apart. So this no longer tries.
+//
+// What the database IS authoritative about is the STATE OF A CITED ITEM — and
+// that is precisely what the model was getting wrong: act:f3fe595b sat parked
+// ~12 days because the evaluator reasoned about the PROSE of "Postmark
+// external-domain approval lands (act:1a8306c4)" without knowing act:1a8306c4
+// had closed. So the facts are resolved and handed to the model, which still
+// judges the whole condition. It cannot release on a clause it cannot see, and
+// it can no longer be wrong about a fact the database holds.
+//
+// Strictly better than the short-circuit on every axis that matters: it cannot
+// false-release, it applies to all 33 fid-citing conditions rather than 0, and
+// it deletes the heuristic entirely. The only thing given up is a saved API
+// call on a set measured at zero.
+
+/**
+ * Resolve every fid cited in a trigger condition into a factual block for the
+ * model's evidence, or `null` when there is nothing to say.
+ *
+ * INJECTION PROPERTY (inherited from the deleted `extractCitedActFids`): the
+ * tokens from `extractConditionFids` are the ONLY values that reach a lookup,
+ * they are shape-validated against the anchored pattern, and each is bound as a
+ * `?` parameter. Raw `trigger_condition` text never reaches SQL.
+ */
+export function describeCitedFids(condition, db) {
+  const text = String(condition == null ? '' : condition);
+  if (!db) return null;
+
+  // Still excluded: a fid minted in ANOTHER database may coincidentally resolve
+  // here to an unrelated row, so a "fact" about it would be a fabrication.
+  if (text.includes(FID_IS_EXTERNAL_MARKER)) return null;
+
+  const fids = extractConditionFids(text);
+  if (fids === null || fids.length === 0) return null;
+
+  const lines = fids.map((fid) => {
+    const s = lookupFidState(db, fid);
+    if (!s.found) return `- ${fid} — NOT FOUND in this project database`;
+    if (s.deleted) return `- ${fid} — DELETED (soft-deleted; not evidence the gate cleared)`;
+    return `- ${fid} — ${s.done ? 'DONE' : 'STILL OPEN'}`;
+  });
+
+  // The framing carries as much weight as the facts. Without "authoritative"
+  // the model weighs a database row against its own reading of the prose;
+  // without the closing caveat it may treat a resolved citation as the WHOLE
+  // gate, which is the exact error this replaced.
+  return [
+    'Referenced items, resolved from the project database (AUTHORITATIVE — trust these over any wording in the condition):',
+    ...lines,
+    'These are facts about the named items ONLY. They do not tell you whether the FULL condition is met — judge that from the condition text.',
+  ].join('\n');
 }
 
 // ===================================================================
@@ -232,7 +417,61 @@ export function recordTriggerCheck(item, result, reasoning) {
 // 1. Deferred trigger evaluation
 // ---------------------------------------------------------------------------
 
-async function evaluateDeferredTriggers(config) {
+/**
+ * File the operator-visible half of a fired trigger.
+ *
+ * Extracted so the model path and the mechanical path cannot disagree about it.
+ * The row and the filing are driven by two DIFFERENT values below — the row
+ * from `classifyTriggerVerdict`, the filing from a raw-string test on the
+ * model's answer — and a short-circuit that recorded the verdict while filing
+ * nothing would lose exactly the half the operator sees.
+ *
+ * The dep is named `file` (not `createItemFn`) deliberately: the detector-
+ * registry census binds a `category:` literal to its NEAREST preceding call
+ * opener and recognises only `createItem(` and `file(` as filing owners, so a
+ * wrapper under any other name silently drops the category out of the census.
+ */
+function fileTriggerFiredItem(item, reasoning, deps = {}) {
+  const file = deps.createItem || createItem;
+  const listPendingFn = deps.listPending || listPending;
+
+  // Check for existing pending item with same fid to avoid duplicates
+  const existing = listPendingFn({ category: 'deferred-trigger' }).some(qi =>
+    qi.evidence?.fid === item.fid
+  );
+  if (existing) return false;
+
+  file({
+    project: item.projectName,
+    project_path: item.projectPath,
+    filed_by: 'ring2-fast',
+    category: 'deferred-trigger',
+    urgency: 'normal',
+    title: `Trigger fired: ${item.text.slice(0, 60)}`,
+    summary: `Deferred action "${item.text}" trigger condition appears met: ${item.triggerCondition}`,
+    context_anchor: `pib-db action ${item.fid}`,
+    evidence: { fid: item.fid, trigger_condition: item.triggerCondition, reasoning },
+  });
+  return true;
+}
+
+// Exported with an injection seam matching this file's convention
+// (`surfacePersistentViolations`, `scanAuditPatterns`, `runDraftAnnotationSweep`
+// all take `(config, deps = {})`). Production callers omit `deps`; the seam is
+// what lets the suite assert "the model was never asked" by injecting a call
+// function that throws.
+export async function evaluateDeferredTriggers(config, deps = {}) {
+  const {
+    openDb = openPibDb,
+    askClaudeFn = askClaude,
+    recordCheckFn = recordTriggerCheck,
+    describeFidsFn = describeCitedFids,
+    gitLog = (cwd) => execSync(
+      'git log --oneline -5 --since="7 days ago"',
+      { cwd, encoding: 'utf8', timeout: 5000 }
+    ),
+  } = deps;
+
   const projects = config.projects || {};
   const projectNames = Object.keys(projects);
   const triggerItems = [];
@@ -242,7 +481,7 @@ async function evaluateDeferredTriggers(config) {
     const projectPath = projects[name].path || projects[name];
     if (!existsSync(projectPath)) continue;
 
-    const db = openPibDb(projectPath);
+    const db = openDb(projectPath);
     if (!db) continue;
 
     try {
@@ -318,18 +557,38 @@ async function evaluateDeferredTriggers(config) {
 
   for (const item of batch) {
     try {
+      // ── Resolve cited fids into FACTS for the model (act:026ab39f) ───────
+      // Not a verdict. The database is authoritative about the STATE of a
+      // cited item and about nothing else; deciding the whole condition from
+      // that state released 2 of 30 live conditions wrongly. See the rationale
+      // above `describeCitedFids`.
+      let citedFacts = null;
+      const rdb = openDb(item.projectPath);
+      if (rdb) {
+        try {
+          citedFacts = describeFidsFn(item.triggerCondition, rdb);
+        } catch (e) {
+          // Never let a resolution failure decide, or block, anything: the
+          // model still gets the condition, just without the facts.
+          logError(`Cited-fid resolve failed for ${item.fid}: ${String(e.message).split('\n')[0]}`);
+          citedFacts = null;
+        } finally {
+          try { rdb.close(); } catch { /* already closed */ }
+        }
+      }
+
       // Gather evidence: recent git activity, project state
       let evidence = `Project: ${item.projectName}\nAction: ${item.text}\nTrigger condition: ${item.triggerCondition}`;
       if (item.notes) {
         evidence += `\nNotes: ${item.notes}`;
       }
+      if (citedFacts) {
+        evidence += `\n\n${citedFacts}`;
+      }
 
       // Check for recent git activity as context
       try {
-        const recentCommits = execSync(
-          'git log --oneline -5 --since="7 days ago"',
-          { cwd: item.projectPath, encoding: 'utf8', timeout: 5000 }
-        ).trim();
+        const recentCommits = gitLog(item.projectPath).trim();
         if (recentCommits) {
           evidence += `\nRecent commits:\n${recentCommits}`;
         }
@@ -340,7 +599,7 @@ async function evaluateDeferredTriggers(config) {
       const systemPrompt = 'You evaluate whether deferred action trigger conditions have been met. Respond with exactly one of: TRIGGERED, STILL_WAITING, or CONDITION_OBSOLETE. Then on the next line, provide a brief reason (one sentence).';
       const userPrompt = `Evaluate this deferred action's trigger condition:\n\n${evidence}\n\nHas the trigger condition been met, is it still waiting, or has the condition become obsolete?`;
 
-      const result = await askClaude(systemPrompt, userPrompt, 256);
+      const result = await askClaudeFn(systemPrompt, userPrompt, 256);
       const firstLine = result.split('\n')[0].trim().toUpperCase();
       const reasoning = result.split('\n').slice(1).join('\n').trim() || 'No reasoning provided.';
 
@@ -355,29 +614,21 @@ async function evaluateDeferredTriggers(config) {
       // Written BEFORE the inbox filing below, deliberately: the durable fact
       // is the evaluation, and a failure to file a queue item must not also
       // lose the verdict.
-      recordTriggerCheck(item, classifyTriggerVerdict(firstLine), reasoning);
+      recordCheckFn(item, classifyTriggerVerdict(firstLine), reasoning);
 
+      // KNOWN, DELIBERATELY UNTOUCHED (act:487a6db5): the row above and the
+      // filing below are driven by two different values — the row by
+      // `classifyTriggerVerdict`, which tests OBSOLETE first, and the filing by
+      // this raw-string test, which tests TRIGGERED first. So
+      // "CONDITION_OBSOLETE (never triggered)" records `condition-obsolete` and
+      // still files a "Trigger fired" item. That is a real inconsistency and it
+      // is NOT fixed here: this lane's regression pin is that a condition with
+      // no fid behaves byte-identically to before, and reordering these would
+      // change it. The mechanical path above drives BOTH writes off one verdict,
+      // so it cannot inherit the split.
       if (firstLine.includes('TRIGGERED')) {
         log(`Fast: trigger FIRED for ${item.fid} — ${item.text}`);
-
-        // Check for existing pending item with same fid to avoid duplicates
-        const existing = listPending({ category: 'deferred-trigger' }).some(qi =>
-          qi.evidence?.fid === item.fid
-        );
-
-        if (!existing) {
-          createItem({
-            project: item.projectName,
-            project_path: item.projectPath,
-            filed_by: 'ring2-fast',
-            category: 'deferred-trigger',
-            urgency: 'normal',
-            title: `Trigger fired: ${item.text.slice(0, 60)}`,
-            summary: `Deferred action "${item.text}" trigger condition appears met: ${item.triggerCondition}`,
-            context_anchor: `pib-db action ${item.fid}`,
-            evidence: { fid: item.fid, trigger_condition: item.triggerCondition, reasoning },
-          });
-        }
+        fileTriggerFiredItem(item, reasoning, deps);
       } else if (firstLine.includes('OBSOLETE')) {
         log(`Fast: trigger OBSOLETE for ${item.fid} — marking checked`);
         // Just mark as checked — human decides what to do

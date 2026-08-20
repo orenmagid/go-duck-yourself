@@ -181,6 +181,36 @@ const QA_TERMINAL_VERDICTS = ['runtime-verified', 'blocked'];
 const QA_GAPS_TOKEN_RE = /^verified\s*[·•*\-–—]\s*(\d+)\s+gaps?\s+filed$/;
 const QA_COVERAGE_ASSESSMENTS = ['adequate', 'extended', 'gap-filed'];
 
+// The KIND of debt a filed gap represents — captured at the moment of filing,
+// because that is the one moment the answer is free. Piece 1 of
+// `.claude/plans/qa-debt-payer-build.md`. Exported so the debt ledger imports
+// this list rather than re-listing it (one machine definition, one place).
+//
+// DISTINCT from the engagement module's `needs:` set (`{decision, credential}`,
+// engagement-schema.md) — they overlap on 'decision' only and answer different
+// questions. This one answers "what kind of work is owed"; engagement's answers
+// "what does the client need to supply". Adding a value to one is NOT a reason
+// to add it to the other.
+//
+// 'event-gated' additionally REQUIRES `releasing_event` — it is the write-time
+// shape requirement that stops event-waiting work being filed as ordinary debt
+// and then skipped by the payer every drain.
+export const QA_GAP_KINDS = ['code-fix', 'qa-verify', 'decision', 'operator', 'event-gated'];
+
+// A fid is `act:` + exactly 8 lowercase hex. Anchored, and the ONLY spelling in
+// this file — the ledger imports it too. (pib-db-lib exports its own FID_PATTERN
+// covering `prj:` as well; this one is action-only by intent, since a gap is
+// always filed as an action.)
+export const QA_FILED_AS_FID_RE = /^act:[0-9a-f]{8}$/;
+
+// Deliberate non-filing, as closed vocabulary rather than free text. These were
+// already a live convention in coverage_posture.gap_filed / class_sweep.filed
+// (10 of 300 live entries: 'not-filed-by-design', 'fixed-in-drain', and seven
+// 'n/a — …' forms). Legal ONLY in those two arrays: `filed_gaps` feeds the
+// N-count in the verdict label, and a confessed gap has its own three-way
+// disposition, so a sentinel there would be a way to say nothing.
+const QA_FILED_AS_SENTINELS = ['not-filed-by-design', 'fixed-in-drain'];
+
 /**
  * Normalize a qa-handoff verdict token to canonical form.
  * Returns 'runtime-verified' | 'blocked' | 'verified · N gaps filed' (N >= 1),
@@ -317,6 +347,58 @@ function gateError(item, message) {
  * @param {object} qa_verdict
  * @returns {string} canonical verdict token
  */
+/**
+ * Validate one gap-bearing entry that carries a `filed_as`.
+ *
+ * `allowSentinel` is the ONLY axis that differs between the four arrays:
+ * coverage_posture.gap_filed and class_sweep.filed may say "deliberately not
+ * filed" in closed vocabulary; filed_gaps and confessed_gap.deferred may not.
+ *
+ * A fid-shaped entry always requires a `kind`. A sentinel never does — there is
+ * no work to type.
+ */
+function validateFiledEntry(item, entry, where, { allowSentinel }) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw gateError(item, `${where} must be an object carrying {gap, filed_as}`);
+  }
+  const filedAs = typeof entry.filed_as === 'string' ? entry.filed_as.trim() : '';
+  if (!filedAs) {
+    throw gateError(item, `${where}.filed_as is required`);
+  }
+  if (allowSentinel && QA_FILED_AS_SENTINELS.includes(filedAs)) return;
+  if (!QA_FILED_AS_FID_RE.test(filedAs)) {
+    const legal = allowSentinel
+      ? `an action fid (act: + 8 hex), or one of: ${QA_FILED_AS_SENTINELS.join(' | ')}`
+      : 'an action fid (act: + 8 hex)';
+    throw gateError(item, `${where}.filed_as must be ${legal} — got ${JSON.stringify(filedAs)}`);
+  }
+  if (!QA_GAP_KINDS.includes(entry.kind)) {
+    throw gateError(item, `${where}.kind is required and must be one of: ${QA_GAP_KINDS.join(' | ')} — it is what lets the debt payer pick this item up, and the drain is the only place the answer is free`);
+  }
+  if (entry.kind === 'event-gated') {
+    const ev = typeof entry.releasing_event === 'string' ? entry.releasing_event.trim() : '';
+    if (!ev) {
+      throw gateError(item, `${where}.kind is 'event-gated' so ${where}.releasing_event is required — name what must happen for this to become workable, or pick a kind that means attention rather than waiting`);
+    }
+  }
+}
+
+/**
+ * Validate every entry of a filed-gap array, when the array is present.
+ *
+ * Keyed on PRESENCE of the array, never on a sibling field. The previous
+ * gap_filed check ran only under `assessment === 'gap-filed'`, which left 115
+ * of 364 stored verdicts (32%) unvalidated and would have preserved the exact
+ * cheapest-legal-place gradient this guard exists to close, merely re-keyed.
+ */
+function validateFiledArray(item, arr, where, opts) {
+  if (arr === undefined || arr === null) return;
+  if (!Array.isArray(arr)) {
+    throw gateError(item, `${where} must be an array when present`);
+  }
+  arr.forEach((entry, i) => validateFiledEntry(item, entry, `${where}[${i}]`, opts));
+}
+
 export function validateQaVerdict(item, qa_verdict) {
   if (!qa_verdict || typeof qa_verdict !== 'object' || Array.isArray(qa_verdict)) {
     throw gateError(item, "missing structured qa_verdict object (pass qa_verdict to resolveItem; shape: see 'The recipient gate' in the qa-handoff skill)");
@@ -337,10 +419,22 @@ export function validateQaVerdict(item, qa_verdict) {
   }
   if (posture.assessment === 'gap-filed') {
     const filed = posture.gap_filed;
-    if (!Array.isArray(filed) || filed.length === 0
-        || filed.some((g) => !g || typeof g.filed_as !== 'string' || !g.filed_as.trim())) {
-      throw gateError(item, "coverage_posture.assessment is 'gap-filed' but coverage_posture.gap_filed is not a non-empty array of {gap, filed_as}");
+    if (!Array.isArray(filed) || filed.length === 0) {
+      throw gateError(item, "coverage_posture.assessment is 'gap-filed' but coverage_posture.gap_filed is not a non-empty array of {gap, filed_as, kind}");
     }
+  }
+  // Entry validation is keyed on the array being PRESENT, not on the assessment
+  // — see validateFiledArray. Sentinels are legal here.
+  validateFiledArray(item, posture.gap_filed, 'coverage_posture.gap_filed', { allowSentinel: true });
+
+  // class_sweep is validated NOWHERE today; this is a new branch from zero.
+  // Its documented shape is `{...} | 'not-triggered'`, so the string form stays
+  // legal and unvalidated — a bare truthiness check would throw on an honest
+  // verdict, and an Array.isArray-only check would silently pass a malformed
+  // `filed`. Validate iff it is an object carrying a `filed` key.
+  const sweep = qa_verdict.class_sweep;
+  if (sweep && typeof sweep === 'object' && !Array.isArray(sweep) && sweep.filed !== undefined) {
+    validateFiledArray(item, sweep.filed, 'class_sweep.filed', { allowSentinel: true });
   }
 
   const verdict = normalizeQaVerdictToken(qa_verdict.verdict);
@@ -363,6 +457,14 @@ export function validateQaVerdict(item, qa_verdict) {
     throw gateError(item, `verdict 'runtime-verified' with ${filedGaps.length} filed_gaps — use 'verified · ${filedGaps.length} gaps filed'`);
   }
 
+  // Entry validation runs on PRESENCE of the array, so a 'blocked' verdict's
+  // filed gaps are typed too (4 live cases; the old nesting inside `gapsMatch`
+  // skipped them). It runs AFTER the label/count checks ON PURPOSE: a
+  // mislabeled verdict must still report the MISLABEL, not a missing `kind`
+  // — the stricter guard must not mask the older, more important one.
+  // No sentinels here: this array feeds the N-count above.
+  validateFiledArray(item, qa_verdict.filed_gaps, 'filed_gaps', { allowSentinel: false });
+
   // Confessed gaps cannot be laundered: every could_not_verify entry must be
   // discharged as fixed-in-session or an explicitly typed deferral. Absent /
   // non-array / empty confession lists demand nothing (legacy compatibility).
@@ -375,6 +477,14 @@ export function validateQaVerdict(item, qa_verdict) {
     }
     const written = Array.isArray(cg.written_and_run) ? cg.written_and_run : [];
     const deferred = Array.isArray(cg.deferred) ? cg.deferred : [];
+    // THIRD disposition. A confessed gap whose surface was deleted, or whose
+    // check became meaningless, can say neither `written_and_run` (false — no
+    // test was run) nor `deferred` (which demands a real fid, filing an action
+    // nobody wants). Leaving it at two forks reproduces the exact
+    // no-legal-way-to-state-the-truth shape that killed an earlier draft of
+    // this guard: a drain forced to choose between two false statements picks
+    // one, and the record is wrong either way.
+    const obsolete = Array.isArray(cg.obsolete) ? cg.obsolete : [];
     written.forEach((w, i) => {
       if (typeof w !== 'string' || !w.trim()) {
         throw gateError(item, `confessed_gap.written_and_run[${i}] must be a non-empty string naming the test written and run`);
@@ -383,13 +493,20 @@ export function validateQaVerdict(item, qa_verdict) {
     deferred.forEach((d, i) => {
       if (!d || typeof d !== 'object'
           || typeof d.gap !== 'string' || !d.gap.trim()
-          || typeof d.filed_as !== 'string' || !d.filed_as.trim()
           || typeof d.justification !== 'string' || !d.justification.trim()) {
-        throw gateError(item, `confessed_gap.deferred[${i}] must be a typed deferral {gap, filed_as, justification} — a confessed gap is fixed in-session or explicitly deferred, never folded into 'filed'`);
+        throw gateError(item, `confessed_gap.deferred[${i}] must be a typed deferral {gap, filed_as, kind, justification} — a confessed gap is fixed in-session (written_and_run), deferred with a filed action, or declared obsolete; never folded into 'filed'`);
+      }
+      validateFiledEntry(item, d, `confessed_gap.deferred[${i}]`, { allowSentinel: false });
+    });
+    obsolete.forEach((o, i) => {
+      if (!o || typeof o !== 'object'
+          || typeof o.gap !== 'string' || !o.gap.trim()
+          || typeof o.justification !== 'string' || !o.justification.trim()) {
+        throw gateError(item, `confessed_gap.obsolete[${i}] must be {gap, justification} — say why the gap no longer needs closing (the surface went away, the check became meaningless); it files no action and asserts no test was run`);
       }
     });
-    if (written.length + deferred.length < confessed.length) {
-      throw gateError(item, `${confessed.length} confessed could_not_verify entr${confessed.length === 1 ? 'y' : 'ies'} but only ${written.length + deferred.length} dispositioned (written_and_run + typed deferrals) — every confessed gap must be discharged`);
+    if (written.length + deferred.length + obsolete.length < confessed.length) {
+      throw gateError(item, `${confessed.length} confessed could_not_verify entr${confessed.length === 1 ? 'y' : 'ies'} but only ${written.length + deferred.length + obsolete.length} dispositioned (written_and_run + typed deferrals + obsolete) — every confessed gap must be discharged`);
     }
   }
 
@@ -1537,7 +1654,7 @@ export function listPending({ project, category, urgency, maxAge, held } = {}) {
  *   `resolved_at || filed_at` >= since (bounds corpus growth for dedup callers)
  * @returns {Array} items sorted newest first by (resolved_at || filed_at)
  */
-export function listItems({ project, category, statuses, since } = {}) {
+export function listItems({ project, category, statuses, since, onUnreadable } = {}) {
   if (!existsSync(QUEUE_DIR)) return [];
   const sinceMs = since ? new Date(since).getTime() : null;
   const entries = readdirSync(QUEUE_DIR, { withFileTypes: true });
@@ -1554,8 +1671,13 @@ export function listItems({ project, category, statuses, since } = {}) {
         if (!(ts >= sinceMs)) continue;
       }
       items.push(item);
-    } catch {
-      // Skip unparseable items
+    } catch (err) {
+      // Skipping is right — one corrupt file must not take down a whole read —
+      // but doing it SILENTLY is an invisible drop channel: it shrinks any
+      // denominator computed from this call with no signal, which is the
+      // understate-by-construction failure a debt ledger cannot afford.
+      // Optional, so every existing caller is unchanged.
+      if (typeof onUnreadable === 'function') onUnreadable(entry.name, err);
     }
   }
   items.sort((a, b) =>
