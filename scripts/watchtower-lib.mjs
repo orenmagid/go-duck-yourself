@@ -1470,10 +1470,16 @@ export function resolveProjectIdentity(cwdOrPath, config, opts = {}) {
 // Every failure returns null — the caller files project_unresolved: true,
 // NEVER a cwd guess (misattribution is the disease this exists to cure).
 //
-// Decided exclusions (CP2): first-occurrence marker matching is correct for
-// the realistic collision direction (marker text INSIDE a worktree basename
-// lands after the true marker); a manufactured earlier marker (a parent
-// dotdir literally named '.mux-worktrees-…') is out of scope.
+// ANCHORED (act:5ebf992e): the marker must sit exactly where mux's own
+// worktree root puts it — immediately after the encoded home dir, i.e. the
+// slug of `~/.mux/worktrees/`. The first-occurrence `indexOf` it replaced
+// matched the marker ANYWHERE, so a scratch repo under `/private/tmp/...`
+// inside a worktree's scratchpad (slug
+// `-private-tmp-...--Users-x--mux-worktrees-cabinet-...`) decoded to the
+// project — and the same fallback attributes transcripts in the retrieval
+// instrument and sessions in Ring 3. A tmp path can never sit at the home
+// anchor, so the anchor subsumes a separate tmp guard. `opts.homeDir`
+// overrides the anchor's home (tests build fixtures under tmpdir).
 //
 // NAME AND SHAPE ARE A CROSS-LANE CONTRACT (act:29001b07 notes, "Cross-lane
 // interface note"): ring3-close feature-detects `resolveProjectFromTranscriptSlug`
@@ -1495,9 +1501,9 @@ function encodeSlugComponent(s) {
 
 export function resolveProjectFromTranscriptSlug(transcriptDirSlug, config, opts = {}) {
   if (!transcriptDirSlug || typeof transcriptDirSlug !== 'string') return null;
-  const idx = transcriptDirSlug.indexOf(MUX_WORKTREES_SLUG_MARKER);
-  if (idx === -1) return null; // not a mux-worktree slug — nothing to decode
-  const rest = transcriptDirSlug.slice(idx + MUX_WORKTREES_SLUG_MARKER.length);
+  const anchor = encodeSlugComponent(opts.homeDir || homedir()) + MUX_WORKTREES_SLUG_MARKER;
+  if (!transcriptDirSlug.startsWith(anchor)) return null; // not OUR worktree root — nothing to decode
+  const rest = transcriptDirSlug.slice(anchor.length);
   if (!rest) return null;
 
   const muxProjectsPath = opts.muxProjectsPath

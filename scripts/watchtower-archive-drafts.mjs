@@ -252,10 +252,11 @@ const bucketOf = (item) => `${item.status}_${hasDraft(item) ? 'with' : 'without'
 // The disposition map. `totals` counts every candidate by status and draft
 // (resolved AND unresolved); `totals.unresolved` is how many of those have no
 // registered project.
-export function buildPlan({ watchtowerDir = getWatchtowerDir(), muxProjectsPath, registryPath } = {}) {
+export function buildPlan({ watchtowerDir = getWatchtowerDir(), muxProjectsPath, registryPath, homeDir } = {}) {
   const config = loadConfig(watchtowerDir);
   const resolverOpts = {};
   if (muxProjectsPath) resolverOpts.muxProjectsPath = muxProjectsPath;
+  if (homeDir) resolverOpts.homeDir = homeDir; // the slug resolver's anchor (act:5ebf992e; tests)
   if (registryPath) resolverOpts.registryPath = registryPath;
 
   const scan = collect({ watchtowerDir });
@@ -358,7 +359,7 @@ function report({ watchtowerDir }) {
  * @param {object} opts
  * @param {'dry-run'|'apply'|'report'} opts.mode
  * @param {string} [opts.now] ISO timestamp (archived_at and the backup date)
- * @param {string} [opts.muxProjectsPath] / [opts.registryPath] resolver overrides (tests)
+ * @param {string} [opts.muxProjectsPath] / [opts.registryPath] / [opts.homeDir] resolver overrides (tests)
  * @param {Function} [opts.copyFile] backup copy (tests)
  * @param {Function} [opts.beforeEach] called with each item id before its re-read (tests)
  */
@@ -368,7 +369,7 @@ export function run(opts = {}) {
   if (mode === 'report') return report({ watchtowerDir });
   if (mode !== 'dry-run' && mode !== 'apply') throw new Error(`watchtower-archive-drafts: unknown mode ${JSON.stringify(mode)}`);
 
-  const plan = buildPlan({ watchtowerDir, muxProjectsPath: opts.muxProjectsPath, registryPath: opts.registryPath });
+  const plan = buildPlan({ watchtowerDir, muxProjectsPath: opts.muxProjectsPath, registryPath: opts.registryPath, homeDir: opts.homeDir });
   const { entries, ...map } = plan;
   if (mode === 'dry-run') return { mode, ...map };
 
@@ -456,7 +457,7 @@ function main(argv) {
     return 2;
   }
   const mode = modes[0].slice(2);
-  const res = run({ mode, muxProjectsPath: valueOf('--mux-projects'), registryPath: valueOf('--registry') });
+  const res = run({ mode, muxProjectsPath: valueOf('--mux-projects'), registryPath: valueOf('--registry'), homeDir: valueOf('--home-dir') });
   if (flags.has('--json')) {
     console.log(JSON.stringify(res, null, 2));
   } else if (mode === 'report') {

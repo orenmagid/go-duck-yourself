@@ -86,8 +86,10 @@ export const ARCHIVE_INDEX_NAME = 'MEMORY-archive.md';
 export const RECALL_SKILL_PATH = join('.claude', 'skills', 'recall', 'SKILL.md');
 export const MEMORY_RULE_MANIFEST_KEY = '.claude/rules/memory-capture.md';
 // The installer's manifest hash (lib/copy.js: sha256, first 16 hex) of the
-// CURRENT templates/rules/memory-capture.md. Pinned by the test.
-export const CURRENT_MEMORY_RULE_HASH = '6723122f4c360e69';
+// CURRENT templates/rules/memory-capture.md. Pinned by the test. Moved from
+// 6723122f4c360e69 when the recall cue's one-sentence A2 edit landed in the
+// rule (act:e46ce733, operator ruling 2026-10-09).
+export const CURRENT_MEMORY_RULE_HASH = '8905c4770df11c3e';
 const TEXT_TRUNCATE = 160;
 
 // region `<glob>` — optional indent / blockquote, optional list bullet, the

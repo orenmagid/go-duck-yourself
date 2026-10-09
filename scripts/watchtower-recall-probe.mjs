@@ -42,7 +42,9 @@
 // a find). The probe measures "findable when asked"; it cannot measure
 // "knew to ask" — that is the invocation count in the retrieval instrument.
 //
-// OUTPUT: <out>/recall-probe-<date>.json (default <WATCHTOWER_DIR>/state/;
+// OUTPUT: <out>/recall-probe-<date>-<project slug>.json (default
+// <WATCHTOWER_DIR>/state/; the slug is ALWAYS in the name — per-project runs
+// on the same day used to overwrite each other, act:d727fe16;
 // `--out <dir>` lets a smoke run write outside the runtime state) carrying
 // every run (source, path, fact, cue, key token, verdict, timings) and a
 // ready-to-append tuning-ledger entry; `--ledger <file>` appends it.
@@ -415,7 +417,7 @@ if (isMain) {
       name: t.name, projectPath: t.path, config, watchtowerDir, homeDir,
       n: args.n, seed: args.seed, timeoutMs: args.timeoutMs, dryRun: args.dryRun, useModel: args.useModel,
     });
-    const outPath = join(outDir, `recall-probe-${report.date}${targets.length > 1 ? `-${report.slug}` : ''}.json`);
+    const outPath = join(outDir, `recall-probe-${report.date}-${report.slug}.json`);
     atomicWrite(outPath, JSON.stringify(report, null, 2) + '\n');
     report.out_path = outPath;
     reports.push(report);

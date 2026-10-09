@@ -16,7 +16,31 @@
 //      time (indexed_files_read / unindexed_files_read);
 //   2. /recall invocations — lines the verb itself appends to
 //      state/recall-log.jsonl (never transcript parsing for this half);
-//   3. /recall hit rate — invocations with hits > 0 over invocations.
+//   3. /recall hit rate — invocations with hits > 0 over invocations. Read it
+//      as "reached the index": the match query is OR-joined tokens, so almost
+//      any question returns SOMETHING (act:d727fe16).
+//   4. /recall results read — invocations after which the SAME session Read
+//      one of the paths the search returned (joined by session_id, then by
+//      timestamp window). The honest quality proxy; `unjoined` counts the
+//      lines no session could be found for. Lines logged by `caller: cli`
+//      or `caller: probe` are excluded from every recall number (operator
+//      ruling 2026-10-04): only a session choosing to ask counts.
+//   5. the recall cue's numbers (recall-cue plan §B4, decision (e),
+//      act:c0a878ec) — read from the cue's OWN log, state/recall-cue-log.jsonl,
+//      over the same window, and reported SEPARATELY so a cue fire can never
+//      inflate "a session chose to ask": cue_prompts (every line except
+//      `unregistered`), cue_fires (`fired`), cue_injected (`injected: true`),
+//      cue_followed (an injected line whose top path the SAME session Read
+//      AFTER the line's ts — joined by the hook payload's session_id only,
+//      never the timestamp fallback), cue_shadow_read (a would-fire line NOT
+//      injected whose top path the session Read anyway after ts — the natural
+//      rate the cue's effect is read against, Decision Default 30), and
+//      cue_blind (busy + no-index + error).
+//
+// Metadata-only stub transcripts (a handful of cost-state / ai-title / mode
+// records, no user or assistant turn, no cwd) are NOT sessions: they are
+// counted as `stub_transcripts` and never inflate `sessions_scanned`
+// (act:fb56c003).
 //
 // THE PREDICATE, PINNED (RETRIEVAL_PREDICATE below is the same text the test
 // asserts): a session counts as a retrieval if it has at least one `tool_use`
@@ -75,6 +99,8 @@ import {
   resolveProjectIdentity, resolveProjectFromTranscriptSlug,
   log as _log, logError as _logError,
 } from './watchtower-lib.mjs';
+// The cue log's name is the cue's to define — one constant, referenced.
+import { CUE_LOG_FILE } from './watchtower-recall-cue.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -87,7 +113,7 @@ export const INDEX_FILES = ['MEMORY.md', 'MEMORY-archive.md'];
 export const OUTPUT_FILE = 'retrieval-instrument.json';
 export const CACHE_FILE = 'retrieval-instrument-cache.json';
 export const RECALL_LOG_FILE = 'recall-log.jsonl';
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 3; // 2: per-transcript `messages` count + state-root reads (act:fb56c003, act:d727fe16); 3: `read_last_ts` per read path (act:c0a878ec)
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // Verbatim from the plan's decision (e). The test asserts this text; the
@@ -231,13 +257,17 @@ export function walkTranscriptFiles(projectsRoot) {
 // cwd of its first cwd-bearing record, first/last timestamps, and every Read /
 // Write / Edit file_path that lands under ANY of the given memory dirs
 // (realpath-normalized). Only memory-dir paths are kept so the cache stays
-// small; the per-project split happens at count time.
+// small; the per-project split happens at count time. `read_last_ts` keeps
+// the LATEST record timestamp each path was Read at: "was it Read after
+// the cue line's ts" is exactly "is its latest Read later than ts", and one
+// stamp per path keeps the cache flat (act:c0a878ec).
 export function scanTranscript(path, memoryDirs) {
-  const verdict = { cwd: null, first_ts: null, last_ts: null, reads: [], writes: [] };
+  const verdict = { cwd: null, first_ts: null, last_ts: null, reads: [], writes: [], read_last_ts: {}, messages: 0 };
   let raw;
   try { raw = readFileSync(path, 'utf8'); } catch { return verdict; }
   const reads = new Set();
   const writes = new Set();
+  const readLast = {};
   const underAny = (p) => memoryDirs.some((d) => isUnder(p, d));
   for (const line of raw.split('\n')) {
     const t = line.trim();
@@ -251,6 +281,7 @@ export function scanTranscript(path, memoryDirs) {
       verdict.last_ts = ts;
     }
     const role = o.role || o.type;
+    if (role === 'user' || role === 'assistant') verdict.messages += 1;
     if (role !== 'assistant') continue;
     const content = o.message?.content ?? o.content;
     if (!Array.isArray(content)) continue;
@@ -261,12 +292,18 @@ export function scanTranscript(path, memoryDirs) {
       if (!READ_TOOLS.has(block.name) && !WRITE_TOOLS.has(block.name)) continue;
       const norm = normalizePath(fp);
       if (!underAny(norm)) continue;
-      if (READ_TOOLS.has(block.name)) reads.add(norm);
-      else writes.add(norm);
+      if (READ_TOOLS.has(block.name)) {
+        reads.add(norm);
+        const ms = typeof ts === 'string' ? Date.parse(ts) : NaN;
+        if (!Number.isNaN(ms) && !(readLast[norm] && Date.parse(readLast[norm]) >= ms)) readLast[norm] = ts;
+      } else {
+        writes.add(norm);
+      }
     }
   }
   verdict.reads = [...reads];
   verdict.writes = [...writes];
+  verdict.read_last_ts = readLast;
   return verdict;
 }
 
@@ -292,9 +329,21 @@ export function loadRecallLog(path, { nowMs, windowDays = WINDOW_DAYS } = {}) {
   return out;
 }
 
-function recallNumbers(lines, projectName) {
+// Lines the verb logs under these callers are not a session choosing to ask
+// (operator ruling 2026-10-04, act:d727fe16): `cli` is a human or a script at
+// a shell, `probe` is the launch probe's own harness.
+export const EXCLUDED_RECALL_CALLERS = new Set(['cli', 'probe']);
+// Timestamp-window join slack: a log line's ts sits inside the session's
+// [first, last] record timestamps, give or take a few minutes of clock skew.
+export const RECALL_JOIN_SLACK_MS = 5 * 60 * 1000;
+
+const rate3 = (num, den) => (den > 0 ? Math.round((num / den) * 1000) / 1000 : null);
+
+function recallNumbers(lines, projectName, projectSessions = []) {
   const slug = slugify(projectName);
-  const mine = lines.filter((l) => l.project === projectName || l.project === slug);
+  const all = lines.filter((l) => l.project === projectName || l.project === slug);
+  const isExcluded = (l) => EXCLUDED_RECALL_CALLERS.has(String(l.caller || ''));
+  const mine = all.filter((l) => !isExcluded(l));
   const invocations = mine.length;
   const hitLines = mine.filter((l) => Number(l.hits) > 0);
   const bySource = {};
@@ -303,11 +352,89 @@ function recallNumbers(lines, projectName) {
       bySource[src] = (bySource[src] || 0) + (Number(n) || 0);
     }
   }
+  // The quality proxy: did the session then READ a path the search returned?
+  // Join by session_id (the skill passes --session-id; the verb logs it),
+  // falling back to the ONE session whose record-timestamp window holds the
+  // line's ts; two candidates is ambiguous and counts as unjoined, never a
+  // guess.
+  const byId = new Map();
+  for (const s of projectSessions) if (s.session_id) byId.set(String(s.session_id), s);
+  let resultsRead = 0;
+  let unjoined = 0;
+  for (const l of mine) {
+    let s = l.session_id ? byId.get(String(l.session_id)) : null;
+    if (!s) {
+      const t = Date.parse(l.ts);
+      const cands = projectSessions.filter((c) => c.first_ms && c.last_ms
+        && t >= c.first_ms - RECALL_JOIN_SLACK_MS && t <= c.last_ms + RECALL_JOIN_SLACK_MS);
+      s = cands.length === 1 ? cands[0] : null;
+    }
+    if (!s) { unjoined += 1; continue; }
+    const tops = (Array.isArray(l.top_paths) ? l.top_paths : []).map((p) => normalizePath(String(p)));
+    if (tops.some((p) => s.reads.has(p))) resultsRead += 1;
+  }
   return {
     recall_invocations: invocations,
     recall_hits: hitLines.length,
-    recall_hit_rate: invocations > 0 ? Math.round((hitLines.length / invocations) * 1000) / 1000 : null,
+    recall_hit_rate: rate3(hitLines.length, invocations),
     recall_hits_by_source: bySource,
+    recall_results_read: resultsRead,
+    recall_results_read_rate: rate3(resultsRead, invocations),
+    recall_unjoined: unjoined,
+    recall_excluded_lines: all.length - mine.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The cue log (written by the cue hook — its OWN log, never recall-log.jsonl)
+// ---------------------------------------------------------------------------
+
+export const CUE_BLIND_OUTCOMES = new Set(['busy', 'no-index', 'error']);
+
+// cueNumbers — the recall cue's six numbers for one project (recall-cue plan
+// §B4). The follow join is by session_id ONLY: every cue line carries the
+// hook payload's real session_id, so a line that joins nothing is a pruned
+// or unscanned transcript, not an ambiguity a timestamp window should guess
+// at. "Read after the line's ts" reads the session's latest Read stamp for
+// the named path (scanTranscript's read_last_ts).
+function cueNumbers(lines, projectName, projectSessions = []) {
+  const slug = slugify(projectName);
+  const mine = lines.filter((l) => l.outcome !== 'unregistered'
+    && (l.project === projectName || l.project === slug));
+  const byId = new Map();
+  for (const s of projectSessions) if (s.session_id) byId.set(String(s.session_id), s);
+  const readAfter = (l) => {
+    const s = l.session_id ? byId.get(String(l.session_id)) : null;
+    if (!s) return false;
+    const top = Array.isArray(l.top3) && l.top3[0] ? normalizePath(String(l.top3[0].path || '')) : null;
+    if (!top) return false;
+    const lastRead = s.read_last_ms.get(top);
+    const lineMs = Date.parse(l.ts);
+    return typeof lastRead === 'number' && !Number.isNaN(lineMs) && lastRead > lineMs;
+  };
+  let fires = 0;
+  let injected = 0;
+  let followed = 0;
+  let shadowRead = 0;
+  let blind = 0;
+  for (const l of mine) {
+    if (CUE_BLIND_OUTCOMES.has(l.outcome)) blind += 1;
+    if (l.outcome !== 'fired') continue;
+    fires += 1;
+    if (l.injected === true) {
+      injected += 1;
+      if (readAfter(l)) followed += 1;
+    } else if (readAfter(l)) {
+      shadowRead += 1;
+    }
+  }
+  return {
+    cue_prompts: mine.length,
+    cue_fires: fires,
+    cue_shadow_read: shadowRead,
+    cue_injected: injected,
+    cue_followed: followed,
+    cue_blind: blind,
   };
 }
 
@@ -394,6 +521,7 @@ export function computeRetrievalInstrument({
   const resolveOpts = {
     muxProjectsPath: join(homeDir, '.config', 'mux', 'projects.json'),
     registryPath: join(homeDir, '.claude', 'cc-registry.json'),
+    homeDir, // the slug resolver's anchor (act:5ebf992e)
   };
   const windowMs = windowDays * DAY_MS;
   const inWindow = (ms) => typeof ms === 'number' && !Number.isNaN(ms) && nowMs - ms <= windowMs;
@@ -411,7 +539,16 @@ export function computeRetrievalInstrument({
     };
   }
   const memoryDirs = Object.values(projects).map((p) => p.memoryDir).filter(Boolean);
-  const memoryDirsKey = [...memoryDirs].sort().join('\n');
+  // Reads are kept for the memory dirs AND the watchtower state root — the
+  // recall corpus (session records, archived drafts, retained transcripts)
+  // lives there, and the results-read join needs those paths (act:d727fe16).
+  // Counting still keys on the project's memory dir alone.
+  const scanRoots = [...memoryDirs, join(watchtowerDir, 'state')];
+  const memoryDirsKey = [...scanRoots].sort().join('\n');
+  // A stub's transcript dir names its project when cwd is absent: the dir
+  // slug is the encoded main-checkout path (act:fb56c003).
+  const slugToProject = new Map(Object.values(projects)
+    .map((p) => [String(p.path).replace(/[^a-zA-Z0-9]/g, '-'), p.name]));
 
   // 2. The cache: reused only when it was built against the same memory-dir
   // set (a newly registered project must not inherit verdicts that never
@@ -442,7 +579,7 @@ export function computeRetrievalInstrument({
         reads: [], writes: [], out_of_window: true };
       continue;
     }
-    const v = scan(f.path, memoryDirs);
+    const v = scan(f.path, scanRoots);
     scanned += 1;
     entries[f.path] = { ...key, dir_slug: f.dir_slug, session_key: f.session_key,
       is_subagent: f.is_subagent, ...v };
@@ -458,29 +595,55 @@ export function computeRetrievalInstrument({
   const sessions = new Map();
   for (const [path, e] of Object.entries(entries)) {
     if (e.out_of_window) continue;
-    const s = sessions.get(e.session_key) || { key: e.session_key, dir_slug: e.dir_slug, cwd: null, last_ms: 0, reads: new Set(), writes: new Set(), parts: 0 };
+    const s = sessions.get(e.session_key) || {
+      key: e.session_key, session_id: basename(e.session_key), dir_slug: e.dir_slug, cwd: null,
+      first_ms: 0, last_ms: 0, messages: 0, reads: new Set(), writes: new Set(), read_last_ms: new Map(), parts: 0,
+    };
     if (!e.is_subagent && e.cwd) s.cwd = e.cwd;
     else if (!s.cwd && e.cwd) s.cwd = e.cwd;
     const lastMs = Date.parse(e.last_ts || '') || e.mtime || 0;
     if (lastMs > s.last_ms) s.last_ms = lastMs;
+    const firstMs = Date.parse(e.first_ts || '') || 0;
+    if (firstMs && (!s.first_ms || firstMs < s.first_ms)) s.first_ms = firstMs;
+    s.messages += e.messages || 0;
     for (const r of e.reads || []) s.reads.add(r);
     for (const w of e.writes || []) s.writes.add(w);
+    // The latest Read stamp per path across the session's parts (main +
+    // subagents) — the cue's "Read after ts" test (act:c0a878ec).
+    for (const [p, stamp] of Object.entries(e.read_last_ts || {})) {
+      const ms = Date.parse(stamp);
+      if (Number.isNaN(ms)) continue;
+      if (!(s.read_last_ms.get(p) >= ms)) s.read_last_ms.set(p, ms);
+    }
     s.parts += 1;
     sessions.set(e.session_key, s);
     void path;
   }
 
   let unattributed = 0;
+  let stubs = 0;
   const byProject = {};
+  const projectSessions = {};
   for (const name of Object.keys(projects)) {
-    byProject[name] = { scanned: 0, excluded: 0, reading: 0, indexed: new Set(), unindexed: new Set(), writes: new Set() };
+    byProject[name] = { scanned: 0, excluded: 0, reading: 0, stubs: 0, indexed: new Set(), unindexed: new Set(), writes: new Set() };
+    projectSessions[name] = [];
   }
   for (const s of sessions.values()) {
     if (!inWindow(s.last_ms)) continue;
     const id = attribute({ cwd: s.cwd, dir_slug: s.dir_slug }, config, resolveOpts, deps);
+    // A metadata-only stub is not a session: count it, attribute it by its
+    // transcript dir when nothing else can, and never let it into the
+    // denominator (act:fb56c003).
+    if ((s.messages || 0) === 0) {
+      stubs += 1;
+      const owner = (id && byProject[id.name]) ? id.name : slugToProject.get(s.dir_slug);
+      if (owner && byProject[owner]) byProject[owner].stubs += 1;
+      continue;
+    }
     if (!id || !byProject[id.name]) { unattributed += 1; continue; }
     const proj = projects[id.name];
     const acc = byProject[id.name];
+    projectSessions[id.name].push(s);
     acc.scanned += 1;
     if (!proj.memoryDir) continue;
     const memWrites = [...s.writes].filter((w) => isUnder(w, proj.memoryDir));
@@ -501,8 +664,10 @@ export function computeRetrievalInstrument({
     if (counted) acc.reading += 1;
   }
 
-  // 5. The recall log, once.
+  // 5. The recall log, once — and the cue log, once, as a SEPARATE list
+  // that never feeds the recall numbers (decision (e), act:c0a878ec).
   const recallLines = loadRecallLog(join(watchtowerDir, 'state', RECALL_LOG_FILE), { nowMs, windowDays });
+  const cueLines = loadRecallLog(join(watchtowerDir, 'state', CUE_LOG_FILE), { nowMs, windowDays });
 
   // 6. Assemble.
   const computedAt = new Date(nowMs).toISOString();
@@ -513,6 +678,7 @@ export function computeRetrievalInstrument({
     transcripts_scanned_this_run: scanned,
     transcripts_cached: Object.keys(entries).length,
     unattributed_sessions: unattributed,
+    stub_transcripts: stubs,
     projects: {},
   };
   for (const [name, proj] of Object.entries(projects)) {
@@ -529,7 +695,9 @@ export function computeRetrievalInstrument({
       sessions_reading: acc.reading,
       sessions_scanned: acc.scanned,
       sessions_excluded_for_writes: acc.excluded,
-      ...recallNumbers(recallLines, name),
+      stub_transcripts: acc.stubs,
+      ...recallNumbers(recallLines, name, projectSessions[name]),
+      ...cueNumbers(cueLines, name, projectSessions[name]),
       autodream_modified_files: dream.autodream_modified_files,
       autodream_stamped_files_total: dream.stamped_total,
       computed_at: computedAt,
@@ -582,7 +750,7 @@ export function runRetrievalInstrument(config, {
   atomicWrite(join(watchtowerDir, 'state', CACHE_FILE), JSON.stringify(cache) + '\n');
   atomicWrite(join(watchtowerDir, 'state', OUTPUT_FILE), JSON.stringify(report, null, 2) + '\n');
   const summary = Object.entries(report.projects)
-    .map(([n, p]) => `${n}: ${p.indexed_files_read}+${p.unindexed_files_read} files read by ${p.sessions_reading}/${p.sessions_scanned} sessions (${p.sessions_excluded_for_writes} excl), recall ${p.recall_invocations} inv`)
+    .map(([n, p]) => `${n}: ${p.indexed_files_read}+${p.unindexed_files_read} files read by ${p.sessions_reading}/${p.sessions_scanned} sessions (${p.sessions_excluded_for_writes} excl, ${p.stub_transcripts} stubs), recall ${p.recall_invocations} inv, ${p.recall_results_read} read a result, ${p.recall_unjoined} unjoined, cue ${p.cue_prompts} prompts/${p.cue_fires} would-fire/${p.cue_injected} injected/${p.cue_followed} followed/${p.cue_shadow_read} read unprompted/${p.cue_blind} blind`)
     .join('; ');
   log(`computed over ${report.transcripts_cached} transcript(s), ${report.transcripts_scanned_this_run} scanned, in ${Date.now() - started}ms — ${summary}`);
   return report;

@@ -45,6 +45,11 @@ import { analyze, resolveRoots } from './watchtower-sync.mjs';
 // one mechanical, incremental refresh per registered project per tick, so the
 // first /recall of a session is fast. Rebuild only when the index is missing.
 import { refreshIndex as refreshRecallIndex } from './watchtower-recall.mjs';
+// The recall cue's loud flip (recall-cue plan, decision (g), act:e46ce733):
+// a project switched AWAY from `on` is surfaced in summary attention for 7
+// days, read from each project's `recall_cue_history` in config.json, so the
+// next session on any desk sees the kill without reading a transcript.
+import { renderRecallCueFlipEntries } from './watchtower-recall-cue.mjs';
 
 const WATCHTOWER_DIR = getWatchtowerDir();
 
@@ -1936,20 +1941,42 @@ function readRetrievalInstrument() {
 // plan's decision (e) puts the numbers in front of the operator every day of
 // month one so thresholds are set against something seen, not furniture that
 // was tuned out. No rate is fabricated: zero invocations reads "no rate".
-// Pure (no I/O) for the hermetic suite.
+// A SECOND line carries the recall cue's numbers (recall-cue plan §B4,
+// act:c0a878ec) whenever the instrument saw cue prompts for the project —
+// kept beside, never inside, the retrieval line, because a cue fire is not
+// a recall invocation (decision (e)); at zero prompts, or for an instrument
+// file from before the cue, nothing. Pure (no I/O) for the hermetic suite.
 export function renderRetrievalInstrumentEntries(r) {
   if (!r || typeof r !== 'object') return [];
-  const rate = (r.recall_invocations > 0 && typeof r.recall_hit_rate === 'number')
-    ? `${Math.round(r.recall_hit_rate * 100)}% hit`
-    : 'no rate yet';
   const days = r.window_days || 30;
-  return [
-    `memory retrieval (${days}d): ${r.indexed_files_read || 0} indexed + ${r.unindexed_files_read || 0} unindexed file(s) read `
-    + `by ${r.sessions_reading || 0} of ${r.sessions_scanned || 0} session(s), ${r.sessions_excluded_for_writes || 0} excluded for writes; `
-    + `/recall ${r.recall_invocations || 0} invocation(s), ${rate}`
-    + (r.autodream_modified_files ? `; auto-dream touched ${r.autodream_modified_files} file(s)` : '')
-    + ` (retrieval-instrument.json)`,
-  ];
+  const lines = [];
+  // No sessions in the window and no recall lines is EMPTY, not measured —
+  // "0 of 0 session(s)" is the furniture the absent-project guard exists to
+  // avoid (act:fb56c003).
+  if ((r.sessions_scanned || 0) > 0 || (r.recall_invocations || 0) > 0) {
+    // The hit rate means the search returned something ("reached the index");
+    // the results-read rate — the session then Read a returned path — is the
+    // quality proxy and sits beside it (act:d727fe16).
+    const pct = (x) => `${Math.round(x * 100)}%`;
+    const rate = (r.recall_invocations > 0 && typeof r.recall_hit_rate === 'number')
+      ? `${pct(r.recall_hit_rate)} reached the index`
+        + (typeof r.recall_results_read_rate === 'number' ? `, ${pct(r.recall_results_read_rate)} read a result` : '')
+      : 'no rate yet';
+    lines.push(
+      `memory retrieval (${days}d): ${r.indexed_files_read || 0} indexed + ${r.unindexed_files_read || 0} unindexed file(s) read `
+      + `by ${r.sessions_reading || 0} of ${r.sessions_scanned || 0} session(s), ${r.sessions_excluded_for_writes || 0} excluded for writes; `
+      + `/recall ${r.recall_invocations || 0} invocation(s), ${rate}`
+      + (r.autodream_modified_files ? `; auto-dream touched ${r.autodream_modified_files} file(s)` : '')
+      + ` (retrieval-instrument.json)`,
+    );
+  }
+  if ((r.cue_prompts || 0) > 0) {
+    lines.push(
+      `recall cue (${days}d): ${r.cue_prompts} prompts, ${r.cue_fires || 0} would-fire, ${r.cue_shadow_read || 0} read unprompted, `
+      + `${r.cue_injected || 0} injected, ${r.cue_followed || 0} followed, ${r.cue_blind || 0} blind (recall-cue-log.jsonl)`,
+    );
+  }
+  return lines;
 }
 
 // refreshRecallIndexes — the Ring 1 tick step for the recall index
@@ -2158,8 +2185,9 @@ function assembleProjectState(ps) {
   // decide anything. Rendered on CHANGE only; see renderRosterEntries.
   for (const line of renderRosterEntries(ps.roster)) issues.push(line);
   // Retrieval instrument (Simplification Project 1, plan B1) — ambient state:
-  // the three memory-retrieval numbers for a measured project, nothing for an
-  // unmeasured one. /briefing 3b reads the same sidecar.
+  // the three memory-retrieval numbers for a measured project, plus the recall
+  // cue's line when it saw prompts (act:c0a878ec), nothing for an unmeasured
+  // one. /briefing 3b reads the same sidecar.
   for (const line of renderRetrievalInstrumentEntries(ps.retrieval)) issues.push(line);
   // Worktree scan coverage (act:6dcb8015) — ambient state, so it lives here
   // rather than in the queue. A partial warning reads as a complete answer, so
@@ -2396,6 +2424,13 @@ function main() {
         logError(`runtime script-drift check failed: ${e.message}`);
       }
     }
+    // A recall-cue kill is never silent (decision (g)): one attention line per
+    // flip away from `on` in the last 7 days. Pure read of config; fail-open.
+    try {
+      for (const line of renderRecallCueFlipEntries(projects)) extraAttention.push(line);
+    } catch (e) {
+      logError(`recall-cue flip render failed: ${e.message}`);
+    }
 
     // Write summary.md
     const summary = assembleSummary(projectStates, config, extraAttention);
@@ -2464,7 +2499,7 @@ function main() {
 // pure given an injectable `exec` — the inline call sites bind safeExec to a
 // cwd; the tests bind a runner against a temp git repo (act:6f36cbe2,
 // act:a136b362).
-export { renderWorktreeCoverage, resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, collectPibState, branchExclusionMatcher, DEFAULT_LONG_LIVED_BRANCHES, createBranchDivergedItem, autoResolveBranchDivergedItems, autoResolveWorktreeItems, autoReconcileCompletionReviews, autoReconcilePendingRelations, autoReconcileSignificanceItems, fileOrphanedWorktreeItem, isSafeRefName, firstWorkingQuery, rolledMemberSql };
+export { renderWorktreeCoverage, resolveMainRef, aheadCount, isMergedInto, hasUnmergedContent, countRealUncommitted, buildGitAttentionSidecar, checkRuntimeScriptDrift, runtimeDriftAttentionLine, assembleProjectState, assembleSummary, renderRecallCueFlipEntries, collectPibState, branchExclusionMatcher, DEFAULT_LONG_LIVED_BRANCHES, createBranchDivergedItem, autoResolveBranchDivergedItems, autoResolveWorktreeItems, autoReconcileCompletionReviews, autoReconcilePendingRelations, autoReconcileSignificanceItems, fileOrphanedWorktreeItem, isSafeRefName, firstWorkingQuery, rolledMemberSql };
 
 // Entry guard so tests (and other modules) can import this file's pure
 // helpers without executing main(). realpathSync matters: node

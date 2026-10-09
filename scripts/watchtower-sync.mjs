@@ -54,7 +54,11 @@ const CATEGORY_SUBDIRS = {
 const TIERS = ['template', 'tracked', 'runtime'];
 
 // Which files in each category are "ours" to keep in sync.
-const HOOK_FILES = ['watchtower-session-start.sh', 'watchtower-session-end.sh'];
+// Hard-coded on purpose (hooks/ holds many non-watchtower hooks); a new
+// watchtower hook MUST be added here AND to lib/watchtower-setup.js's
+// session-hooks list — the coherence test in __tests__/watchtower-sync.test.mjs
+// fails when the two lists disagree.
+const HOOK_FILES = ['watchtower-session-start.sh', 'watchtower-session-end.sh', 'watchtower-recall-cue.sh'];
 const CABINET_FILES = ['advisories-state-schema.md', 'watchtower-contracts.md'];
 
 function isManagedScript(name) {
