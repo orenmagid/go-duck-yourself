@@ -43,7 +43,7 @@
 
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync,
-  renameSync, statSync, realpathSync, rmSync,
+  renameSync, realpathSync, rmSync,
 } from 'fs';
 import { join, basename, dirname } from 'path';
 import { execSync, spawnSync } from 'child_process';
@@ -71,10 +71,6 @@ import * as watchtowerLib from './watchtower-lib.mjs';
 // Direct queue import (precedent: ring2 imports expireItem this way) —
 // watchtower-lib deliberately not extended for this (lane separation).
 import { listItems, supersedeItem, annotateItemEvidence } from './watchtower-queue.mjs';
-// Shared prospective-commitment seam (act:aa554774) — /close files them
-// forward as actions; Phase 2d uses the SAME definition to decline to
-// duplicate what the sweep already filed.
-import { detectCommitments, findFiledCommitment } from './watchtower-commitments.mjs';
 import { runRoutinePass } from './watchtower-routines.mjs';
 
 const require = createRequire(import.meta.url);
@@ -105,18 +101,6 @@ const SINGLE_CALL_TRANSCRIPT_BUDGET = 300_000;
 // evidence fell outside the window is never revisited unless the same work
 // happens to be discussed again. There was no second look to rely on. Phase 2c
 // now reads the shared slice like the rest of the group.
-// M2 Phase B (act:edd79e15 pt2): when a compressed transcript exceeds the
-// single-call budget, extraction chunks it into OVERLAPPING windows so a lesson
-// straddling a boundary survives in at least one chunk. Bounded fallback only —
-// preprocessTranscript already caps `compressed` at ~100K tokens (~400K chars),
-// so with a 300K budget this fires only for the largest untruncated sessions
-// (2 windows); MAX_EXTRACTION_CHUNKS is a defensive cap (a future preprocessing
-// change can't make this unbounded). When the cap WOULD truncate, the most-
-// recent windows are kept and a notice is logged (no silent truncation). Note:
-// a >100K-token raw session already lost its FRONT to preprocessing before
-// chunking — "full transcript" is false there; the cap is honest about it.
-const PHASE_B_OVERLAP = 30_000;        // chars carried between adjacent windows
-const MAX_EXTRACTION_CHUNKS = 4;
 
 // --- Dedup tuning constants (Phase 2c/2d noise reduction) ---
 // How far back resolved/dismissed inbox items count as a dedup corpus.
@@ -132,6 +116,17 @@ const RESOLUTION_CORPUS_DAYS = 90;
 // not count). The short-title floor in isDuplicate guarantees a candidate has
 // >=3 meaningful tokens before any pass can fire.
 const OVERLAP_THRESHOLD = 3;
+// Thread-cursor near-identity gate (act:2e902ded). Cursor lines are long
+// prose (~9-19 meaningful tokens), so a 3-token overlap against one is a
+// TOPIC match, not a restatement. The M5 canary measured the consequence:
+// 659 suppressions in 14 days, 317 of them thread-cursor, at 3-7x baseline,
+// and a read of the sample found distinct compliance constraints dropped as
+// "already known". A ratio gate — shared tokens over the SHORTER side — is
+// what the memory corpus already uses for the same shape: a short cursor
+// line restated still hits (4 of 4 = 1.0), a long line sharing three words
+// with a new lesson does not (3 of 8 = 0.375). The count threshold stays at
+// OVERLAP_THRESHOLD; this is an additional gate, not a replacement.
+const THREAD_CURSOR_MIN_RATIO = 0.5;
 // A completion-review item resolved/dismissed within this window suppresses
 // re-filing for the same fid (a dismissed "is this done?" must not re-file
 // next session while the action is still open).
@@ -581,6 +576,67 @@ export function appendRecordPointer(bullets, recordRef) {
   const b = typeof bullets === 'string' ? bullets.trim() : '';
   const pointer = `_Full record: ${recordRef}_`;
   return b ? `${b}\n\n${pointer}` : pointer;
+}
+
+// ---------------------------------------------------------------------------
+// Transcript retention (Simplification Project 1, plan B5, act:8b206268;
+// decision (f): keep everything, every project, no expiry, no deletion step
+// anywhere, no redaction pass).
+// ---------------------------------------------------------------------------
+// The platform prunes transcripts at cleanupPeriodDays (~30 days). Phase 2b
+// keeps a LOSSLESS TEXT-ONLY extraction beside the session record:
+//   state/projects/<slug>/transcripts/<date>-<sessionId>.txt
+// User and assistant text blocks in order, each tool_use as one line
+// `[tool: <name>]`, no tool-result bodies, no thinking, no tool inputs.
+// Measured at planning: ~2% of the raw JSONL. This is corpus source (iv) of
+// the recall index — the verbatim record the fidelity evidence says to keep
+// (plan §Rationale) — written with the same date/sessionId name as the
+// session record so the two sit side by side.
+
+export function extractTranscriptText(rawJsonl) {
+  const out = [];
+  let lastRole = null;
+  const pushRole = (role) => {
+    if (role !== lastRole) { out.push(`[${role}]`); lastRole = role; }
+  };
+  for (const line of String(rawJsonl || '').split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let entry;
+    try { entry = JSON.parse(t); } catch { continue; }
+    const role = entry.role || entry.type;
+    if (role !== 'user' && role !== 'assistant') continue;
+    const msg = entry.message || entry;
+    const content = msg.content;
+    if (typeof content === 'string') {
+      if (content.trim()) { pushRole(role); out.push(content.trim()); }
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (!block) continue;
+      if (typeof block === 'string') {
+        if (block.trim()) { pushRole(role); out.push(block.trim()); }
+      } else if (block.type === 'text' && typeof block.text === 'string') {
+        if (block.text.trim()) { pushRole(role); out.push(block.text.trim()); }
+      } else if (block.type === 'tool_use') {
+        pushRole(role);
+        out.push(`[tool: ${block.name || 'unknown'}]`);
+      }
+      // thinking, tool_result, images, attachments: dropped — no bodies.
+    }
+  }
+  return out.join('\n\n') + (out.length ? '\n' : '');
+}
+
+export function writeTranscriptRetention(transcriptPath, projectSlug, sessionId,
+  { date = new Date().toISOString().slice(0, 10), watchtowerDir = WATCHTOWER_DIR } = {}) {
+  const raw = readFileSync(transcriptPath, 'utf8');
+  const text = extractTranscriptText(raw);
+  const dir = join(watchtowerDir, 'state', 'projects', projectSlug, 'transcripts');
+  const outPath = join(dir, `${date}-${sessionId}.txt`);
+  atomicWrite(outPath, text);
+  return outPath;
 }
 
 async function sessionSummary(compressed, projectSlug, sessionId) {
@@ -1502,7 +1558,7 @@ function extractMemoryFileTitle(content, maxLines = 10) {
 //              the calibrated OVERLAP_THRESHOLD behavior unchanged. File-
 //              derived titles and descriptions additionally require NEAR
 //              IDENTITY (MEMORY_FILE_MIN_RATIO) — the same 0.8-of-the-shorter
-//              bar mergeChunkExtractions already uses for "the same lesson
+//              bar the retired M2 chunk merge used for "the same lesson
 //              worded twice", which is exactly the re-file case. Measured at
 //              that bar: 8 known re-files blocked, 2 of 141 presumed-novel
 //              drafts touched.
@@ -1521,8 +1577,9 @@ const MEMORY_FILE_MIN_RATIO = 0.8;
 const MEMORY_DESCRIPTION_MAX_CHARS = 400;
 
 // A memory file's one-line description: the frontmatter `description:` value
-// when present (the /cc-remember shape), else the first real prose line —
-// skipping headings, the `_Captured:` stamp, and frontmatter fences.
+// when present (the native auto-memory shape; the retired curated writer used
+// it too), else the first real prose line — skipping headings, the legacy
+// `_Captured:` stamp, and frontmatter fences.
 export function extractMemoryDescription(content) {
   if (typeof content !== 'string') return null;
   const lines = content.split('\n');
@@ -1627,8 +1684,8 @@ export function loadMemoryCorpus(projectPath) {
   return { titles, entries, promptLines };
 }
 
-// loadMemoryTitles — the bare-string title view, for the M1b prompt injection
-// (selectNearbyMemoryTitles) and the existing suites. The dedup pass consumes
+// loadMemoryTitles — the bare-string title view, kept for the existing
+// suites. The dedup pass consumes
 // `loadMemoryCorpus().entries` instead, which additionally carries per-file
 // descriptions and labels.
 function loadMemoryTitles(projectPath) {
@@ -1680,8 +1737,9 @@ function loadMemoryTitles(projectPath) {
 // `maintainability.md § Single Source of Truth`), so the corpus is precise;
 // it is simply almost inert. Dropping RULES_MIN_RATIO to the count-only bar
 // every other non-memory corpus uses raises it to eight and immediately buys
-// false positives (a UTC-day upsert lesson matching "The canonical write path:
-// /cc-remember"), so the near-identity gate stays.
+// false positives (measured: a UTC-day upsert lesson matching the heading
+// "The canonical write path: /cc-remember" of the since-retired memory rule),
+// so the near-identity gate stays.
 //
 // The reason is structural and worth stating rather than tuning around: an
 // item that RESTATES a rule restates its CONTENT in its own words, and shares
@@ -1917,7 +1975,12 @@ function isDuplicate(title, content, memoryTitles, pendingTitles,
 
   const passes = [
     ['memory', memoryTitles],
-    ['thread-cursor', threadCursorLines],
+    // Bare cursor strings get the ratio gate here, at the one consumer, so no
+    // builder or caller has to know about it; an entry that already carries
+    // its own gates passes through. `label` stays the line text so the
+    // canary's per-corpus ledger reads exactly as before (act:2e902ded).
+    ['thread-cursor', (threadCursorLines || []).map((e) =>
+      typeof e === 'string' ? { text: e, label: e, minRatio: THREAD_CURSOR_MIN_RATIO } : e)],
     ['pending', pendingTitles],
     ['resolved', resolvedTitles],
     ['dismissed', dismissedTitles],
@@ -1937,183 +2000,6 @@ function isDuplicate(title, content, memoryTitles, pendingTitles,
     }
   }
   return false;
-}
-
-// selectNearbyMemoryTitles — the M1b prefilter (act:16904ffc). Pick the
-// existing memory titles most relevant to THIS session so the extraction call
-// can be shown "here is what's already saved" and self-filter dupes IN ONE
-// pass (zero new model calls; embeddings stay rejected). Score each title by
-// how many of its meaningful tokens appear in the (recent) transcript; take the
-// top `limit`. Reuses the M1a tokenizer — this is context selection, not a
-// similarity oracle (the extraction model itself is the semantic engine).
-function selectNearbyMemoryTitles(memoryTitles, transcript, limit = 15) {
-  if (!Array.isArray(memoryTitles) || memoryTitles.length === 0) return [];
-  const tx = new Set(meaningfulTokens(transcript));
-  if (tx.size === 0) return [];
-  const scored = [];
-  for (const title of memoryTitles) {
-    const score = [...new Set(meaningfulTokens(title))].filter(t => tx.has(t)).length;
-    if (score > 0) scored.push({ title, score });
-  }
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, limit).map(s => s.title);
-}
-
-// Separate cap for the pending-inbox shortlist (act:5182beda, N3/Reach 1 of
-// grp:retro-remeaning) — NOT a shared budget with selectNearbyMemoryTitles'
-// default 15. A large pending pile would otherwise evict memory titles from
-// a shared slice and degrade the M1b novelty gate; the two corpora are
-// separately capped so growth in one never starves the other.
-const PENDING_RELATION_CAP = 10;
-
-// The legal relation verbs a pending-relation proposal can carry. 'none' is
-// the model's explicit no-relation answer, never a filed value.
-const RELATION_VALUES = ['pairs_with', 'answers', 'contradicts'];
-
-// selectNearbyPendingItems — the Reach-1 sibling of selectNearbyMemoryTitles:
-// same relevance-scoring recipe, over a DIFFERENT corpus (pending inbox
-// items, not saved memory) with its OWN cap. Returns {id, title} pairs, not
-// bare strings — a relation proposal must resolve back to an actual pending
-// item id, which a title string alone cannot do.
-function selectNearbyPendingItems(pendingItems, transcript, limit = PENDING_RELATION_CAP) {
-  if (!Array.isArray(pendingItems) || pendingItems.length === 0) return [];
-  const tx = new Set(meaningfulTokens(transcript));
-  if (tx.size === 0) return [];
-  const scored = [];
-  for (const p of pendingItems) {
-    if (!p || typeof p.id !== 'string' || typeof p.title !== 'string' || !p.title.trim()) continue;
-    const score = [...new Set(meaningfulTokens(p.title))].filter(t => tx.has(t)).length;
-    if (score > 0) scored.push({ id: p.id, title: p.title, score });
-  }
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, limit).map(({ id, title }) => ({ id, title }));
-}
-
-// relationKey — the dedup key for a pending-relation proposal: sorted ids +
-// the relation verb, so the SAME relation between the SAME pair of items
-// never files twice regardless of which side is extracted first.
-function relationKey(idA, idB, relation) {
-  return `${[idA, idB].sort().join('|')}:${relation}`;
-}
-
-// fileRelationProposal — files (or returns the existing) 'pending-relation'
-// item for a proposed relation between a freshly-filed item and a still-
-// pending one. Dedup is a listItems scan by evidence.relation_key — global,
-// not project-scoped, ACROSS ALL STATUSES WITH NO TIME WINDOW (act:bcb7edd4
-// tightening, backported from Reach 2's durable-exclusion constraint): a
-// relation the operator DISMISSED must never refile when a later session's
-// extraction re-proposes it — the original pending-only check left exactly
-// that hole. Never throws on a dup; the caller's try/catch covers genuine
-// I/O failure only.
-function fileRelationProposal({ project, fromId, fromTitle, toId, toTitle, relation, sessionId, threadIds }) {
-  const key = relationKey(fromId, toId, relation);
-  const existing = listItems({ category: 'pending-relation' })
-    .find((i) => i.evidence && i.evidence.relation_key === key);
-  if (existing) return existing.id;
-  return createItem({
-    project: project.name,
-    project_path: project.path,
-    ...(project.unresolved ? { project_unresolved: true } : {}),
-    category: 'pending-relation',
-    urgency: 'normal',
-    title: `Relation: "${fromTitle}" ${relation} "${toTitle}"`,
-    summary: `New understanding reaching back to a still-pending item: this item ${relation} `
-      + `"${toTitle}", which is still awaiting triage in the inbox.`,
-    context_anchor: `session ${sessionId}`,
-    evidence: {
-      relation,
-      relation_key: key,
-      from_id: fromId,
-      to_id: toId,
-      from_title: fromTitle,
-      to_title: toTitle,
-      session_id: sessionId,
-    },
-    options: [
-      { key: 'confirm', label: 'Confirm — the relation holds' },
-      { key: 'dismiss', label: 'Not related' },
-    ],
-    filed_by: 'ring3-close',
-    thread_ids: threadIds,
-  });
-}
-
-// modelRescues — the M1b rescue gate (DEFAULT-KEEP). The extraction model is
-// shown the nearby saved titles and asked, per proposed item, which saved title
-// covers it (`covered_by`) — "none" if genuinely novel. When isDuplicate
-// LEXICALLY flags an item the model AFFIRMATIVELY judged novel, the model's
-// semantic read RESCUES it (file anyway). The model may ONLY rescue, NEVER
-// suppress: a missing/garbage/empty covered_by is NOT an affirmative novelty
-// claim, so isDuplicate's deterministic decision stands. (The historian
-// landmine, act:3975348f — a silent fuzzy SUPPRESSOR was deleted once; this
-// gate can only ADD recall, never remove it.)
-function modelRescues(item) {
-  const cb = item && item.covered_by;
-  if (typeof cb !== 'string') return false;
-  return /^\s*(none|null|n\/?a|nothing|no\b)/i.test(cb.trim());
-}
-
-// chunkWithOverlap — the M2 Phase B windowing (act:edd79e15 pt2). Split `text`
-// into windows of `size` chars that OVERLAP by `overlap` chars (so a lesson
-// straddling a boundary appears whole in at least one window). Covers the full
-// text front-to-back; if more than `maxChunks` windows are needed, the
-// MOST-RECENT `maxChunks` are kept (recency — a missed late lesson is the bug
-// this program fights) and `dropped` counts the front windows skipped. Returns
-// { windows, capped, dropped }.
-function chunkWithOverlap(text, size, overlap, maxChunks) {
-  if (typeof text !== 'string' || text.length === 0) return { windows: [], capped: false, dropped: 0 };
-  if (text.length <= size) return { windows: [text], capped: false, dropped: 0 };
-  const step = Math.max(1, size - overlap);
-  const windows = [];
-  for (let start = 0; start < text.length; start += step) {
-    windows.push(text.slice(start, start + size));
-    if (start + size >= text.length) break;
-  }
-  if (windows.length <= maxChunks) return { windows, capped: false, dropped: 0 };
-  const dropped = windows.length - maxChunks;
-  return { windows: windows.slice(dropped), capped: true, dropped };
-}
-
-// mergeChunkExtractions — flatten per-chunk extraction arrays and dedup the
-// merge with a STRICTER-than-corpus matcher (act:edd79e15 pt2). Intra-session
-// titles are fresh and specific, so the overlap windows produce the SAME lesson
-// twice — merge those (normalized-equal title, or >=80% of the shorter title's
-// meaningful tokens shared and >=3) but NEVER merge two genuinely distinct
-// lessons that merely share a few words (don't reuse the loose 3-token corpus
-// bar). covered_by and all fields ride through from the first copy kept.
-function mergeChunkExtractions(perChunk) {
-  const norm = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
-  const merged = [];
-  for (const arr of perChunk) {
-    for (const item of (arr || [])) {
-      if (!item || typeof item.title !== 'string') continue;
-      const itemTokens = new Set(meaningfulTokens(item.title));
-      const dup = merged.some(m => {
-        if (norm(m.title) === norm(item.title)) return true;
-        const mTokens = meaningfulTokens(m.title);
-        if (itemTokens.size === 0 || mTokens.length === 0) return false;
-        const shared = mTokens.filter(t => itemTokens.has(t)).length;
-        const smaller = Math.min(itemTokens.size, mTokens.length);
-        return shared >= 3 && shared >= Math.ceil(0.8 * smaller);
-      });
-      if (!dup) merged.push(item);
-    }
-  }
-  return merged;
-}
-
-// runExtractionCall — one model call → parsed JSON array (or [] on no-match).
-// Shared by the Phase A single call and each Phase B chunk. Throws on a call or
-// JSON error so the caller decides the fail-direction (Phase A returns nothing;
-// Phase B isolates per chunk so one bad window doesn't lose the others).
-async function runExtractionCall(callFn, userMessage, { cachePrefix = null } = {}) {
-  // Both paths render transcript-first with the instruction last, so Phase 2d
-  // behaves identically on short and long sessions. Only the single-call path
-  // passes a cachePrefix: each Phase B window is used exactly once, so caching
-  // one would pay the 1.25x write premium for a read that never comes.
-  const response = await callFn(SHARED_PREFACE, userMessage, { cachePrefix });
-  const jsonMatch = response.match(/\[[\s\S]*\]/);
-  return jsonMatch ? JSON.parse(jsonMatch[0]) : [];
 }
 
 // resolutionCorpus — titles of recently resolved/dismissed/superseded inbox
@@ -2157,7 +2043,7 @@ function threadCursorLines(threadsDir, projectSlug) {
 }
 
 // buildExtractionCorpora — assemble the dedup corpora isDuplicate consumes,
-// the SAME machinery Phase 2d and Phase 2m build inline. Extracted so the
+// the SAME machinery Phase 2m builds inline. Extracted so the
 // close lenses (Phase 2n/2o) don't fork a third copy of the corpus-building
 // idiom. Every builder fails OPEN — a corpus hiccup degrades dedup, never
 // aborts the lens (a finding re-filing once beats losing the pass). `phase`
@@ -2528,143 +2414,6 @@ export function verifyCompletionQuote(quote, transcriptJsonl) {
 }
 
 // ---------------------------------------------------------------------------
-// Bookkeeping suppression (act:471941c9, part 1)
-// ---------------------------------------------------------------------------
-//
-// A fifth of one project's 105-item extraction drain (2026-07-30) was
-// BOOKKEEPING: "decision: X merged to main at faf335e", "decision: core
-// v0.1.12 committed and merged, not yet published", "decision: skill filed as
-// act:6f79ddc4". Git and pib-db already hold those facts, more reliably and
-// with less drift — a memory draft of them is a stale cache with a triage
-// cost. The four substance classes named by the report are the four rules
-// below: a commit sha, a merge event, a version bump, a filed-as-record.
-//
-// DESIGN CONSTRAINTS, all learned the expensive way by the recall-fix program:
-//
-//  - TITLE-GATED. Every specimen in the corpus is bookkeeping *in its title*;
-//    a genuine lesson that merely MENTIONS a sha in its body is not
-//    bookkeeping. Matching on content would suppress real lessons about
-//    merges, versions, and filing — the exact over-suppression this system
-//    has already paid for once (act:3975348f).
-//  - A HEX RUN NEEDS A DIGIT. `\b[0-9a-f]{7,40}\b` alone matches ordinary
-//    English ("defaced", "cabbaged"). Requiring at least one digit removes
-//    the whole word class without weakening sha detection.
-//  - A HEX RUN NEEDS GIT CONTEXT. A bare hex token is only a commit sha when
-//    the title also talks about committing/merging/branching. Otherwise it is
-//    an id of some other kind and this rule has no opinion.
-//  - A FID NEEDS FILING GRAMMAR. "filed AS act:…" / "deferred TO new action
-//    act:…" is a record of filing. "automations skill filed and built
-//    (act:1866b723) — how Lily creates her own scheduled automations" is a
-//    real decision that happens to cite its action, and the operator KEPT it.
-//    The preposition, and the fid sitting at the very end of the title, are
-//    what separate the two.
-//
-// Returns null (not bookkeeping) or { rule, matched } — the caller logs the
-// rule name so every suppression is attributable to a named cause.
-
-// A hex run of sha length that contains at least one digit.
-const SHA_RUN_RE = /\b(?=[0-9a-f]{7,40}\b)[a-f0-9]*[0-9][0-9a-f]*\b/i;
-// Fid tokens are stripped before the sha test. An `act:29687e65` is a work-item
-// citation, not a commit — and its 8-hex tail is indistinguishable from a short
-// sha once the prefix is out of frame. Measured: leaving fids in made every
-// title that cited an action AND used the word "merge" read as a commit record,
-// including "…send-time merge is a deferred follow-up (act:29687e65)", a real
-// decision the operator kept.
-const ANY_FID_TOKEN_RE = /\b(?:act|dec|prj|grp):[0-9a-z-]{4,}/gi;
-// Words that make a hex run a COMMIT sha rather than some other identifier.
-const GIT_CONTEXT_RE = /\b(commit|commits|committed|merge|merged|merging|branch|sha|fast-forward|pushed|landed|cherry-pick|rebased?)\b/i;
-// "merged to main" — the merge-event record. PAST TENSE ONLY: "merging to main
-// requires a merge commit, not fast-forward" is a lesson ABOUT merging, and the
-// present participle is what separates the two.
-const MERGE_EVENT_RE = /\bmerged\s+(?:in)?to\s+(?:main|master|trunk)\b/i;
-// "two commits on branch mux/…" — a commit-count record with no sha in it.
-const COMMIT_COUNT_RE = /\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+commits?\s+on\s+(?:the\s+)?branch\b/i;
-// A semver-shaped version anywhere in the title.
-const VERSION_RE = /\bv?\d+\.\d+\.\d+\b/;
-// The verbs that turn a version mention into a release-bookkeeping record.
-const RELEASE_VERB_RE = /\b(bump(?:ed)?|shipped|released?|publish(?:ed)?|committed|merged|tagged)\b/i;
-// "filed as act:…", "stored in act:…", "deferred to new action act:…".
-const FILED_AS_RE = /\b(?:filed|stored|tracked|logged|queued|captured|recorded|deferred|moved|split)\s+(?:as|in|to|under)\s+(?:a\s+|the\s+|new\s+|another\s+)*(?:action\s+|item\s+|handoff\s+)?(?:act|dec|prj|grp):[0-9a-z-]{4,}/i;
-// A trailing "(act:…)" parenthetical on a title whose verb is a filing verb —
-// the other half of the filed-as shape, where the fid is the citation rather
-// than the object of the preposition.
-const TRAILING_FID_RE = /\((?:act|dec|prj|grp):[0-9a-z-]{4,}\)\s*$/i;
-// The routing PREPOSITION is required, not just the verb: "deferred TO Phase 4
-// build gate (act:…)" is a filing record; "…send-time merge is a deferred
-// follow-up (act:…)" is a real decision that cites its action, and the operator
-// kept it.
-const FILING_VERB_RE = /\b(?:filed|deferred|tracked|queued|split|moved|superseded|stored)\s+(?:as|to|in|into|under)\b/i;
-// A queue-item disposition record ("Resolve two inbox items as addressed"). The
-// QUANTIFIER is load-bearing: it separates a record of dispositioning N actual
-// items from a lesson about the mechanism ("Dismissed inbox items refile on
-// next tick — dedup only checks pending items", which the operator kept).
-const QUEUE_BOOKKEEPING_RE = /\b(?:resolve[ds]?|dismiss(?:ed)?|supersede[ds]?|flipped)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|all|the)\b[^.]{0,40}\b(?:inbox|queue)\s+items?\b/i;
-
-export function bookkeepingRule(title) {
-  if (typeof title !== 'string' || !title.trim()) return null;
-  const t = title;
-  const deFidded = t.replace(ANY_FID_TOKEN_RE, ' ');
-  if (SHA_RUN_RE.test(deFidded) && GIT_CONTEXT_RE.test(t)) {
-    return { rule: 'commit-sha', matched: (deFidded.match(SHA_RUN_RE) || [''])[0] };
-  }
-  if (MERGE_EVENT_RE.test(t)) {
-    return { rule: 'merge-event', matched: (t.match(MERGE_EVENT_RE) || [''])[0] };
-  }
-  if (COMMIT_COUNT_RE.test(t)) {
-    return { rule: 'merge-event', matched: (t.match(COMMIT_COUNT_RE) || [''])[0] };
-  }
-  if (VERSION_RE.test(t) && RELEASE_VERB_RE.test(t)) {
-    return { rule: 'version-bump', matched: (t.match(VERSION_RE) || [''])[0] };
-  }
-  if (FILED_AS_RE.test(t)) {
-    return { rule: 'filed-as-record', matched: (t.match(FILED_AS_RE) || [''])[0] };
-  }
-  if (TRAILING_FID_RE.test(t) && FILING_VERB_RE.test(t)) {
-    return { rule: 'filed-as-record', matched: (t.match(TRAILING_FID_RE) || [''])[0].trim() };
-  }
-  if (QUEUE_BOOKKEEPING_RE.test(t)) {
-    return { rule: 'queue-bookkeeping', matched: (t.match(QUEUE_BOOKKEEPING_RE) || [''])[0] };
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Authority-path routing (act:471941c9, part 2)
-// ---------------------------------------------------------------------------
-//
-// A project can designate a single file as THE authority on a class of
-// knowledge — reflow makes `docs/cowork-capabilities.md` the one place
-// platform limits live, enforced by its own validator. Ring 3 was minting the
-// same facts into memory in parallel, which is precisely the drift the
-// authority file exists to prevent (4 of 10 extracted constraints had been
-// written there the day before).
-//
-// Declared in watchtower config as either a per-project or a defaults-level
-// map from extraction TYPE to a repo-relative path:
-//
-//   "authority_paths": { "constraint": "docs/cowork-capabilities.md" }
-//
-// The routing is a ROUTING, not a suppression: the item is still filed, still
-// triaged, still carries its full draft. Only its home changes — from
-// "memory" to "authority-file", with the path named in the option label so
-// the operator's one click says where it goes. Nothing is written to the
-// authority file automatically; a file with a validator behind it is not
-// something a cron job should edit.
-export function resolveAuthorityPath(config, projectName, type) {
-  if (!config || typeof type !== 'string' || !type) return null;
-  const perProject = config.projects
-    && config.projects[projectName]
-    && config.projects[projectName].authority_paths;
-  const fromDefaults = config.defaults && config.defaults.authority_paths;
-  for (const map of [perProject, fromDefaults]) {
-    if (!map || typeof map !== 'object') continue;
-    const p = map[type];
-    if (typeof p === 'string' && p.trim()) return p.trim();
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
 // Commitment dedup — the other side of /close's sweep (act:aa554774)
 // ---------------------------------------------------------------------------
 //
@@ -2675,17 +2424,15 @@ export function resolveAuthorityPath(config, projectName, type) {
 // explicit requirement when this was filed: "the watchtower must not create
 // duplicates of what the sweep files."
 //
-// So Phase 2d loads the actions this project created inside the session's own
-// window and declines to file a commitment-shaped extraction that one of them
-// already covers.
-//
-// This is the same seam as bookkeeping suppression (act:471941c9) from the
-// other side. Bookkeeping says "pib-db already owns this event"; this says
-// "pib-db already owns this obligation, as of ninety seconds ago."
-//
-// act:a6bb5603 made this reader SHARED — the same rows now also feed
-// isDuplicate as the sixth dedup corpus — and bounded its window at BOTH ends.
-// See sessionActionWindow for why, and for the residual imprecision.
+// Phase 2d used to load the actions this project created inside the session's
+// own window and decline to file a commitment-shaped extraction one of them
+// already covered. Phase 2d was DELETED by Simplification Project 1
+// (prj:a4c6052b, plan A1, 2026-09-29) — no extraction now exists to
+// duplicate the sweep — so the ring-side commitment dedup went with it. The
+// reader below survives because act:a6bb5603 made it SHARED: the same rows
+// feed isDuplicate as the sixth dedup corpus for Phases 2m/2n/2o, bounded
+// at BOTH ends. See sessionActionWindow for why, and for the residual
+// imprecision.
 
 // sessionActionWindow — the calendar-day window an action must fall inside to
 // count as "this session filed it".
@@ -2739,7 +2486,7 @@ export function sessionActionWindow(sessionStartIso, sessionEndIso = null) {
 // The shared reader. Returns [{fid, text}] — NEVER notes: action notes are
 // long and prose-heavy and would generate false overlap with almost anything
 // (act:a6bb5603's explicit constraint).
-function loadSessionFiledActions(project, window, { phase = 'Phase 2d' } = {}) {
+function loadSessionFiledActions(project, window, { phase = 'ring3-close' } = {}) {
   const projectPath = project && project.path;
   if (!projectPath || !window) return [];
   const dbPath = join(projectPath, 'pib.db');
@@ -2782,401 +2529,6 @@ export function sessionActionEntries(rows) {
     entries.push({ text: r.text.toLowerCase(), label: `${r.fid}: ${r.text}` });
   }
   return entries;
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2d: Knowledge extraction → inbox
-// ---------------------------------------------------------------------------
-
-async function decisionExtraction(compressed, project, sessionId, transcriptPath,
-  threadIds = [], { callFn = claudeCall, config = null, sessionStartIso = null,
-    sessionWindow = null } = {}) {
-  const projectPath = project.path;
-  log('Phase 2d: Knowledge extraction');
-
-  // Dedup corpora — built FIRST (before the extraction call) so M1b can inject
-  // the nearest saved titles into the prompt AND back the result with the
-  // deterministic isDuplicate pass after. The SAME builder the close lenses use
-  // (one corpus-building idiom). M1a: memory is title-matched (no description
-  // tail), thread cursors are their own whole-token corpus; every builder fails
-  // open. Queried by the resolved project NAME (the old basename query looked
-  // up a phantom project, so dedup never matched and dups re-filed).
-  // The session-actions corpus is built BELOW rather than here, because Phase
-  // 2d already reads exactly those rows for commitment dedup — one db read,
-  // two consumers (the "shared reader" act:a6bb5603 asks for). Every other
-  // lens has no such reader and lets the builder do it.
-  const { memoryTitles, memoryEntries, memoryPromptLines, threadCursorLines: cursorLines,
-    pendingTitles, resolutionTitles, ruleEntries } =
-    buildExtractionCorpora(project, { phase: 'Phase 2d', config });
-  // Positive confirmation, not silence: "no suppressions" must be
-  // distinguishable from "the memory corpus never loaded".
-  log(`Phase 2d: memory corpus — ${memoryTitles.length} title(s), ${memoryEntries.length} dedup entr(ies), ${memoryPromptLines.length} novelty line(s)`);
-
-  // Routed through the shared helper, not an equivalent expression: the two
-  // were byte-identical by coincidence, and a change to one would have
-  // silently un-shared the entry rather than failing.
-  const transcript = cacheableTranscript(compressed);
-  // M1b prefilter: the saved titles most relevant to THIS session (scored over
-  // the full compressed transcript, not just the recent slice).
-  // act:471941c9 part 4: scored over `memoryPromptLines` (title — description),
-  // not bare index titles. A consolidated memory's index title is slug-derived
-  // and carries almost no content tokens, so the old prefilter could neither
-  // FIND the relevant memory nor SHOW the model anything it could judge against.
-  const nearbyTitles = selectNearbyMemoryTitles(memoryPromptLines, compressed);
-
-  // Reach 1 (act:5182beda): the id-paired sibling of pendingTitles, so a
-  // model-proposed relation can resolve back to an actual pending item.
-  // SEPARATE fetch from buildExtractionCorpora's bare-string pendingTitles
-  // (that shape serves the deterministic dedup pass; this one needs ids).
-  let pendingItemsForRelation = [];
-  try {
-    pendingItemsForRelation = listPending({ project: project.name });
-  } catch (e) {
-    logError(`Phase 2d: pending-relation corpus failed (${e.message}) — continuing without it`);
-  }
-  const nearbyPending = selectNearbyPendingItems(pendingItemsForRelation, compressed);
-  const pendingByTitle = new Map(nearbyPending.map((p) => [p.title, p.id]));
-
-  // Cache-group member (act:25b2c277 follow-up). The single-call path binds the
-  // SAME slice as cacheableTranscript() and was already transcript-first, so it
-  // joins the shared entry for free — it was excluded on a misreading of the
-  // chunked path, which is the only one whose windows genuinely differ.
-  const instruction = `You are extracting decisions, constraints, lessons, and user preferences from the Claude Code session transcript above. For each item found, classify its home:
-
-- "memory" = a lesson, preference, or constraint worth remembering across sessions
-- "claude-md" = a convention or rule that should be added to CLAUDE.md
-- "pib-db-trigger" = a deferred action with a trigger condition
-- "upstream-feedback" = friction with Claude Code itself
-- "derivation" = the fact is DERIVABLE (see DERIVABLE below) — its home is the recomputation itself, not a written record
-- "session-record" = the fact is PERISHABLE (see PERISHABLE below) — its only durable home is the record of the session that observed it, never memory
-
-Only extract items that represent NEW knowledge — things learned or decided in this session that aren't yet captured. Skip items that are routine, obvious, or just restating existing conventions.
-
-NEVER EXTRACT BOOKKEEPING. Git and the work tracker already hold these facts, more reliably and with less drift, so a memory of them is a stale copy with a triage cost. Do not emit an item whose substance is any of: a commit sha or what landed at it; a merge event ("X merged to main"); a version bump, release, or publish record; or a record that something was filed, deferred, or tracked as an action ("filed as act:1234abcd"). If a session ALSO produced a durable lesson while doing one of those things, extract the lesson and leave the event out of it.
-
-DERIVABLE: a fact is derivable when it can be recomputed on demand from a live source rather than remembered — a memory of a derivable fact is a stale cache that goes wrong the moment reality moves on. Examples: "prod is at commit 35a5d15" (recompute: check the deploy log or git log on the remote), "the census run already executed" (recompute: check the run log or the action's status in pib-db), "invoice #1's boundary is 95.25h through July 12" (recompute: re-run the timelog query). When an item is derivable, set "derivable": true and "derivation" to a short instruction for HOW to recompute it (a command, a query, a file to check), and set "home" to "derivation". NEVER omit a derivable item from the output — it is always included, just routed to its derivation instead of memory.
-
-PERISHABLE: a fact can be non-derivable and STILL not be durable — true at the moment of this session and destined to become false as work proceeds, with no live source to recompute it from. Examples: "phase 7 hasn't started yet" (false the day phase 7 starts), "usage this month is 42 runs" (a count that moves), "the fix is deployed but not yet verified" (a transition state). A perishable fact is a point-in-time snapshot, NOT a lesson or a durable decision — writing it to memory files a sentence that silently goes wrong. The durability test: would this sentence still be true a month from now if nobody touched anything? A durable lesson would; a snapshot would not. When an item is perishable, set "perishable": true and "perishes_when" to a short statement of WHAT event or time makes it false, and set "home" to "session-record". If a fact is BOTH recomputable and perishable (a deploy SHA is both), classify it DERIVABLE — the recomputation instruction is the better record. NEVER omit a perishable item from the output — it is always included, just routed to the session record instead of memory.
-
-SUBJECT: for every item, set "subject" to the actual project, tool, or system the knowledge is ABOUT. This is usually the same as the project you're working in, but flag it when it differs — a lesson about Claude Code itself learned while doing client work, or a lesson about a third-party API or service, belongs to THAT subject, not the filing project.
-
-UNCLASSIFIABLE: if an item is clearly worth surfacing but does not cleanly fit any type or home above, set "type" to "unclassifiable" and "unclassifiable_reason" to a one-line reason why — this makes your uncertainty visible instead of forcing a confident wrong label. Still include "title" and "content"; "home" and "derivable" are not required for an unclassifiable item.
-
-NOVELTY: an "ALREADY SAVED TO MEMORY" list may appear at the very end of the input. Use it as novelty context: OMIT an item ONLY when a saved title clearly and substantially covers the SAME specific knowledge. DEFAULT TO INCLUDING — when in doubt whether a saved title covers it, INCLUDE the item (re-proposing a near-duplicate is cheap; losing a novel lesson is not). For every item you DO output, set "covered_by" to the exact saved title that most covers it, or "none" if no saved title covers it.
-
-RELATION TO PENDING ITEMS: a "PENDING IN INBOX" list may also appear at the end of the input — these are drafts from earlier sessions still awaiting human triage, NOT yet believed or saved. If an item you output clearly relates to one of them, set "relates_to" to that pending item's exact title and "relation" to "pairs_with" (same topic, worth reading together), "answers" (this item answers a question the pending one raised), or "contradicts" (this item conflicts with what the pending one says). If no pending item relates, set "relates_to" to "none" and "relation" to "none". These are a SEPARATE judgment from "covered_by" — NEVER put a pending title in "covered_by" (covered_by is for MEMORY titles only; a pending item is not yet saved, so naming it there would wrongly suppress the item you're filing right now). And NEVER omit an item, or lower its urgency, on account of a pending item — relate to it, that is all; suppression on account of a pending draft is not something the system can see or undo.
-
-For each item, assess how time-sensitive routing is. Urgency means HOW FAST THE VALUE DECAYS if not routed — it is NOT importance:
-- "urgent" = the value evaporates within days if not routed (a trigger condition about to fire, a constraint someone will trip over THIS WEEK, a decision another active session needs right now). Apply the time-decay test: "if this sits in the inbox for a week, is most of its value gone?" If no, it is not urgent.
-- "normal" = worth routing but the value keeps (most decisions and constraints)
-- "low" = interesting but can wait indefinitely
-
-Lessons and preferences are almost NEVER urgent, no matter how important they are — an important-but-durable item is "normal", not "urgent".
-
-Output JSON array: [{"type":"decision|constraint|lesson|preference|unclassifiable","home":"memory|claude-md|pib-db-trigger|upstream-feedback|derivation|session-record","urgency":"urgent|normal|low","title":"short title","content":"detailed description","covered_by":"exact already-saved title that covers this, or \\"none\\"","subject":"the actual project, tool, or system this is about","derivable":false,"derivation":null,"perishable":false,"perishes_when":null,"unclassifiable_reason":null,"relates_to":"exact pending title that this relates to, or \\"none\\"","relation":"pairs_with|answers|contradicts|none"}]
-Output ONLY the JSON array, no other text. If nothing found, output [].`;
-
-  // M1b injection: show the model what's already saved so it self-filters dupes
-  // in this one pass. DEFAULT-KEEP — the wording leans toward inclusion. Empty
-  // nearby set ⇒ no block ⇒ the prompt degrades to blind extraction (fail-open).
-  const savedBlock = nearbyTitles.length
-    ? `\n\nALREADY SAVED TO MEMORY (do NOT re-propose anything one of these substantially and specifically covers; when unsure, INCLUDE the item):\n${nearbyTitles.map(t => `- ${t}`).join('\n')}`
-    : '';
-
-  // Reach 1 injection (act:5182beda): show the model the pending inbox so it
-  // can propose a relation — the first instance of the retrospective-
-  // temporality motion (new understanding reaching back to what's still
-  // pending). A SEPARATE block from savedBlock, never merged into it — the
-  // never-omit-on-a-pending-item instruction above depends on the model
-  // being able to tell "saved" from "pending" apart at a glance.
-  const pendingBlock = nearbyPending.length
-    ? `\n\nPENDING IN INBOX (not yet saved or believed — candidates for a RELATION only; never a reason to omit or demote anything):\n${nearbyPending.map((p) => `- ${p.title}`).join('\n')}`
-    : '';
-
-  let extractions = [];
-  try {
-    if (compressed.length > SINGLE_CALL_TRANSCRIPT_BUDGET) {
-      // M2 Phase B: the compressed transcript exceeds one call — chunk it into
-      // overlapping windows so nothing in the middle is dropped, extract each,
-      // merge with a strict intra-session matcher. Per-chunk isolation: a bad
-      // window logs and contributes nothing; the others still file (fail-open).
-      const { windows, capped, dropped } = chunkWithOverlap(
-        compressed, SINGLE_CALL_TRANSCRIPT_BUDGET, PHASE_B_OVERLAP, MAX_EXTRACTION_CHUNKS);
-      log(`Phase 2d: M2-B — compressed ${compressed.length} chars > budget; chunk-and-merge over ${windows.length} overlapping window(s)`);
-      if (capped) {
-        log(`Phase 2d: M2-B — MAX_CHUNKS cap hit; oldest ${dropped} window(s) NOT extracted (most-recent kept)`);
-      }
-      const perChunk = [];
-      for (const window of windows) {
-        try {
-          perChunk.push(await runExtractionCall(
-            callFn, `${window}\n\n${instruction}${savedBlock}${pendingBlock}`));
-        } catch (e) {
-          logError(`Phase 2d: M2-B chunk extraction failed (${e.message}) — continuing with the other windows`);
-          perChunk.push([]);
-        }
-      }
-      extractions = mergeChunkExtractions(perChunk);
-    } else {
-      // Instruction ahead of the saved/pending lists: the prompt itself says
-      // those lists appear "at the very end of the input", and that was true
-      // when the instruction lived in `system`. Keep it true.
-      extractions = await runExtractionCall(
-        callFn, `${instruction}${savedBlock}${pendingBlock}`,
-        { cachePrefix: transcript });
-    }
-  } catch (e) {
-    logError(`Phase 2d: Claude extraction failed: ${e.message}`);
-    return { autoWritten: 0, queued: 0 };
-  }
-
-  if (extractions.length === 0) {
-    log('Phase 2d: No knowledge extracted');
-    return { autoWritten: 0, queued: 0 };
-  }
-  if (nearbyTitles.length) {
-    log(`Phase 2d: M1b — injected ${nearbyTitles.length} nearby saved title(s) for novelty context`);
-  }
-  if (nearbyPending.length) {
-    log(`Phase 2d: Reach 1 — injected ${nearbyPending.length} nearby pending item(s) for relation context`);
-  }
-
-  let queued = 0;
-  let deduped = 0;
-  let rescued = 0;
-  let relationsProposed = 0;
-  let bookkept = 0;
-  let authorityRouted = 0;
-  let commitmentDeduped = 0;
-
-  // act:aa554774: the actions /close's commitment sweep could have filed for
-  // this session. Loaded once, outside the loop.
-  const window = sessionWindow || sessionActionWindow(sessionStartIso);
-  const sessionFiledActions = loadSessionFiledActions(project, window);
-  if (sessionFiledActions.length) {
-    log(`Phase 2d: commitment dedup — ${sessionFiledActions.length} action(s) filed `
-      + `${window.startDay}..${window.endDay} are in scope`);
-  }
-  // act:a6bb5603, the sixth corpus: the SAME rows, read once, now also offered
-  // to isDuplicate as a general dedup corpus. Config-flagged and OFF by
-  // default — commitment dedup above is unaffected by the flag, because it is
-  // narrowly shaped (commitment-shaped items only) and already shipped.
-  const sessionActionCorpus = config?.defaults?.dedup_session_actions_corpus === true
-    ? sessionActionEntries(sessionFiledActions)
-    : [];
-  if (sessionActionCorpus.length) {
-    log(`Phase 2d: session-actions corpus — ${sessionActionCorpus.length} action text(s) in scope`);
-  }
-
-  for (const item of extractions) {
-    const fullTitle = `${item.type}: ${item.title}`;
-
-    // Bookkeeping suppression (act:471941c9 part 1) runs BEFORE dedup: an
-    // event git or pib-db already owns is not knowledge, so there is nothing
-    // for the dedup corpora to adjudicate. Logged and ledgered under its own
-    // corpus name so the rule that fired is attributable and the recall canary
-    // can see it. Note this also swallows a commitment stated inside a
-    // bookkeeping title ("v0.1.1 merged but not yet reinstalled — reinstall
-    // still owed"); that is deliberate, and the reason /close now runs a
-    // prospective-commitment sweep of its own (act:aa554774) rather than
-    // leaving dated obligations to the extraction path.
-    const bk = bookkeepingRule(fullTitle);
-    if (bk) {
-      bookkept++;
-      log(`Phase 2d: suppressed "${fullTitle}" — bookkeeping [${bk.rule}] matched "${bk.matched}" (git/pib-db already own this)`);
-      recordSuppression({
-        project: project.name, corpus: `bookkeeping:${bk.rule}`,
-        suppressed_title: fullTitle, matched_against: bk.matched,
-        session_id: sessionId, ts: reprocessTs,
-      });
-      continue;
-    }
-
-    // Commitment dedup (act:aa554774). Scoped to COMMITMENT-SHAPED items only
-    // — a pib-db-trigger home, or a title/content that trips the shared
-    // detector — because a general "does any action created today share words
-    // with this lesson" test would suppress ordinary knowledge. When it fires,
-    // the log names the action that already covers it, which is the evidence
-    // the acceptance criterion asks for.
-    if (sessionFiledActions.length) {
-      const commitmentShaped = item.home === 'pib-db-trigger'
-        || detectCommitments(`${item.title}\n${item.content || ''}`).length > 0;
-      if (commitmentShaped) {
-        const filed = findFiledCommitment(item.title, sessionFiledActions);
-        if (filed) {
-          commitmentDeduped++;
-          log(`Phase 2d: suppressed "${fullTitle}" — commitment already filed as ${filed.fid} ("${filed.text}") during this session`);
-          recordSuppression({
-            project: project.name, corpus: 'commitment-already-filed',
-            suppressed_title: fullTitle, matched_against: `${filed.fid}: ${filed.text}`,
-            session_id: sessionId, ts: reprocessTs,
-          });
-          continue;
-        }
-      }
-    }
-
-    const dup = isDuplicate(
-      fullTitle, item.content || '', memoryEntries, pendingTitles,
-      {
-        ...resolutionTitles,
-        threadCursorLines: cursorLines,
-        sessionActionEntries: sessionActionCorpus,
-        ruleEntries,
-      });
-    if (dup) {
-      // M1b rescue gate: a lexical flag the model AFFIRMATIVELY judged novel is
-      // RESCUED (filed). The model can only rescue, never independently suppress
-      // — a missing/non-"none" covered_by leaves isDuplicate's decision intact.
-      if (modelRescues(item)) {
-        rescued++;
-        log(`Phase 2d: rescued "${fullTitle}" — ${dup.corpus} lexical match "${dup.match}" but model judged novel (covered_by: ${item.covered_by})`);
-      } else {
-        deduped++;
-        // One line per suppression — the dismissed matcher is the loosest in
-        // the system; over-suppression must be visible and tunable.
-        log(`Phase 2d: suppressed "${fullTitle}" — ${dup.corpus} corpus matched "${dup.match}"`);
-        recordSuppression({
-          project: project.name, corpus: dup.corpus,
-          suppressed_title: fullTitle, matched_against: dup.match,
-          session_id: sessionId, ts: reprocessTs,
-        });
-        continue;
-      }
-    }
-
-    try {
-      // Four routing shapes (act:471dd701 N2 + act:a69c21f8 follow-up):
-      // unclassifiable (model uncertainty made visible, never a forced
-      // home guess), derivable (routed to its recomputation, never
-      // written to memory), perishable (a point-in-time snapshot routed
-      // to the session record, never written to memory; derivable WINS
-      // when both flags are set — the derivation is the better record),
-      // and the four pre-existing homes.
-      const isUnclassifiable = item.type === 'unclassifiable';
-      const isDerivable = item.derivable === true;
-      const isPerishable = !isDerivable && item.perishable === true;
-      // Authority-path routing (act:471941c9 part 2). A project that has
-      // designated one file as THE authority for this knowledge class gets the
-      // item routed THERE instead of into memory — filed and triaged exactly as
-      // before, only its home and its one option label change. Applies to the
-      // memory-bound arm only: a derivable/perishable/unclassifiable item has
-      // already been routed away from memory for a stronger reason.
-      const authorityPath = (!isUnclassifiable && !isDerivable && !isPerishable
-        && (item.home === 'memory' || item.home === 'claude-md'))
-        ? resolveAuthorityPath(config, project.name, item.type)
-        : null;
-      const home = isDerivable ? 'derivation'
-        : isPerishable ? 'session-record'
-          : authorityPath ? 'authority-file'
-            : item.home;
-      const isMemory = !isUnclassifiable && !isDerivable && !isPerishable
-        && !authorityPath && home === 'memory';
-
-      let options;
-      let draftArtifact = null;
-      let summary = item.content;
-      if (authorityPath) {
-        authorityRouted++;
-        log(`Phase 2d: routed "${fullTitle}" to authority file ${authorityPath} (type "${item.type}") instead of memory`);
-        options = [
-          { key: 'route-to-authority', label: `Add to ${authorityPath}` },
-          { key: 'write', label: 'Write to memory instead' },
-          { key: 'dismiss', label: 'Dismiss' },
-        ];
-        draftArtifact = `# ${item.title}\n\n${item.content}`;
-        summary = `${item.content}\n\nAuthority for "${item.type}" in this project: ${authorityPath}`;
-      } else if (isUnclassifiable) {
-        options = [
-          { key: 'triage', label: 'Needs human triage' },
-          { key: 'dismiss', label: 'Dismiss' },
-        ];
-      } else if (isDerivable) {
-        options = [
-          { key: 'acknowledge', label: 'Acknowledge — derivable, no write needed' },
-          { key: 'dismiss', label: 'Dismiss' },
-        ];
-        summary = item.derivation ? `${item.content}\n\nDerivation: ${item.derivation}` : item.content;
-      } else if (isPerishable) {
-        options = [
-          { key: 'acknowledge', label: 'Acknowledge — point-in-time snapshot, not durable' },
-          { key: 'dismiss', label: 'Dismiss' },
-        ];
-        summary = item.perishes_when ? `${item.content}\n\nPerishes: ${item.perishes_when}` : item.content;
-      } else if (isMemory) {
-        options = [
-          { key: 'write', label: 'Write to memory' },
-          { key: 'edit', label: 'Edit before writing' },
-          { key: 'dismiss', label: 'Dismiss' },
-        ];
-        draftArtifact = `# ${item.title}\n\n${item.content}`;
-      } else {
-        options = [
-          { key: `route-to-${home}`, label: `Write to ${home}` },
-          { key: 'dismiss', label: 'Dismiss' },
-        ];
-      }
-
-      const newId = createItem({
-        project: project.name,
-        project_path: projectPath,
-        ...(project.unresolved ? { project_unresolved: true } : {}),
-        category: 'knowledge-extraction',
-        urgency: item.urgency || 'normal',
-        title: fullTitle,
-        summary,
-        context_anchor: `session ${sessionId}`,
-        evidence: {
-          type: item.type,
-          ...(isUnclassifiable ? {} : { home }),
-          session_id: sessionId,
-          ...(item.subject ? { subject: item.subject } : {}),
-          ...(isDerivable ? { derivable: true, derivation: item.derivation } : {}),
-          ...(isPerishable ? { perishable: true, perishes_when: item.perishes_when } : {}),
-          ...(isUnclassifiable ? { unclassifiable_reason: item.unclassifiable_reason } : {}),
-          ...(authorityPath ? { authority_path: authorityPath } : {}),
-        },
-        options,
-        draft_artifact: draftArtifact,
-        filed_by: 'ring3-close',
-        transcript_ref: { path: transcriptPath, line_range: null },
-        thread_ids: threadIds,
-      });
-      queued++;
-
-      // Reach 1 (act:5182beda): the model may propose that THIS fresh item
-      // relates to a still-PENDING one shown in pendingBlock. A relation
-      // proposal is filed as its OWN inbox item — it never changes anything
-      // about the item just created above (no suppression, no home change).
-      if (RELATION_VALUES.includes(item.relation)
-          && typeof item.relates_to === 'string' && item.relates_to.trim()) {
-        const relatedId = pendingByTitle.get(item.relates_to);
-        if (relatedId && relatedId !== newId) {
-          try {
-            fileRelationProposal({
-              project, fromId: newId, fromTitle: fullTitle,
-              toId: relatedId, toTitle: item.relates_to,
-              relation: item.relation, sessionId, threadIds,
-            });
-            relationsProposed++;
-          } catch (e) {
-            logError(`Phase 2d: Reach 1 relation proposal failed for "${fullTitle}" (${e.message})`);
-          }
-        }
-      }
-    } catch (e) {
-      logError(`Phase 2d: Failed to queue extraction: ${e.message}`);
-    }
-  }
-
-  if (bookkept > 0) log(`Phase 2d: ${bookkept} extraction(s) suppressed as bookkeeping (git/pib-db already own them)`);
-  if (commitmentDeduped > 0) log(`Phase 2d: ${commitmentDeduped} commitment(s) suppressed — already filed as actions during this session`);
-  if (authorityRouted > 0) log(`Phase 2d: ${authorityRouted} extraction(s) routed to a declared authority file instead of memory`);
-  if (deduped > 0) log(`Phase 2d: ${deduped} extractions skipped (already in memory or inbox)`);
-  if (rescued > 0) log(`Phase 2d: ${rescued} extraction(s) rescued from a lexical match (model judged novel)`);
-  if (relationsProposed > 0) log(`Phase 2d: Reach 1 — ${relationsProposed} relation(s) proposed against the pending inbox`);
-  log(`Phase 2d: ${queued} extractions queued for review`);
-  return { autoWritten: 0, queued };
 }
 
 // ---------------------------------------------------------------------------
@@ -3380,14 +2732,14 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
     const jsonMatch = response.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
       log('Phase 2g: No upstream friction (parse failure)');
-      return;
+      return { routed: 0, durable: 0, dropped: 0 };
     }
 
     const frictionItems = JSON.parse(jsonMatch[0]);
 
     if (frictionItems.length === 0) {
       log('Phase 2g: No upstream friction detected');
-      return;
+      return { routed: 0, durable: 0, dropped: 0 };
     }
 
     const tally = { routed: 0, durable: 0, dropped: 0 };
@@ -3415,23 +2767,21 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
         continue;
       }
 
-      // The third arm, and it comes from the data: of the five friction items
-      // the operator KEPT, four exited as `captured-to-memory` — platform
+      // The third arm came from the data: of the five friction items the
+      // operator KEPT, four exited as `captured-to-memory` — platform
       // constraints with a durable workaround ("Claude-in-Chrome cannot connect
-      // while Claude Desktop is running"). Those have no upstream route and
-      // never will, and dropping them would discard the useful half of this
-      // lens. They are knowledge, so they go where knowledge goes.
+      // while Claude Desktop is running"). This arm used to file them as
+      // knowledge-extraction drafts. Simplification Project 1 (prj:a4c6052b,
+      // plan A2, 2026-09-29) made it COUNT-ONLY: a durable platform constraint
+      // is a standing fact — layer 1 of the three-layer memory model — that
+      // the session captures natively at the moment it learns it; a draft
+      // proposed after the fact was measured as written and never read. The
+      // count and the log line stay so the arm remains observable (a constraint
+      // that reaches here without a native memory write is an accepted loss,
+      // named in the plan's edge cases).
       if (item.durable === true) {
-        createItem({
-          ...base,
-          category: 'knowledge-extraction',
-          urgency: 'low',
-          title: item.title,
-          summary: item.description,
-          context_anchor: 'ring3-close friction scan (durable constraint, no upstream route)',
-          evidence: { type: 'constraint', home: 'memory', severity: item.severity, source: 'friction-lens' },
-        });
         tally.durable++;
+        log(`Phase 2g: durable constraint counted, not filed — "${item.title}" (the session's own memory is where a standing fact is captured)`);
         continue;
       }
 
@@ -3441,10 +2791,12 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
     // All three counts, always. Silence here would be indistinguishable from
     // the lens never running — and the drop count is the number this change
     // exists to move, so it must be observable.
-    log(`Phase 2g: friction — ${tally.routed} routed, ${tally.durable} durable→knowledge, `
+    log(`Phase 2g: friction — ${tally.routed} routed, ${tally.durable} durable (counted, not filed), `
       + `${tally.dropped} dropped (no route, nothing durable)`);
+    return tally;
   } catch (e) {
     logError(`Phase 2g: Friction detection failed: ${e.message}`);
+    return null;
   }
 }
 
@@ -3537,7 +2889,7 @@ async function advisorPass(compressed, project, sessionId, threadIds = [],
   }
   log(`Phase 2m: Roster — ${advisors.map(a => a.name).join(', ')}`);
 
-  // Dedup corpora — same suppression machinery as Phase 2d; builders fail
+  // Dedup corpora — the shared suppression machinery; builders fail
   // open (an advisor finding re-filing once beats losing the whole pass).
   let pendingTitles = [];
   try {
@@ -3661,7 +3013,7 @@ Output ONLY the JSON array, no other text.`;
 // ---------------------------------------------------------------------------
 // Session-close extraction lenses (act:4ff2cfb3) — three additions to the
 // transcript pass, decided in the 2026-06-12 ledger walkthrough. Each is the
-// SAME shape as the existing lenses (Phase 2d / Phase 2m): one pinned-sonnet
+// SAME shape as the existing lens (Phase 2m): one pinned-sonnet
 // call, structured-JSON output, the shared dedup corpora, a per-lens cap, and
 // one log line per suppression. callFn is injectable for hermetic tests
 // (production omits it → this run's claudeCall).
@@ -3670,7 +3022,7 @@ Output ONLY the JSON array, no other text.`;
 //       nor filed (passing promises, side-issues, hanging questions) → inbox.
 //   2o: Skill-candidate — a manual procedure repeated by hand that a skill
 //       would automate → inbox. The skill-discovery extension of the
-//       knowledge-extraction concern (Phase 2d's sibling).
+//       knowledge-extraction concern (the retired Phase 2d's sibling).
 //   2p: Checklist-catch — a surfaced change-impact check that caught a real
 //       bug → recorded to checklist-stats.json (the catch-recording side of
 //       /debrief's checklist-feedback phase, which dies with debrief; feeds
@@ -3823,8 +3175,8 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
 // Phase 2o: Skill-candidate lens
 // ---------------------------------------------------------------------------
 //
-// The skill-discovery extension of the knowledge-extraction concern (Phase
-// 2d's sibling): when the session shows the operator performing the SAME
+// The skill-discovery extension of the knowledge-extraction concern (the
+// retired Phase 2d's sibling): when the session shows the operator performing the SAME
 // multi-step manual procedure more than once by hand, a Claude Code skill or
 // slash-command would have automated it. Surface it as a "should this become
 // a skill?" inbox item. Same dedup discipline as every other lens.
@@ -4846,6 +4198,15 @@ async function main() {
   if (slugUnresolved) {
     log('Phase 2b: skipped — unresolved identity; no state-file key minted from a transcript-slug name');
   } else {
+    // Transcript retention (plan B5) — before the model call, in its own
+    // try, so an API failure never costs the verbatim record; it needs no
+    // model. Enabled everywhere; nothing deletes what this writes.
+    try {
+      const kept = writeTranscriptRetention(args.transcriptPath, project.slug, args.sessionId);
+      log(`Phase 2b: transcript retained at ${kept.slice(kept.indexOf('state/'))}`);
+    } catch (e) {
+      logError(`Phase 2b: transcript retention failed: ${e.message}`);
+    }
     try {
       summary = await sessionSummary(compressed, project.slug, args.sessionId);
     } catch (e) {
@@ -4883,16 +4244,6 @@ async function main() {
     stats.itemsFiled += result.queued;
   } catch (e) {
     logError(`Phase 2c failed: ${e.message}`);
-  }
-
-  // Phase 2d: Decision/lesson extraction
-  try {
-    const result = await decisionExtraction(compressed, project, args.sessionId, args.transcriptPath, threadIds, { config, sessionStartIso, sessionWindow });
-    stats.memoryWritten = result.autoWritten;
-    stats.extractionsQueued = result.queued;
-    stats.itemsFiled += result.queued;
-  } catch (e) {
-    logError(`Phase 2d failed: ${e.message}`);
   }
 
   // Phase 2e: Audit pattern capture
@@ -5041,7 +4392,7 @@ async function main() {
   // A systemic API failure means EVERY Claude-dependent phase produced
   // nothing — surface it loudly so it can't hide behind a "success" run.
   if (systemicApiFailure) {
-    logError(`SYSTEMIC API FAILURE (${systemicApiFailure.type}) — every knowledge-extraction phase was skipped this run (no summary, threads, extractions, or advisor findings). Ring 3 health is DEGRADED. Operator action required: ${systemicApiFailure.message}`);
+    logError(`SYSTEMIC API FAILURE (${systemicApiFailure.type}) — every model-backed phase was skipped this run (no summary, threads, extractions, or advisor findings). Ring 3 health is DEGRADED. Operator action required: ${systemicApiFailure.message}`);
     stats.apiFailure = systemicApiFailure.type;
   }
 
@@ -5211,21 +4562,15 @@ export {
   tokenize,
   isDuplicate,
   parseMemoryTitles,
-  selectNearbyMemoryTitles,
   loadMemoryTitles,
   // Dedup-hole fix (act:421a8ab2, N5 of grp:retro-remeaning)
   extractMemoryFileTitle,
-  // Extraction-noise umbrella (act:471941c9) — bookkeepingRule,
-  // resolveAuthorityPath, loadMemoryCorpus, and extractMemoryDescription are
-  // exported inline at their declarations.
-  // Reach 1 (act:5182beda, N3 of grp:retro-remeaning)
-  selectNearbyPendingItems,
-  relationKey,
-  fileRelationProposal,
-  modelRescues,
-  chunkWithOverlap,
-  mergeChunkExtractions,
-  decisionExtraction,
+  // loadMemoryCorpus and extractMemoryDescription are exported inline at
+  // their declarations. Phase 2d (decisionExtraction) and its 2d-only helpers
+  // — selectNearbyMemoryTitles, selectNearbyPendingItems, relationKey,
+  // fileRelationProposal, modelRescues, chunkWithOverlap,
+  // mergeChunkExtractions, bookkeepingRule, resolveAuthorityPath — were
+  // DELETED by Simplification Project 1 (prj:a4c6052b, plan A1, 2026-09-29).
   resolutionCorpus,
   threadCursorLines,
   buildExtractionCorpora,

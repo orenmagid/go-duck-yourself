@@ -1,12 +1,14 @@
 /**
  * Shared project-identity and memory-dir resolution for CC's
  * memory-related tooling. Used by:
- *   - lib/migrate-from-omega.js (Phase 1 migration)
- *   - scripts/write-memory-file.mjs (Phase 3a /cc-remember writer)
- *   - scripts/validate-memory.mjs (Phase 3a validator)
+ *   - lib/migrate-from-omega.js (one-time omega → built-in migration)
+ *   - the recall script (watchtower-recall.mjs, Simplification Project 1
+ *     lane B-retriever) and the /memory skill, to find the memory dir
+ * (The curated write path that also required it — write-memory-file.mjs,
+ * validate-memory.mjs — was retired 2026-09-29, plan A5.)
  *
  * Worktree-safe: resolves project identity via `git rev-parse
- * --git-common-dir`, so callers from a worktree write to the host
+ * --git-common-dir`, so callers from a worktree resolve to the host
  * project's memory dir, not a per-worktree split.
  */
 

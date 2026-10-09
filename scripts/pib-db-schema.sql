@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS actions (
   tags               TEXT NOT NULL DEFAULT '',
   sort_order         INTEGER NOT NULL DEFAULT 0,
   created            TEXT NOT NULL CHECK(created GLOB '????-??-??'),
+  created_at         TEXT CHECK(created_at IS NULL OR created_at GLOB '????-??-??T??:??:??*'),
   notes              TEXT NOT NULL DEFAULT '',
   deleted_at         TEXT,
   trigger_condition  TEXT,

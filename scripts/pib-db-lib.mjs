@@ -24,7 +24,7 @@
 // Every function takes (db, params) and returns a result object.
 // None of them do console.log — callers decide how to present output.
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -87,6 +87,13 @@ function today() {
 //       tier that matters most for this migration: the live Maginnis tracker
 //       sits at user_version 12 on THIS lineage, so v13 is the number that
 //       actually reaches it.
+//  14 — what an item NEEDS: actions.needs, a CLOSED vocabulary (base v12
+//       twin — act:df8e90e7). Numbered 14 here because the patch runs two
+//       ahead.
+//  15 — a clock on actions: actions.created_at, the ISO timestamp `created`
+//       (a calendar date) never carried, read by createAction's 60-minute
+//       retry-dedup window (base v13 twin — act:5001e898). Numbered 15 here
+//       because the patch runs two ahead — RENUMBERED, never copy-pasted.
 // What an open item NEEDS — the kind of work owed, a CLOSED vocabulary.
 //
 // NOT named `kind`: that word already means area-vs-project on containers, and
@@ -103,7 +110,18 @@ function today() {
 // Convergence plan + its detector: `.claude/plans/qa-debt-payer-build.md`.
 export const ACTION_NEEDS = ['code-fix', 'qa-verify', 'decision', 'operator', 'event-gated'];
 
-export const SCHEMA_VERSION = 14;
+// ONE vocabulary check, two writers. createAction and updateAction must refuse
+// the same values in the same words; two literal copies of that message in one
+// file is the divergence this repo repeatedly pays for. Returns the error
+// string, or null when there is nothing to refuse — `undefined` (field
+// untouched) and `null` (explicitly cleared) are both fine.
+export function validateNeeds(needs) {
+  if (needs === undefined || needs === null) return null;
+  if (ACTION_NEEDS.includes(needs)) return null;
+  return `needs must be one of: ${ACTION_NEEDS.join(' | ')} (or null to clear) — got ${JSON.stringify(needs)}`;
+}
+
+export const SCHEMA_VERSION = 15;
 
 // ---------------------------------------------------------------------------
 // Schema lineage — the fail-closed guard (act:b7d81b52)
@@ -299,6 +317,13 @@ const MIGRATIONS = [
   // v10's resolution left theirs. The CHECK closes the vocabulary at the schema
   // layer; ACTION_NEEDS is the same list at the boundary.
   { version: 14, sql: "ALTER TABLE actions ADD COLUMN needs TEXT CHECK(needs IS NULL OR needs IN ('code-fix','qa-verify','decision','operator','event-gated'))", expect: { column: 'actions.needs' } },
+  // v15: a CLOCK on actions (act:5001e898; base v13 twin — numbered 15 here
+  // because the patch runs two ahead, RENUMBERED never copy-pasted). `created`
+  // is a calendar date (CHECK GLOB '????-??-??'), so the retry-dedup window in
+  // createAction had nothing to read. No backfill and no DEFAULT — a NULL row
+  // honestly predates the clock and is treated as outside every window.
+  // Stamped once, at create; no library function writes it again.
+  { version: 15, sql: "ALTER TABLE actions ADD COLUMN created_at TEXT CHECK(created_at IS NULL OR created_at GLOB '????-??-??T??:??:??*')", expect: { column: 'actions.created_at' } },
 ];
 
 // The post-condition of every migration the stamp claims was applied.
@@ -785,10 +810,76 @@ function validateSurfaceArea(notes) {
 // structural one that no matcher drift can silence).
 export const HIERARCHY_TITLE_PATTERN = /\b(?:Phase|Lane|Child)\s+(?:[0-9]+|[A-Z][0-9]?)\b|TRACKER:|COORDINATOR|SEQUENCE/;
 
-export function createAction(db, { text, projectFid, due, notes }) {
+// Idempotent create (act:5001e898). Measured three times: pib_create_action
+// issued twice in immediate succession with identical parameters — a
+// transport retry or a model re-issue — minted twin actions. No judgment is
+// involved (the same call arrives twice), so no rule can fix it; the guard
+// sits at the write boundary. An EXACT-text match on an OPEN action in the
+// SAME container created inside this window is returned instead of inserted.
+// Exact text only, deliberately: a lexical near-match may PROPOSE, never
+// suppress (act:421a8ab2 — the reason the fold sweep only annotates), so a
+// similar title becomes the advisory below and is never a refusal.
+const DUPLICATE_CREATE_WINDOW_MS = 60 * 60 * 1000;
+
+// The shared-title advisory is the human twin of the retry case: a session
+// files an action and later finds the same work filed a week earlier. The
+// boundary can only help by SURFACING — the nearest open action by title
+// overlap rides along in the create response as text. Tokens are lowercase
+// alphanumeric runs of length >= 3, stopworded; the list mirrors the fold
+// sweep's FOLD_STOPWORDS (watchtower-queue.mjs) as a COPY, not an import —
+// this library is installed standalone in consumer scripts/ and cannot reach
+// the watchtower runtime (the same reason Ring 2 carries its own releasing
+// vocabulary). Four shared tokens is the floor; fewer is coincidence.
+const CREATE_ADVISORY_MIN_SHARED_TOKENS = 4;
+const TITLE_STOPWORDS = new Set(('a about after all also an and any are as at be because been before '
+  + 'being but by can could did do does done for from had has have how i if in into is it its just '
+  + 'like may more most much my new no not now of on one only or other our out over so some than '
+  + 'that the then there these they this to too two under up use used using very via was we were '
+  + 'what when where which while who why will with within would you your').split(' '));
+
+function titleTokens(text) {
+  const tokens = new Set();
+  if (typeof text !== 'string' || !text) return tokens;
+  for (const w of text.toLowerCase().match(/[a-z0-9]+/g) || []) {
+    if (w.length >= 3 && !TITLE_STOPWORDS.has(w)) tokens.add(w);
+  }
+  return tokens;
+}
+
+// The strongest open title match at or above the floor, or null. Reads every
+// live action once; the backlog is hundreds of rows, not millions.
+function nearestOpenActionByTitle(db, text, excludeFid) {
+  const mine = titleTokens(text);
+  if (mine.size < CREATE_ADVISORY_MIN_SHARED_TOKENS) return null;
+  const rows = db.prepare(`SELECT fid, text FROM actions WHERE fid <> ? AND completed = 0 AND status <> 'done' AND deleted_at IS NULL`).all(excludeFid);
+  let best = null;
+  for (const row of rows) {
+    const theirs = titleTokens(row.text);
+    let shared = 0;
+    for (const t of mine) if (theirs.has(t)) shared += 1;
+    if (shared >= CREATE_ADVISORY_MIN_SHARED_TOKENS && (!best || shared > best.shared)) {
+      best = { fid: row.fid, text: row.text, shared };
+    }
+  }
+  return best;
+}
+
+export function createAction(db, { text, projectFid, due, notes, needs }) {
   const validationError = validateSurfaceArea(notes);
   if (validationError) {
     return { error: validationError };
+  }
+
+  // Filing time is the moment the type is known. The column existed and every
+  // creation door dropped it in silence — success returned, value gone — which
+  // is how the QA-debt payer's selector was left with nothing to select on.
+  // Refused before any write, by the same helper updateAction uses so the two
+  // doors cannot drift. Omitted or null stores NULL, exactly as an untyped row
+  // honestly predating the column does; only a value outside the closed
+  // vocabulary is refused.
+  const needsError = validateNeeds(needs);
+  if (needsError) {
+    return { error: needsError };
   }
 
   // The enter-invariant, at its first writer (§16.3): an open action may not
@@ -808,16 +899,57 @@ export function createAction(db, { text, projectFid, due, notes }) {
   }
 
   const fid = generateFid('act');
-  db.prepare(`
-    INSERT INTO actions (fid, text, project_fid, due, notes, created)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(fid, text, projectFid || null, due || null, notes || '', today());
-  const result = { fid, text, message: `Created action ${fid}: ${text}` };
+  const createdAt = new Date().toISOString();
+  const windowStart = new Date(Date.parse(createdAt) - DUPLICATE_CREATE_WINDOW_MS).toISOString();
+  // The twin lookup and the INSERT run in ONE immediate transaction, so two
+  // concurrent identical creates — the retry case exactly — cannot both miss
+  // and both insert: the second waits on the first's write lock and then sees
+  // its row (createProject's shape; §12.7). `project_fid IS ?` so an unfiled
+  // twin (NULL container) matches an unfiled create — no container is one
+  // container. A NULL created_at row predates the clock and never matches —
+  // NULL >= anything is NULL, so the window predicate alone excludes it
+  // (measured: an explicit IS NOT NULL beside it was deletable without a
+  // test going red, so it is not carried).
+  let twin = null;
+  const tx = db.transaction(() => {
+    twin = db.prepare(`
+      SELECT fid, created_at FROM actions
+      WHERE text = ? AND project_fid IS ? AND status = 'open' AND deleted_at IS NULL
+        AND created_at >= ?
+      ORDER BY created_at DESC LIMIT 1
+    `).get(text, projectFid || null, windowStart);
+    if (twin) return;
+    db.prepare(`
+      INSERT INTO actions (fid, text, project_fid, due, notes, needs, created, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(fid, text, projectFid || null, due || null, notes || '', needs || null, today(), createdAt);
+  });
+  tx.immediate();
+  if (twin) {
+    // Not an error: a retry must get the answer the original got, so the
+    // caller holds ONE fid either way. `deduplicated` is the tell.
+    const ageMinutes = Math.max(0, Math.round((Date.parse(createdAt) - Date.parse(twin.created_at)) / 60000));
+    return {
+      fid: twin.fid,
+      text,
+      deduplicated: true,
+      created_at: twin.created_at,
+      message: `Not created: an identical open action already exists in this container — ${twin.fid}, filed ${ageMinutes} min ago. Returning it instead of minting a twin (act:5001e898). If this is genuinely different work, say how in the text.`,
+    };
+  }
+  const result = { fid, text, created_at: createdAt, message: `Created action ${fid}: ${text}` };
   // Teach-after-the-call (§6 lever 3): the write succeeded, but a
   // hierarchy-in-title pattern means this action is probably one step of a
   // larger outcome that deserves to be a real project.
   if (HIERARCHY_TITLE_PATTERN.test(text)) {
     result.suggestion = `This title encodes its position in a hierarchy. If several actions are steps toward one outcome, create a project for that outcome (pib_create_project with kind='project'), parent them to it via projectFid, and drop the position marker from each title — the project, not the title, carries the structure.`;
+  }
+  // Surface, never refuse: the nearest open action by title overlap, for the
+  // week-old human duplicate that exact-text cannot see.
+  const similar = nearestOpenActionByTitle(db, text, fid);
+  if (similar) {
+    result.similar_to = similar.fid;
+    result.advisory = `An open action with a similar title exists: ${similar.fid} — "${similar.text}" (${similar.shared} shared title words). Not refused — if it is the same work, update that action instead of carrying two.`;
   }
   return result;
 }
@@ -926,8 +1058,9 @@ export function updateAction(db, { fid, status, text, tags, notes, due, flagged,
   // a schema violation escapes as a throw the tracker renders as a blank 500,
   // so the refusal is returned before the SQL runs (the house pattern).
   if (needs !== undefined) {
-    if (needs !== null && !ACTION_NEEDS.includes(needs)) {
-      return { error: `needs must be one of: ${ACTION_NEEDS.join(' | ')} (or null to clear) — got ${JSON.stringify(needs)}` };
+    const needsError = validateNeeds(needs);
+    if (needsError) {
+      return { error: needsError };
     }
     sets.push('needs = ?');
     params.push(needs);
@@ -1058,6 +1191,78 @@ export function getAction(db, { fid }) {
   `).get(fid);
   if (!row) return { error: `No action found with fid: ${fid}` };
   return row;
+}
+
+// ---------------------------------------------------------------------------
+// Verification breadcrumb (act:c17510a8)
+// ---------------------------------------------------------------------------
+// The completion gate (templates/hooks/action-completion-gate.sh) reads the
+// EXACT filename `<verifyDir>/<fid>.json`, and a session once typed
+// `14fdf580.json` — never read by any gate. This is the one writer that
+// COMPUTES the path from the fid, so nothing is typed. The caller resolves
+// verifyDir (the MAIN checkout's .claude/verification — resolveVerificationDir
+// in pib-db-path.mjs, the same spelling the gate uses); this library never
+// runs git.
+//
+// ac_verified is true ONLY when summary is non-empty. With no summary the
+// breadcrumb is still written, with ac_verified:false, and the gate still
+// refuses — the verb never launders an unverified completion. spec_read is
+// stamped true: the action row was fetched to validate the fid, and a summary
+// of what was verified presupposes the spec was read.
+//
+// An existing breadcrumb is MERGED, not replaced: spec_read_at, deviations and
+// scenarios_updated (the /execute-group field the gate requires on grp:-tagged
+// plans) survive; only the verification fields are rewritten. Refuses an
+// unknown fid and a done action — a breadcrumb for either records nothing.
+export function writeBreadcrumb(db, { fid, summary, verifyDir, now } = {}) {
+  const fidError = validateFid(fid);
+  if (fidError) return fidError;
+  if (!verifyDir) return { error: 'verifyDir is required — the caller resolves it (resolveVerificationDir)' };
+
+  const row = db.prepare(
+    `SELECT fid, text, completed FROM actions WHERE fid = ? AND deleted_at IS NULL`
+  ).get(fid);
+  if (!row) return { error: `No action with fid ${fid} — nothing to verify. Check the fid (pib_list_actions) before writing a breadcrumb.` };
+  if (row.completed === 1) return { error: `${fid} is already completed — a breadcrumb for a done action records nothing.` };
+
+  const stamp = now || new Date().toISOString();
+  const path = join(verifyDir, `${fid}.json`);
+  let existing = {};
+  if (existsSync(path)) {
+    try {
+      const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) existing = parsed;
+    } catch { /* unreadable: rewritten below */ }
+  }
+
+  const verified = typeof summary === 'string' && summary.trim().length > 0;
+  const breadcrumb = {
+    ...existing,
+    fid,
+    spec_read: true,
+    spec_read_at: existing.spec_read_at || stamp,
+    ac_verified: verified,
+    verification_summary: verified ? summary.trim() : null,
+    deviations: Array.isArray(existing.deviations) ? existing.deviations : [],
+    written_by: 'pib-db write-breadcrumb',
+    written_at: stamp,
+  };
+  if (verified) breadcrumb.ac_verified_at = stamp;
+  else delete breadcrumb.ac_verified_at;
+
+  mkdirSync(verifyDir, { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(breadcrumb, null, 2) + '\n');
+  renameSync(tmp, path);
+
+  return {
+    fid,
+    path,
+    ac_verified: verified,
+    message: verified
+      ? `Wrote ${path} (ac_verified: true). pib_complete_action ${fid} will now pass the breadcrumb gate.`
+      : `Wrote ${path} with ac_verified: false — no summary was given, so the completion gate will still refuse ${fid}. Verify each acceptance criterion against the implementation, then rerun with --summary "<what you verified>".`,
+  };
 }
 
 // ---------------------------------------------------------------------------

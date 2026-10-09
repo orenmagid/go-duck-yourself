@@ -28,15 +28,11 @@ import { join, dirname } from 'node:path';
 import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
-export function resolvePibDbPath({ cwd = process.cwd(), env = process.env } = {}) {
-  // 1. Explicit override wins, verbatim.
-  if (env.PIB_DB_PATH) return env.PIB_DB_PATH;
-
-  // 2. Linked worktree → the main checkout's pib.db (only when it exists).
-  //    Fail-open: this runs at module load of every CLI invocation and every
-  //    MCP start, so ANY git failure (non-git cwd, git off PATH, a stuck
-  //    index.lock that trips the timeout) must fall through to the cwd
-  //    default below — never throw, never hang the importing process.
+// The ONE git call every resolver here shares. Fail-open: this runs at module
+// load of every CLI invocation and every MCP start, so ANY git failure (non-git
+// cwd, git off PATH, a stuck index.lock that trips the timeout) returns null —
+// never throws, never hangs the importing process.
+function gitDirs(cwd) {
   try {
     const out = execFileSync(
       'git',
@@ -47,15 +43,47 @@ export function resolvePibDbPath({ cwd = process.cwd(), env = process.env } = {}
     // from the main checkout would make the equality test and dirname() wrong).
     // Output order follows the flag order: common-dir, then git-dir.
     const [commonDir, gitDir] = out.split('\n').map((l) => l.trim()).filter(Boolean);
-    if (commonDir && gitDir && commonDir !== gitDir) {
-      const mainRoot = dirname(commonDir); // dirname(<main>/.git) === <main>
-      const mainDb = join(mainRoot, 'pib.db');
-      if (existsSync(mainDb)) return mainDb; // never redirect to a db that isn't there
-    }
+    if (commonDir && gitDir) return { commonDir, gitDir };
   } catch {
-    /* not a git repo, git unavailable, or timed out → cwd default below */
+    /* not a git repo, git unavailable, or timed out */
+  }
+  return null;
+}
+
+export function resolvePibDbPath({ cwd = process.cwd(), env = process.env } = {}) {
+  // 1. Explicit override wins, verbatim.
+  if (env.PIB_DB_PATH) return env.PIB_DB_PATH;
+
+  // 2. Linked worktree → the main checkout's pib.db (only when it exists).
+  const dirs = gitDirs(cwd);
+  if (dirs && dirs.commonDir !== dirs.gitDir) {
+    const mainRoot = dirname(dirs.commonDir); // dirname(<main>/.git) === <main>
+    const mainDb = join(mainRoot, 'pib.db');
+    if (existsSync(mainDb)) return mainDb; // never redirect to a db that isn't there
   }
 
   // 3. Default: cwd/pib.db (also the main checkout's own db).
   return join(cwd, 'pib.db');
+}
+
+/**
+ * The MAIN checkout's root — dirname(git-common-dir) — for any cwd inside a
+ * git repository (a linked worktree resolves to main; the main checkout
+ * resolves to itself, even from a subdirectory). null outside a repository.
+ */
+export function resolveMainCheckout({ cwd = process.cwd() } = {}) {
+  const dirs = gitDirs(cwd);
+  return dirs ? dirname(dirs.commonDir) : null;
+}
+
+/**
+ * Where verification breadcrumbs live: `<MAIN checkout>/.claude/verification`,
+ * falling back to cwd-relative outside a git repository. This is the SAME
+ * spelling the completion gate reads (action-completion-gate.sh resolves
+ * VERIFY_DIR the same way), which is the whole point of act:c17510a8 — the
+ * writer (write-breadcrumb / pib_write_breadcrumb) and the reader (the gate)
+ * compute one path; nobody types it.
+ */
+export function resolveVerificationDir({ cwd = process.cwd() } = {}) {
+  return join(resolveMainCheckout({ cwd }) ?? cwd, '.claude', 'verification');
 }

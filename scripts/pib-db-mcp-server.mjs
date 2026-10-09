@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { createInterface } from 'node:readline';
 import * as lib from './pib-db-lib.mjs';
-import { resolvePibDbPath } from './pib-db-path.mjs';
+import { resolvePibDbPath, resolveVerificationDir } from './pib-db-path.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -84,7 +84,6 @@ const TOOLS = [
         kind: { type: 'string', enum: ['area', 'project'], description: "Reclassify the container. Promoting to 'project' gives it a completion semantic; its notes should state the outcome." },
         parentFid: { type: 'string', description: "The AREA this project serves. Only a kind='project' may name one and the target must be an area; pass null to clear it (which is also how you demote a parented project back to an area, in the same call)." },
         tags: { type: 'string', description: 'Comma-separated tags' },
-        needs: { type: 'string', enum: ['code-fix', 'qa-verify', 'decision', 'operator', 'event-gated'], description: 'What kind of work this item needs — a DIFF (code-fix), a RUN against a live stack (qa-verify), a CALL only the operator can make (decision), the operator\'s hands (operator), or an event in the world (event-gated). The QA-debt payer selects on it; pass null to clear.' },
         name: { type: 'string', description: 'New container name' },
         status: { type: 'string', description: "New status. 'done' is refused for areas, and for projects with open children.", enum: ['active', 'paused', 'done', 'dropped', 'someday'] },
         notes: { type: 'string', description: 'Updated notes' },
@@ -124,13 +123,14 @@ const TOOLS = [
   },
   {
     name: 'pib_create_action',
-    description: 'Create a new action (work item — a single step). Notes MUST contain a "## Surface Area" section with at least one "- files:" or "- dirs:" line. If this action cannot START until another action is finished, do NOT write that in the title or notes as prose — create it, then state the dependency with pib_add_dependency, which makes it a real edge the "what can I start now" query reads. And if the title is about to encode its position in something bigger (Phase 2, Lane B, Child 3), that something is a PROJECT — create it with pib_create_project and parent this action via projectFid instead of putting hierarchy in the title.',
+    description: 'Create a new action (work item — a single step). Notes MUST contain a "## Surface Area" section with at least one "- files:" or "- dirs:" line. If this action cannot START until another action is finished, do NOT write that in the title or notes as prose — create it, then state the dependency with pib_add_dependency, which makes it a real edge the "what can I start now" query reads. And if the title is about to encode its position in something bigger (Phase 2, Lane B, Child 3), that something is a PROJECT — create it with pib_create_project and parent this action via projectFid instead of putting hierarchy in the title. Idempotent under retry: an identical text in the same container within the last 60 minutes is NOT created again — the response carries the existing fid with `deduplicated: true`, so a re-issued call is safe. A response may also carry an `advisory` naming an open action with a similar title (`similar_to`): informational, never a refusal — check it before carrying two.',
     inputSchema: {
       type: 'object',
       properties: {
         text: { type: 'string', description: 'Action description' },
         projectFid: { type: 'string', description: 'Parent container fid (e.g., prj:abc12345 — an area or a project)' },
         due: { type: 'string', description: 'Due date (YYYY-MM-DD)' },
+        needs: { type: 'string', enum: ['code-fix', 'qa-verify', 'decision', 'operator', 'event-gated'], description: 'What kind of work this item needs — a DIFF (code-fix), a RUN against a live stack (qa-verify), a CALL only the operator can make (decision), the operator\'s hands (operator), or an event in the world (event-gated). The QA-debt payer selects on it.' },
         notes: { type: 'string', description: 'Action notes. Must include ## Surface Area section with - files: or - dirs: lines.' },
       },
       required: ['text', 'notes'],
@@ -162,6 +162,7 @@ const TOOLS = [
         notes: { type: 'string', description: 'Updated notes' },
         due: { type: 'string', description: 'Due date (YYYY-MM-DD)' },
         flagged: { type: 'boolean', description: 'Flag the action' },
+        needs: { type: 'string', enum: ['code-fix', 'qa-verify', 'decision', 'operator', 'event-gated'], description: 'What kind of work this item needs — a DIFF (code-fix), a RUN against a live stack (qa-verify), a CALL only the operator can make (decision), the operator\'s hands (operator), or an event in the world (event-gated). The QA-debt payer selects on it; pass null to clear.' },
         projectFid: { type: 'string', description: 'Reparent the action to this project fid (must be an existing project; rejected if not found)' },
       },
       required: ['fid'],
@@ -174,6 +175,18 @@ const TOOLS = [
       type: 'object',
       properties: {
         fid: { type: 'string', description: 'Action fid (e.g., act:abc12345)' },
+      },
+      required: ['fid'],
+    },
+  },
+  {
+    name: 'pib_write_breadcrumb',
+    description: "Write the verification breadcrumb that pib_complete_action's gate reads, at the path COMPUTED from the fid and resolved to the MAIN checkout's .claude/verification/<fid>.json — never type that path (a hand-typed short-fid filename was never read by any gate). Pass summary = what you verified against each acceptance criterion; a non-empty summary records ac_verified:true and pib_complete_action then passes. Without a summary the breadcrumb is written with ac_verified:false and the gate still refuses — this tool never launders an unverified completion. Refuses an unknown fid and an already-done action. An existing breadcrumb is merged: spec_read_at, deviations and scenarios_updated survive.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fid: { type: 'string', description: 'Action fid (e.g., act:abc12345)' },
+        summary: { type: 'string', description: 'What was verified, criterion by criterion. Non-empty => ac_verified:true. Omit only to record that the spec was read while verification is still pending.' },
       },
       required: ['fid'],
     },
@@ -395,6 +408,10 @@ function handleToolCall(name, args) {
       return lib.updateAction(d, args);
     case 'pib_complete_action':
       return lib.completeAction(d, args);
+    case 'pib_write_breadcrumb':
+      // verifyDir is resolved HERE, per call, so the server's cwd (the MAIN
+      // checkout or a linked worktree) decides — the library never runs git.
+      return lib.writeBreadcrumb(d, { ...args, verifyDir: resolveVerificationDir() });
     case 'pib_get_action':
       return lib.getAction(d, args);
     case 'pib_ingest_findings':

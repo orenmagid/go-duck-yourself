@@ -11,19 +11,26 @@
 //   - Event-driven: checks lock/ring2-fast-trigger file
 //
 // Slow tier (--slow):
-//   - Memory hygiene via validate-memory.mjs
-//   - Cross-project memory synthesis (cap 3 evals/run)
+//   (Memory hygiene — validate-memory.mjs per project, state/memory-health.md,
+//    the memory-budget standing debt and its retraction — was DELETED with the
+//    curated memory write path: Simplification Project 1, prj:a4c6052b, plan
+//    A5, 2026-09-29. The platform enforces its own index cap.)
+//   (Cross-project memory synthesis was DELETED — Simplification Project 1,
+//    prj:a4c6052b, plan A3, 2026-09-29; act:fd61d5cb closes there.)
 //   - Stale work detection (14d → stale-project, all-done → project-completion)
 //   - Quality pattern detection — routes Ring 3 patterns to cabinet members via inbox
+//     (act:a49b9191: classifies each pattern against the encoded rule set first —
+//     instances go to state/rule-instances/<project>.jsonl; threshold → ONE
+//     promotion proposal; themes collapse before fan-out; flag pattern_rule_classifier)
 //   - Cabinet-roster review (occasional, weekly slot): uncovered tech,
 //     dormant skills (reuses scripts/skill-usage.mjs), briefing staleness
 //   - Consumer hooks (subshell, 60s timeout)
-//   - Writes state/memory-health.md, state/work-items.md
+//   - Writes state/work-items.md
 //   - Triggers Ring 1 re-eval (lock/ring1-trigger)
 
 import {
   readFileSync, writeFileSync, readdirSync, existsSync, statSync,
-  mkdirSync, unlinkSync, realpathSync,
+  mkdirSync, unlinkSync, realpathSync, appendFileSync,
 } from 'fs';
 import { join, resolve } from 'path';
 import { pathToFileURL } from 'url';
@@ -42,7 +49,13 @@ import {
   expireItem, listItems, expiryDaysFor,
   proposeFolds, buildFoldClusters, annotateItemEvidence, supersedeItem,
 } from './watchtower-queue.mjs';
-import { autoReconcileItem } from './watchtower-lib.mjs';
+// The rules-corpus reader lives in ring3 (act:a6bb5603). Reused, not forked —
+// one reader for both scopes (act:a49b9191).
+import { loadRulesCorpus } from './watchtower-ring3-close.mjs';
+// The retrieval instrument (Simplification Project 1, plan B1): is memory
+// reached? Three numbers per project per rolling 30 days, computed once a day
+// from the transcript walk + the recall log; no model call.
+import { runRetrievalInstrument } from './watchtower-retrieval-instrument.mjs';
 
 // Shared thread-file reader (single source of truth in watchtower-lib.mjs).
 // Re-exported so ring2's existing tests (ring2-thread-context.test.mjs) keep
@@ -69,7 +82,6 @@ const ESCALATION_WARN_DAYS = 14;
 // urgent — de-escalate so the SessionStart urgent count stays trustworthy.
 const URGENT_DECAY_DAYS = 7;
 const SLOW_STALE_DAYS = 14;
-const SLOW_CROSS_PROJECT_CAP = 3;
 const HOOK_TIMEOUT_MS = 60_000;
 const SLOW_PATTERN_SCAN_CAP = 3;
 
@@ -1008,419 +1020,20 @@ async function runFast() {
 // ===================================================================
 
 // ---------------------------------------------------------------------------
-// 1. Memory hygiene
-// ---------------------------------------------------------------------------
-
-async function runMemoryHygiene(config) {
-  const projects = config.projects || {};
-  const projectNames = Object.keys(projects);
-  const results = [];
-
-  for (const name of projectNames) {
-    const projectPath = projects[name].path || projects[name];
-    if (!existsSync(projectPath)) continue;
-
-    // Run validate-memory.mjs as child process (may not exist in all projects)
-    // CC installs scripts/ at project root, not .claude/scripts/
-    const validateScript = join(projectPath, 'scripts', 'validate-memory.mjs');
-    if (!existsSync(validateScript)) {
-      results.push({ project: name, status: 'skipped', reason: 'validate-memory.mjs not found' });
-      continue;
-    }
-
-    try {
-      const output = execSync(
-        `node "${validateScript}" --quiet`,
-        { cwd: projectPath, encoding: 'utf8', timeout: 30_000, stdio: ['pipe', 'pipe', 'pipe'] }
-      );
-      results.push({ project: name, status: 'pass', output: output.trim() });
-    } catch (e) {
-      // Exit code 1 means violations, 2 means bad usage
-      const stderr = e.stderr || '';
-      const stdout = e.stdout || '';
-
-      // Parse violations from output
-      const violations = [];
-      const lines = (stdout + '\n' + stderr).split('\n');
-      for (const line of lines) {
-        if (line.startsWith('FAIL:')) {
-          violations.push(line.replace('FAIL:', '').trim());
-        }
-      }
-
-      results.push({
-        project: name,
-        status: 'violations',
-        violations,
-        exitCode: e.status,
-      });
-    }
-  }
-
-  // Write state/memory-health.md
-  const healthLines = [`# Memory Health — ${new Date().toISOString()}`, ''];
-
-  const violationProjects = results.filter(r => r.status === 'violations');
-  const passProjects = results.filter(r => r.status === 'pass');
-  const skippedProjects = results.filter(r => r.status === 'skipped');
-
-  if (violationProjects.length === 0) {
-    healthLines.push('All projects pass memory validation.');
-  } else {
-    healthLines.push(`${violationProjects.length} project(s) with memory issues:`);
-    for (const p of violationProjects) {
-      healthLines.push(`\n### ${p.project}`);
-      for (const v of p.violations) {
-        healthLines.push(`- ${v}`);
-      }
-    }
-  }
-
-  healthLines.push('');
-  healthLines.push(`## Summary`);
-  healthLines.push(`- Pass: ${passProjects.length}`);
-  healthLines.push(`- Violations: ${violationProjects.length}`);
-  healthLines.push(`- Skipped: ${skippedProjects.length}`);
-
-  const stateDir = join(WATCHTOWER_DIR, 'state');
-  mkdirSync(stateDir, { recursive: true });
-  atomicWrite(join(stateDir, 'memory-health.md'), healthLines.join('\n'));
-
-  // Silent detection ≈ no detection (no-silent-failures rule, act:3f3f9a31):
-  // a project persistently over budget gets ONE inbox item, not a log line
-  // nobody reads. Streaks tracked across runs; re-file at most every 7 days.
-  try {
-    surfacePersistentViolations(violationProjects, projects, stateDir);
-  } catch (e) {
-    logError(`Slow: memory violation surfacing failed: ${e.message}`);
-  }
-
-  // The other half of the same truth: a project that now PASSES retracts its
-  // standing alarm on this very pass (act:ea23b3a5). Detector symmetry — a
-  // detector that files must also retract, and the retraction condition is
-  // already computed two lines up.
-  try {
-    const retracted = retractClearedMemoryBudgetItems(passProjects);
-    if (retracted > 0) log(`Slow: retracted ${retracted} memory-budget alarm(s) whose condition cleared`);
-  } catch (e) {
-    logError(`Slow: memory-budget retraction failed: ${e.message}`);
-  }
-
-  log(`Slow: memory hygiene — ${passProjects.length} pass, ${violationProjects.length} violations, ${skippedProjects.length} skipped`);
-  return results;
-}
-
-const MEMORY_VIOLATION_STREAK_THRESHOLD = 3; // consecutive slow runs
-
-// ---------------------------------------------------------------------------
-// Memory-budget standing debt (act:ea23b3a5)
+// 1. (Memory hygiene ran here until 2026-09-29.)
 // ---------------------------------------------------------------------------
 //
-// This alarm is now ONE accumulating item per project, not a fresh filing every
-// N days. The old 7-day refile throttle produced the live specimen: a maginnis
-// budget violation restated three times, in three categories, by three filers —
-// and the `title.startsWith('Memory budget violation')` pending check that was
-// supposed to prevent it is fragile against Ring 2's own `[AGING]` prefix
-// rewrite, which happens at 14 days.
-//
-// Occurrences are counted in CALENDAR DAYS, not slow-run timestamps. Ring 2
-// slow runs roughly 48 times a day: a per-run key would make the replay guard
-// dead code, grow the key list by ~17,500 entries a year inside a single JSON
-// file, and render a "3,412 runs" count that means nothing to a person. "This
-// has stood for 6 days" is the fact the operator actually acts on.
-//
-// The append routes through `annotateItemEvidence` — fresh read, pending fence
-// checked at WRITE time, deep-equal skip — rather than a direct item write.
-// That deliberately leaves title, urgency, and `filed_at` alone: the item does
-// not strip its own `[AGING]` prefix, does not pin itself to the top of every
-// pending list, and cannot become structurally un-expirable. If the debt
-// outlives the 30-day policy it expires and refiles fresh through the streak
-// gate, which is an honest signal reset rather than an immortal alarm.
-const MEMORY_BUDGET_DEBT_CLASS = 'memory-budget';
-const LEGACY_MEMORY_BUDGET_TITLE = /^(\[AGING\] )?Memory budget violation/;
-
-// BOTH selectors, always. Every memory-budget item on disk when this shipped
-// carries `evidence: { violations, streak }` and no `debt_class`, so matching
-// on the new field alone would silently miss the exact pile that motivated the
-// fix — and would leave it with no code path that ever touches it again.
-export function isMemoryBudgetItem(item) {
-  return item?.category === 'watchtower-health'
-    && (item?.evidence?.debt_class === MEMORY_BUDGET_DEBT_CLASS
-      || LEGACY_MEMORY_BUDGET_TITLE.test(String(item?.title || '')));
-}
-
-function findMemoryBudgetItems(projectName, listPendingFn) {
-  return (listPendingFn || listPending)({ project: projectName, category: 'watchtower-health' })
-    .filter(isMemoryBudgetItem)
-    .sort((a, b) => String(a.filed_at).localeCompare(String(b.filed_at)));
-}
-
-// deps are injectable so the suite stays hermetic; production callers omit them.
-export function surfacePersistentViolations(violationProjects, projects, stateDir, deps = {}) {
-  const listPendingFn = deps.listPending || listPending;
-  // Named `file`, not `createItemFn`: the detector-registry census binds a
-  // `category:` literal to its NEAREST preceding call opener and only
-  // recognises `createItem(` and `file(` as FILING owners. A wrapper under any
-  // other name reads as a query filter and the category silently drops out of
-  // the census — act:c2f06955 item 5 predicted this evasion, and the suite
-  // caught it live when this dep was first written as `createItemFn`.
-  const file = deps.createItem || createItem;
-  const annotateFn = deps.annotateItemEvidence || annotateItemEvidence;
-  const supersedeFn = deps.supersedeItem || supersedeItem;
-  const today = deps.today || new Date().toISOString().slice(0, 10);
-
-  const streakPath = join(stateDir, 'memory-violation-streaks.json');
-  let streaks = {};
-  if (existsSync(streakPath)) {
-    try { streaks = JSON.parse(readFileSync(streakPath, 'utf8')); } catch { streaks = {}; }
-  }
-
-  const violatingNames = new Set(violationProjects.map(p => p.project));
-
-  // Reset streaks for projects that now pass. This is also the anti-oscillation
-  // floor: after a retraction the project must fail three consecutive runs
-  // again before anything refiles, so retract-then-refile cannot cycle.
-  for (const name of Object.keys(streaks)) {
-    if (!violatingNames.has(name)) delete streaks[name];
-  }
-
-  for (const p of violationProjects) {
-    const entry = streaks[p.project] || { count: 0, last_filed: null };
-    entry.count += 1;
-
-    if (entry.count >= MEMORY_VIOLATION_STREAK_THRESHOLD) {
-      const pending = findMemoryBudgetItems(p.project, listPendingFn);
-      const target = pending[0] || null;
-
-      // Race residue or a pre-aggregation pile: the oldest accumulates and
-      // every other exits through the sanctioned verb naming its successor.
-      for (const extra of pending.slice(1)) {
-        try {
-          supersedeFn(extra.id, {
-            reason: `absorbed into the standing memory-budget item ${target.id} for ${p.project}`,
-          });
-        } catch (e) {
-          logError(`Slow: could not supersede duplicate memory-budget item ${extra.id} (${e.message})`);
-        }
-      }
-
-      if (target) {
-        const prior = target.evidence || {};
-        const priorDays = Array.isArray(prior.days) ? prior.days : [];
-        // Replay guard: a second violating run on a day already recorded is a
-        // no-op (annotateItemEvidence's deep-equal skip makes it a true no-write).
-        const days = [...new Set([...priorDays, today])].sort();
-        try {
-          annotateFn(target.id, {
-            debt_class: MEMORY_BUDGET_DEBT_CLASS,
-            days,
-            // `session_count` is the spelling itemSessionWeight (watchtower-
-            // inbox-assessment) already reads and which has zero producers
-            // today — so backlog-rot weighs this debt correctly with no
-            // consumer change and no migration of anything on disk.
-            session_count: days.length,
-            first_seen: days[0],
-            last_seen: days[days.length - 1],
-            violations: p.violations || [],
-            streak: entry.count,
-          });
-          log(`Slow: memory-budget debt for ${p.project} now spans ${days.length} day(s) (item ${target.id})`);
-        } catch (e) {
-          logError(`Slow: could not append memory-budget evidence to ${target.id} (${e.message})`);
-        }
-      } else {
-        const projectPath = projects[p.project]?.path || projects[p.project] || '';
-        file({
-          project: p.project,
-          project_path: projectPath,
-          filed_by: 'ring2-slow',
-          category: 'watchtower-health',
-          urgency: 'normal',
-          title: `Memory budget violation: ${p.project}`,
-          summary: `MEMORY.md has failed validation for ${entry.count} consecutive Ring 2 runs:\n${(p.violations || []).map(v => `- ${v}`).join('\n')}\n\nOver-budget MEMORY.md only partially loads at session start — memories past the cap are invisible. This item accumulates while the condition stands and retracts automatically once validate-memory passes.`,
-          context_anchor: 'state/memory-health.md',
-          evidence: {
-            debt_class: MEMORY_BUDGET_DEBT_CLASS,
-            days: [today],
-            session_count: 1,
-            first_seen: today,
-            last_seen: today,
-            violations: p.violations || [],
-            streak: entry.count,
-          },
-          options: [
-            { key: 'trim', label: 'Trim MEMORY.md now' },
-            { key: 'defer', label: 'Defer — file a pib-db action' },
-            { key: 'dismiss', label: 'Dismiss' },
-          ],
-        });
-        entry.last_filed = new Date().toISOString();
-        log(`Slow: filed memory-budget violation item for ${p.project} (streak ${entry.count})`);
-      }
-    }
-
-    streaks[p.project] = entry;
-  }
-
-  atomicWrite(streakPath, JSON.stringify(streaks, null, 2));
-}
-
-// Validator-backed retraction (act:ea23b3a5). Three memory-budget alarms sat
-// pending for days after the condition cleared — maginnis MEMORY.md validates
-// PASS at 74 lines / 16.6 KB against a 200-line / 25 KB budget — because
-// nothing consulted the validator that Ring 2 slow ALREADY runs for every
-// project on this same pass. The truth was sitting in `passProjects`.
-//
-// This lives here rather than in Ring 1 deliberately: Ring 1 shelling
-// `validate-memory.mjs` itself would fork a second memory-health producer,
-// which watchtower-contracts.md forbids by name, and at a 30-minute throttle
-// against Ring 2's 30-minute cadence it would buy exactly zero freshness.
-//
-// FAIL TOWARD KEEPING: only a project this pass positively classified `pass`
-// retracts. `violations`, `skipped`, and every error path leave the alarm
-// standing — runMemoryHygiene maps any nonzero validator exit to `violations`,
-// so an ambiguous failure can never be mistaken for a pass.
-export function retractClearedMemoryBudgetItems(passProjects, deps = {}) {
-  const listPendingFn = deps.listPending || listPending;
-  const reconcile = deps.autoReconcileItem || autoReconcileItem;
-  let retracted = 0;
-  for (const p of passProjects || []) {
-    for (const item of findMemoryBudgetItems(p.project, listPendingFn)) {
-      try {
-        const res = reconcile(item.id, {
-          resolution: 'validator-passes',
-          notes: `Auto-resolved by Ring 2 slow: ${p.project}'s validate-memory now passes — the budget violation this alarm reported no longer holds.`,
-          actor: 'ring2-slow',
-          evidence: { validator: 'scripts/validate-memory.mjs', validator_status: 'pass' },
-        });
-        if (res) {
-          retracted++;
-          log(`Slow: retracted memory-budget item ${item.id} — ${p.project} validates clean`);
-        }
-      } catch (e) {
-        logError(`Slow: could not retract memory-budget item ${item.id} (${e.message}) — keeping it pending`);
-      }
-    }
-  }
-  return retracted;
-}
-
-// ---------------------------------------------------------------------------
-// 2. Cross-project memory synthesis
-// ---------------------------------------------------------------------------
-
-async function crossProjectMemorySynthesis(config) {
-  const projects = config.projects || {};
-  const projectNames = Object.keys(projects);
-
-  // Collect memory indices from all projects
-  const projectMemories = [];
-  for (const name of projectNames) {
-    const projectPath = projects[name].path || projects[name];
-    if (!existsSync(projectPath)) continue;
-
-    const memoryDir = findMemoryDir(projectPath);
-    if (!memoryDir) continue;
-
-    const indexPath = join(memoryDir, 'MEMORY.md');
-    if (!existsSync(indexPath)) continue;
-
-    try {
-      const content = readFileSync(indexPath, 'utf8');
-      // Extract memory entries (lines with links or bold references)
-      const entries = [];
-      for (const line of content.split('\n')) {
-        if (line.match(/\[.+\]\(.+\.md\)/) || line.match(/\*\*.+\.md\*\*/)) {
-          entries.push(line.trim());
-        }
-      }
-      if (entries.length >= 5) {
-        projectMemories.push({ project: name, entries, path: projectPath });
-      }
-    } catch {
-      // skip
-    }
-  }
-
-  if (projectMemories.length < 2) {
-    log('Slow: cross-project synthesis skipped (need at least 2 projects with memory)');
-    return;
-  }
-
-  // Rotate evaluations using state file
-  const synthStatePath = join(WATCHTOWER_DIR, 'state', 'cross-project-synth.json');
-  let synthState = { last_pairs: [], last_run: null };
-  if (existsSync(synthStatePath)) {
-    try {
-      synthState = JSON.parse(readFileSync(synthStatePath, 'utf8'));
-    } catch {
-      // reset
-    }
-  }
-
-  // Generate pairs to compare, skip recently evaluated
-  const pairs = [];
-  for (let i = 0; i < projectMemories.length; i++) {
-    for (let j = i + 1; j < projectMemories.length; j++) {
-      const pairKey = `${projectMemories[i].project}:${projectMemories[j].project}`;
-      const lastEval = (synthState.last_pairs || []).find(p => p.key === pairKey);
-      const daysSinceEval = lastEval
-        ? (Date.now() - new Date(lastEval.checked_at).getTime()) / (24 * 60 * 60 * 1000)
-        : Infinity;
-      // Re-evaluate if not checked in 7 days
-      if (daysSinceEval >= 7) {
-        pairs.push({ a: projectMemories[i], b: projectMemories[j], key: pairKey });
-      }
-    }
-  }
-
-  const batch = pairs.slice(0, SLOW_CROSS_PROJECT_CAP);
-  if (batch.length === 0) {
-    log('Slow: no cross-project pairs due for synthesis');
-    return;
-  }
-
-  log(`Slow: evaluating ${batch.length} cross-project memory pairs`);
-
-  const newPairChecks = [];
-  for (const pair of batch) {
-    try {
-      const systemPrompt = 'You compare memory entries from two projects to find cross-cutting patterns, shared lessons, or transferable decisions. Be concise. If nothing interesting, say "No cross-project insights."';
-
-      const userPrompt = `Project A (${pair.a.project}) memories:\n${pair.a.entries.join('\n')}\n\nProject B (${pair.b.project}) memories:\n${pair.b.entries.join('\n')}\n\nAre there shared patterns, contradictory decisions, or transferable lessons?`;
-
-      const result = await askClaude(systemPrompt, userPrompt, 512);
-      newPairChecks.push({ key: pair.key, checked_at: new Date().toISOString() });
-
-      if (!result.toLowerCase().includes('no cross-project insights')) {
-        log(`Slow: cross-project insight found for ${pair.key}`);
-        // Route insights to the inbox
-        createItem({
-          project: pair.a.project,
-          project_path: pair.a.path,
-          filed_by: 'ring2-slow',
-          category: 'knowledge-extraction',
-          urgency: 'low',
-          title: `Cross-project insight: ${pair.a.project} + ${pair.b.project}`,
-          summary: result.trim(),
-          context_anchor: `cross-project memory synthesis: ${pair.key}`,
-          evidence: { pair_key: pair.key, projects: [pair.a.project, pair.b.project] },
-        });
-      }
-    } catch (e) {
-      logError(`Cross-project synthesis failed for ${pair.key}: ${e.message}`);
-      newPairChecks.push({ key: pair.key, checked_at: new Date().toISOString() });
-    }
-  }
-
-  // Update synthesis state (tracks when pairs were last checked)
-  const existingPairs = (synthState.last_pairs || []).filter(p =>
-    !newPairChecks.some(np => np.key === p.key)
-  );
-  synthState.last_pairs = [...existingPairs, ...newPairChecks];
-  synthState.last_run = new Date().toISOString();
-  atomicWrite(synthStatePath, JSON.stringify(synthState, null, 2));
-}
+// runMemoryHygiene shelled every project's scripts/validate-memory.mjs, wrote
+// state/memory-health.md, filed ONE accumulating `watchtower-health` item per
+// project on a 3-run violation streak (surfacePersistentViolations,
+// act:ea23b3a5) and retracted it on the same pass once the validator passed
+// (retractClearedMemoryBudgetItems). All of it was DELETED by Simplification
+// Project 1, plan A5 (act:7c1ce89a), with the validator it shelled: the
+// memory index is the platform's, holding standing facts only; the platform
+// enforces its own cap and reminds the session when the index is over it.
+// `watchtower-health` is retired in INBOX_DETECTOR_REGISTRY. The sidecars
+// state/memory-health.md and state/memory-violation-streaks.json are runtime
+// residue for plan C4. See cabinet/memory-contract.md.
 
 // ---------------------------------------------------------------------------
 // 3. Stale work detection
@@ -1751,10 +1364,16 @@ const GAP_OPENING_CHARS = 60;
 // Pure: the text of the **Gap:** block — everything after the marker up to the
 // next bold block label or a blank line. Exported for the hermetic suite.
 export function extractGapBlock(body) {
-  if (typeof body !== 'string') return null;
-  const i = body.indexOf(GAP_BLOCK_MARKER);
+  return extractLabeledBlock(body, GAP_BLOCK_MARKER);
+}
+
+// Pure: the text of any `**Label:**` block — the Gap block for the gate
+// above, the Evidence block for the rule-instance counter (act:a49b9191).
+export function extractLabeledBlock(body, marker) {
+  if (typeof body !== 'string' || typeof marker !== 'string' || !marker) return null;
+  const i = body.indexOf(marker);
   if (i === -1) return null;
-  const rest = body.slice(i + GAP_BLOCK_MARKER.length);
+  const rest = body.slice(i + marker.length);
   const out = [];
   for (const line of rest.split('\n')) {
     // A blank line or the next `**Label:**` block ends this one. The blank-line
@@ -1827,6 +1446,533 @@ export function parseAuditPatterns(content) {
   return patterns;
 }
 
+// ---------------------------------------------------------------------------
+// 5a. Rule-instance classification (act:a49b9191 — the scanner remembers
+//     what is already a rule; implements act:78db81d9's aggregation contract)
+// ---------------------------------------------------------------------------
+//
+// Measured twice (2026-08-10: 99 of 178; 2026-08-27: 154 of 220): ~70% of
+// the pattern-promotion stream is observed INSTANCES of rules that already
+// load eagerly in every session. The scanner routed each to a member and
+// filed it as new because it checked the pattern against nothing encoded.
+//
+// Now every pattern that passes the shape gates is CLASSIFIED before it is
+// routed: ONE Claude call with the encoded set in the prompt, returning
+// `{instance_of: <index>|null, theme: <label>}`. Mechanical token overlap is
+// deliberately NOT the mechanism — act:421a8ab2: a lexical matcher may
+// propose, never suppress; ring3's headings-only `rules` dedup corpus
+// measured nearly inert (3 of ~3100) for the structural reason that an
+// instance restates a rule's CONTENT and shares almost no tokens with its
+// HEADING. The model decides; the counter records.
+//
+// The encoded set: the title heading of every `.claude/rules/*.md` in the
+// project AND global scope (read through ring3's loadRulesCorpus — one
+// reader, not a third; sub-headings ride along as context, never as
+// targets), pinned memory titles (`pinned: true` frontmatter, per
+// memory-lifecycle-contract.md), and the titles of patterns already resolved
+// `promoted`. Keyed on the heading's hash, so a reworded or deleted rule
+// starts a fresh series and its old instances surface as ORPHANED in the
+// summary instead of silently absorbing new ones (the calibration fence,
+// part 4 of act:a49b9191).
+//
+// The act:78db81d9 invariant, restated so "file no item" is never read as
+// suppression: EVERY instance is retained, with its Evidence block, in
+// `state/rule-instances/<project>.jsonl` (append-only) — in BOTH flag
+// states. Phase 2e's prompt is untouched.
+//
+// Attribution: audit-patterns.md carries a date and nothing else — no
+// project, no session id — so an instance of a project-scoped rule belongs
+// to that project (the first config project holding it when several do),
+// and an instance of a GLOBAL-only rule is attributed to the first config
+// project, which is where today's member routing lands it anyway (routing
+// picks the first project in config order that has the named member).
+// `session_id` is recorded as null until Phase 2e stamps one.
+//
+// Flag: `defaults.pattern_rule_classifier === true` (opt-IN, ships OFF —
+// watchtower-contracts.md "New Dedup Corpora Ship OFF"). OFF: classify,
+// count, and file exactly as before — pure measurement. ON: instances file
+// no item, a rule crossing PROMOTION_THRESHOLD instances inside
+// PROMOTION_WINDOW_DAYS files ONE promotion proposal carrying them all, and
+// novel patterns collapse by theme before member fan-out. ON writes fewer
+// items than OFF, never more; a classifier failure fails OPEN (the pattern
+// files as if novel).
+
+export const RULE_INSTANCE_DIR = 'rule-instances';
+export const PROMOTION_THRESHOLD = 5;
+export const PROMOTION_WINDOW_DAYS = 14;
+export const RULE_EVIDENCE_WEEK_DAYS = 7;
+const CLASSIFIER_PATTERN_CHARS = 1500;
+const CLASSIFIER_THEME_CHARS = 80;
+const CLASSIFIER_SECTIONS_SHOWN = 6;
+const ENCODED_SET_CAP = 400;
+const EVIDENCE_MARKER = '**Evidence:**';
+
+function ruleHash(kind, title) {
+  return simpleHash(`${kind}:${String(title || '').trim().toLowerCase()}`);
+}
+
+// Pure: ring3's loadRulesCorpus entries ({text, label}) → one entry per rule
+// FILE. The label carries what the lowercased `text` lost: `<file>` for the
+// slug entry, `<file> § <Heading>` (or `global:<file> § …`) per heading, in
+// file order — so the first heading is the rule's title and the rest are its
+// sections. Exported for the hermetic suite.
+export function rulesFromCorpusEntries(entries, { project = null, projectPath = null } = {}) {
+  const files = new Map();
+  for (const e of Array.isArray(entries) ? entries : []) {
+    if (!e || typeof e.label !== 'string') continue;
+    const sep = e.label.indexOf(' § ');
+    const fileLabel = sep === -1 ? e.label : e.label.slice(0, sep);
+    const heading = sep === -1 ? null : e.label.slice(sep + 3).trim();
+    if (!files.has(fileLabel)) {
+      files.set(fileLabel, {
+        file: fileLabel.replace(/^global:/, ''),
+        scope: fileLabel.startsWith('global:') ? 'global' : 'project',
+        slug: null,
+        headings: [],
+      });
+    }
+    const rec = files.get(fileLabel);
+    if (heading === null) rec.slug = typeof e.text === 'string' ? e.text : null;
+    else if (heading) rec.headings.push(heading);
+  }
+  const out = [];
+  for (const rec of files.values()) {
+    const title = rec.headings[0] || rec.slug || rec.file.replace(/\.md$/, '');
+    const scoped = rec.scope === 'project';
+    out.push({
+      kind: 'rule',
+      title,
+      hash: ruleHash('rule', title),
+      file: rec.file,
+      scope: rec.scope,
+      project: scoped ? project : null,
+      project_path: scoped ? projectPath : null,
+      sections: rec.headings.slice(1, 1 + CLASSIFIER_SECTIONS_SHOWN),
+    });
+  }
+  return out;
+}
+
+// Pure-ish: memory files whose frontmatter carries `pinned: true`, titled by
+// their first H1 (else frontmatter name, else filename). The index file and
+// anything unreadable contribute nothing — fail open toward a smaller set.
+export function pinnedMemoryEntries(memoryDir) {
+  if (!memoryDir || !existsSync(memoryDir)) return [];
+  let files = [];
+  try { files = readdirSync(memoryDir).filter((f) => f.endsWith('.md') && f !== 'MEMORY.md' && f !== 'MEMORY-archive.md'); }
+  catch { return []; }
+  const out = [];
+  for (const f of files) {
+    let content = '';
+    try { content = readFileSync(join(memoryDir, f), 'utf8'); } catch { continue; }
+    const fm = /^---\n([\s\S]*?)\n---/.exec(content);
+    if (!fm || !/^\s*pinned:\s*true\s*$/m.test(fm[1])) continue;
+    const rest = content.slice(fm[0].length);
+    const h1 = /^#\s+(.+?)\s*$/m.exec(rest);
+    const name = /^\s*name:\s*(.+?)\s*$/m.exec(fm[1]);
+    const title = (h1 && h1[1].trim()) || (name && name[1].trim()) || f.replace(/\.md$/, '');
+    out.push({ kind: 'memory', title, hash: ruleHash('memory', title), file: f, scope: 'memory', sections: [] });
+  }
+  return out;
+}
+
+// Pure: the titles of patterns the operator already promoted (a queue item
+// resolved with resolution_type 'promoted'). Their instances are not new
+// patterns either — they are evidence for the action the promotion filed.
+export function promotedPatternEntries(items) {
+  const out = [];
+  const seen = new Set();
+  for (const it of Array.isArray(items) ? items : []) {
+    if (!it || it.category !== 'pattern-promotion' || it.resolution_type !== 'promoted') continue;
+    const ev = it.evidence || {};
+    let title = typeof ev.pattern_title === 'string' && ev.pattern_title.trim() ? ev.pattern_title.trim() : null;
+    if (!title && typeof it.title === 'string') title = it.title.replace(/^Pattern for cabinet-[^:]+:\s*/, '').trim();
+    if (!title) continue;
+    const hash = ruleHash('promoted', title);
+    if (seen.has(hash)) continue;
+    seen.add(hash);
+    out.push({ kind: 'promoted', title, hash, item_id: it.id || null, scope: 'promoted', project: it.project || null, project_path: it.project_path || null, sections: [] });
+  }
+  return out;
+}
+
+// The encoded set for one scan, portfolio-wide, deduped by hash. Fails open
+// at every step: an unreadable scope shrinks the set (fewer instances
+// recognized → more items filed), never aborts the scan.
+export function buildEncodedRuleSet(config, deps = {}) {
+  const {
+    globalDir,
+    memoryDirFn = findMemoryDir,
+    listItemsFn = listItems,
+    loadRulesFn = loadRulesCorpus,
+  } = deps;
+  const projects = [];
+  for (const [name, projConfig] of Object.entries((config && config.projects) || {})) {
+    const path = (projConfig && projConfig.path) || projConfig;
+    if (typeof path !== 'string' || !existsSync(path)) continue;
+    projects.push({ name, path });
+  }
+  const byHash = new Map();
+  const order = [];
+  const put = (entry) => {
+    const prior = byHash.get(entry.hash);
+    if (!prior) { byHash.set(entry.hash, entry); order.push(entry.hash); return; }
+    // A project-scoped copy beats the global one for attribution; among
+    // project copies the first in config order stands.
+    if (prior.scope === 'global' && entry.scope === 'project') {
+      byHash.set(entry.hash, { ...entry });
+    }
+  };
+  for (const { name, path } of projects) {
+    let entries = [];
+    try { entries = loadRulesFn(path, globalDir ? { globalDir } : undefined); }
+    catch { entries = []; }
+    for (const r of rulesFromCorpusEntries(entries, { project: name, projectPath: path })) put(r);
+    let memDir = null;
+    try { memDir = memoryDirFn(path); } catch { memDir = null; }
+    for (const m of pinnedMemoryEntries(memDir)) put({ ...m, project: name, project_path: path });
+  }
+  let promoted = [];
+  try { promoted = promotedPatternEntries(listItemsFn({ category: 'pattern-promotion' })); }
+  catch { promoted = []; }
+  for (const p of promoted) {
+    const home = projects.find((x) => x.name === p.project) || projects[0] || null;
+    put({ ...p, project: home ? home.name : null, project_path: home ? home.path : null });
+  }
+  const first = projects[0] || null;
+  const set = [];
+  for (const hash of order) {
+    const e = byHash.get(hash);
+    if (!e.project && first) { e.project = first.name; e.project_path = first.path; e.attributed = 'first-project'; }
+    set.push(e);
+  }
+  if (set.length > ENCODED_SET_CAP) {
+    log(`Slow: encoded rule set capped at ${ENCODED_SET_CAP} of ${set.length} entries`);
+    set.length = ENCODED_SET_CAP;
+  }
+  set.forEach((e, i) => { e.index = i + 1; });
+  return set;
+}
+
+export const RULE_CLASSIFIER_SYSTEM_PROMPT = `You classify one audit pattern against a numbered set of things ALREADY ENCODED for this project: rules every session loads, pinned memory constraints, and patterns already promoted into work.
+
+Answer the question: is this pattern an observed INSTANCE of one entry — a case where the behavior that entry already prescribes was not followed — or does it describe a gap NO entry covers?
+
+Respond with ONLY a JSON object on one line: {"instance_of": <entry number or null>, "theme": "<3-6 word theme label>"}
+
+- instance_of: the number of the ONE entry the pattern is an instance of, or null.
+- An entry counts only if a reader who already knew that entry would recognize this pattern as "that rule, not followed". Shared vocabulary is NOT enough — an entry that merely uses similar words, or covers a neighboring topic, is not a match. When in doubt, answer null.
+- theme: a short label for what the pattern is about (used to group similar patterns), always present.`;
+
+export function buildRuleClassifierPrompt(pattern, encodedSet) {
+  const lines = (encodedSet || []).map((e, i) => {
+    const n = e.index || i + 1;
+    const where = e.kind === 'rule' ? `rule ${e.file}` : e.kind === 'memory' ? 'pinned memory' : 'already promoted';
+    const sections = Array.isArray(e.sections) && e.sections.length ? ` — sections: ${e.sections.join('; ')}` : '';
+    return `[${n}] ${e.title} (${where})${sections}`;
+  });
+  return `Pattern:\nTitle: ${pattern.title}\n${String(pattern.body || '').slice(0, CLASSIFIER_PATTERN_CHARS)}\n\nEncoded set:\n${lines.join('\n')}\n\nWhich entry, if any, is this pattern an instance of?`;
+}
+
+// Pure: the model's verdict. Anything unparseable or out of range reads as
+// NOVEL (fail toward filing) and says so, so a garbled answer can never
+// manufacture a suppression.
+export function parseRuleClassifierVerdict(text, setSize) {
+  const out = { instance_of: null, theme: null, parse_error: false };
+  if (typeof text !== 'string' || !text.trim()) { out.parse_error = true; return out; }
+  const m = /\{[\s\S]*\}/.exec(text);
+  if (!m) { out.parse_error = true; return out; }
+  let obj;
+  try { obj = JSON.parse(m[0]); } catch { out.parse_error = true; return out; }
+  if (!obj || typeof obj !== 'object') { out.parse_error = true; return out; }
+  const raw = obj.instance_of;
+  const n = typeof raw === 'number' ? raw : (typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw) : null);
+  if (Number.isInteger(n) && n >= 1 && n <= (setSize || 0)) out.instance_of = n;
+  if (typeof obj.theme === 'string' && obj.theme.trim()) out.theme = obj.theme.trim().slice(0, CLASSIFIER_THEME_CHARS);
+  return out;
+}
+
+async function classifyPatternAgainstRules(pattern, encodedSet) {
+  const text = await askClaude(RULE_CLASSIFIER_SYSTEM_PROMPT, buildRuleClassifierPrompt(pattern, encodedSet), 128);
+  return parseRuleClassifierVerdict(text, encodedSet.length);
+}
+
+// --- The counter file (append-only, per project) ---
+
+export function ruleInstancesPath(watchtowerDir, project) {
+  return join(watchtowerDir, 'state', RULE_INSTANCE_DIR, `${slugify(String(project || 'unattributed')) || 'unattributed'}.jsonl`);
+}
+
+export function appendRuleInstance(watchtowerDir, project, line) {
+  const fp = ruleInstancesPath(watchtowerDir, project);
+  mkdirSync(join(watchtowerDir, 'state', RULE_INSTANCE_DIR), { recursive: true });
+  appendFileSync(fp, JSON.stringify(line) + '\n');
+  return fp;
+}
+
+export function readRuleInstances(watchtowerDir, project, { onUnreadable } = {}) {
+  const fp = ruleInstancesPath(watchtowerDir, project);
+  if (!existsSync(fp)) return [];
+  let raw = '';
+  try { raw = readFileSync(fp, 'utf8'); } catch { return []; }
+  const out = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line)); }
+    catch (e) { if (typeof onUnreadable === 'function') onUnreadable(line, e); }
+  }
+  return out;
+}
+
+// Pure: which rules crossed the threshold. A proposal covers the instances
+// of one rule filed inside the window AND after the last proposal's
+// window_end — so a sixth instance is one toward the NEXT threshold, not a
+// re-fire of the last. Dedup key = rule_hash + window start (the plan's
+// contract); existing proposals are matched on that key too.
+export function proposePromotions(instances, {
+  existingProposals = [],
+  now = Date.now(),
+  threshold = PROMOTION_THRESHOLD,
+  windowDays = PROMOTION_WINDOW_DAYS,
+} = {}) {
+  const nowMs = now instanceof Date ? now.getTime() : now;
+  const windowStartMs = nowMs - windowDays * 86400000;
+  const keys = new Set();
+  const lastEnd = new Map();
+  for (const p of Array.isArray(existingProposals) ? existingProposals : []) {
+    const ev = (p && p.evidence) || {};
+    if (typeof ev.proposal_key === 'string') keys.add(ev.proposal_key);
+    if (typeof ev.rule_hash === 'string' && typeof ev.window_end === 'string') {
+      const t = Date.parse(ev.window_end);
+      if (!Number.isNaN(t) && t > (lastEnd.get(ev.rule_hash) ?? -Infinity)) lastEnd.set(ev.rule_hash, t);
+    }
+  }
+  const byRule = new Map();
+  for (const line of Array.isArray(instances) ? instances : []) {
+    if (!line || typeof line.rule_hash !== 'string' || typeof line.filed_at !== 'string') continue;
+    const t = Date.parse(line.filed_at);
+    if (Number.isNaN(t) || t < windowStartMs || t > nowMs) continue;
+    if (t <= (lastEnd.get(line.rule_hash) ?? -Infinity)) continue;
+    if (!byRule.has(line.rule_hash)) byRule.set(line.rule_hash, []);
+    byRule.get(line.rule_hash).push({ line, t });
+  }
+  const proposals = [];
+  for (const [ruleHashValue, rows] of byRule) {
+    if (rows.length < threshold) continue;
+    rows.sort((a, b) => a.t - b.t);
+    const windowStart = rows[0].line.filed_at;
+    const windowEnd = rows[rows.length - 1].line.filed_at;
+    const key = `${ruleHashValue}:${windowStart}`;
+    if (keys.has(key)) continue;
+    const first = rows[0].line;
+    proposals.push({
+      rule: first.rule,
+      rule_hash: ruleHashValue,
+      rule_file: first.rule_file || null,
+      rule_kind: first.rule_kind || 'rule',
+      project: first.project || null,
+      proposal_key: key,
+      window_start: windowStart,
+      window_end: windowEnd,
+      instance_count: rows.length,
+      instances: rows.map((r) => r.line),
+    });
+  }
+  return proposals;
+}
+
+// Pure: the per-rule series, for the briefing line and the calibration
+// fence. `orphaned` = the rule's hash is not in the current encoded set (the
+// rule was deleted or reworded) — reported as its own line, never folded
+// into a live rule. An EMPTY set cannot judge orphans and says so (null).
+export function summarizeRuleInstances(instances, encodedSet, {
+  now = Date.now(),
+  weekDays = RULE_EVIDENCE_WEEK_DAYS,
+  windowDays = PROMOTION_WINDOW_DAYS,
+} = {}) {
+  const nowMs = now instanceof Date ? now.getTime() : now;
+  const weekMs = nowMs - weekDays * 86400000;
+  const windowMs = nowMs - windowDays * 86400000;
+  const known = new Set((encodedSet || []).map((e) => e.hash));
+  const canJudge = known.size > 0;
+  const byRule = new Map();
+  for (const line of Array.isArray(instances) ? instances : []) {
+    if (!line || typeof line.rule_hash !== 'string') continue;
+    if (!byRule.has(line.rule_hash)) {
+      byRule.set(line.rule_hash, {
+        rule: line.rule || null, rule_hash: line.rule_hash, rule_file: line.rule_file || null,
+        count_7d: 0, count_14d: 0, total: 0, last_seen: null,
+        orphaned: canJudge ? !known.has(line.rule_hash) : null,
+      });
+    }
+    const r = byRule.get(line.rule_hash);
+    r.total++;
+    const t = Date.parse(line.filed_at);
+    if (!Number.isNaN(t)) {
+      if (t >= weekMs) r.count_7d++;
+      if (t >= windowMs) r.count_14d++;
+      if (!r.last_seen || t > Date.parse(r.last_seen)) r.last_seen = line.filed_at;
+    }
+  }
+  const rules = [...byRule.values()].sort((a, b) => b.count_14d - a.count_14d || b.total - a.total);
+  return {
+    rules,
+    rules_with_new_evidence_7d: rules.filter((r) => r.count_7d > 0).length,
+    orphaned_rules: canJudge ? rules.filter((r) => r.orphaned).length : null,
+    orphaned_instances_14d: canJudge ? rules.filter((r) => r.orphaned).reduce((n, r) => n + r.count_14d, 0) : null,
+    encoded_set_size: known.size,
+  };
+}
+
+function writeRuleInstanceSummary(watchtowerDir, config, encodedSet, nowMs) {
+  const projects = {};
+  for (const [name] of Object.entries((config && config.projects) || {})) {
+    projects[name] = summarizeRuleInstances(readRuleInstances(watchtowerDir, name), encodedSet, { now: nowMs });
+  }
+  atomicWrite(join(watchtowerDir, 'state', RULE_INSTANCE_DIR, 'summary.json'), JSON.stringify({
+    schema_version: 1,
+    generated_at: new Date(nowMs).toISOString(),
+    week_days: RULE_EVIDENCE_WEEK_DAYS,
+    window_days: PROMOTION_WINDOW_DAYS,
+    projects,
+  }, null, 2));
+}
+
+// Pure: theme collapse before member fan-out. Fold-paired patterns (the
+// watchtower-queue recipe, run over THIS batch) share a group; a pattern in
+// no accepted cluster groups by the model's own theme label; a pattern with
+// neither stands alone. Batch order is preserved.
+export function groupPatternsByTheme(patterns, { foldFn = proposeFolds, clusterFn = buildFoldClusters } = {}) {
+  const list = Array.isArray(patterns) ? patterns : [];
+  // The block labels (**Evidence:** / **Gap:**) are structural and present in
+  // EVERY body; left in, they are shared tokens that pair unrelated short
+  // patterns under the recipe's min-denominator overlap.
+  const strip = (s) => String(s || '').replace(/\*\*(Evidence|Gap):\*\*/g, ' ');
+  const pseudo = list.map((p) => ({ id: p.hash, title: p.title, draft_artifact: strip(p.body) }));
+  let clusters = new Map();
+  try { clusters = clusterFn(foldFn(pseudo)); } catch { clusters = new Map(); }
+  const groups = new Map();
+  for (const p of list) {
+    const c = clusters.get(p.hash);
+    let key;
+    if (c && c.cluster && Array.isArray(c.cluster.members) && c.cluster.members.length > 1) {
+      key = `fold:${[...c.cluster.members].sort().join('+')}`;
+    } else if (typeof p.theme === 'string' && p.theme.trim()) {
+      key = `theme:${simpleHash(p.theme.trim().toLowerCase())}`;
+    } else {
+      key = `self:${p.hash}`;
+    }
+    if (!groups.has(key)) groups.set(key, { key, patterns: [] });
+    groups.get(key).patterns.push(p);
+  }
+  return [...groups.values()];
+}
+
+function normalizeRouting(routed) {
+  const list = Array.isArray(routed) ? routed : (routed ? [routed] : []);
+  const seen = new Set();
+  return list.filter((m) => m && typeof m.name === 'string' && !seen.has(m.name) && seen.add(m.name));
+}
+
+// The acceptance instrument: run resolved pattern-promotion items back
+// through the classifier and tally what WOULD have happened. Pure given an
+// injected classifyFn; the CLI arm below drives it with the real model.
+export async function replayRuleClassifier({ items, encodedSet: inputSet, classifyFn, onProgress } = {}) {
+  const rows = [];
+  const novelPatterns = [];
+  let skipped = 0;
+  const list = Array.isArray(items) ? items : [];
+  // A replayed item that was itself PROMOTED is in today's encoded set as a
+  // 'promoted' entry — replaying it against that set classifies it as an
+  // instance of its own promotion. Exclude entries minted from the replayed
+  // items, then re-index, so the replay sees the set as it stood before.
+  const replayIds = new Set(list.map((it) => it && it.id).filter(Boolean));
+  const encodedSet = (Array.isArray(inputSet) ? inputSet : [])
+    .filter((e) => !(e && e.kind === 'promoted' && replayIds.has(e.item_id)))
+    .map((e, i) => ({ ...e, index: i + 1 }));
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i];
+    const ev = (it && it.evidence) || {};
+    if (typeof ev.pattern_text !== 'string' || !ev.pattern_text.trim()) { skipped++; continue; }
+    const pattern = {
+      title: ev.pattern_title || (typeof it.title === 'string' ? it.title.replace(/^Pattern for cabinet-[^:]+:\s*/, '') : ''),
+      body: ev.pattern_text,
+      date: ev.source_date || null,
+      hash: ev.pattern_hash || simpleHash((ev.pattern_title || '') + ev.pattern_text),
+    };
+    let verdict;
+    try { verdict = await classifyFn(pattern, encodedSet); }
+    catch (e) { verdict = { instance_of: null, theme: null, parse_error: true, error: e.message }; }
+    const entry = verdict && verdict.instance_of ? encodedSet[verdict.instance_of - 1] : null;
+    rows.push({
+      id: it.id || null,
+      title: pattern.title,
+      resolution_type: it.resolution_type || null,
+      instance_of: entry ? entry.title : null,
+      rule_hash: entry ? entry.hash : null,
+      theme: (verdict && verdict.theme) || null,
+      parse_error: !!(verdict && verdict.parse_error),
+      error: (verdict && verdict.error) || null,
+    });
+    if (!entry) novelPatterns.push({ ...pattern, theme: (verdict && verdict.theme) || null });
+    if (typeof onProgress === 'function') onProgress(i + 1, list.length, rows[rows.length - 1]);
+  }
+  const byRuleMap = new Map();
+  const byDisposition = {};
+  for (const r of rows) {
+    const d = r.resolution_type || 'unknown';
+    if (!byDisposition[d]) byDisposition[d] = { instances: 0, novel: 0 };
+    byDisposition[d][r.instance_of ? 'instances' : 'novel']++;
+    if (r.instance_of) byRuleMap.set(r.instance_of, (byRuleMap.get(r.instance_of) || 0) + 1);
+  }
+  const promotedRows = rows.filter((r) => r.resolution_type === 'promoted');
+  return {
+    total: rows.length,
+    skipped_no_text: skipped,
+    encoded_set_size: encodedSet.length,
+    excluded_self_promotions: (Array.isArray(inputSet) ? inputSet.length : 0) - encodedSet.length,
+    instances: rows.filter((r) => r.instance_of).length,
+    novel: novelPatterns.length,
+    would_file: groupPatternsByTheme(novelPatterns).length,
+    errors: rows.filter((r) => r.error).length,
+    parse_errors: rows.filter((r) => r.parse_error).length,
+    by_rule: [...byRuleMap.entries()].map(([rule, count]) => ({ rule, count })).sort((a, b) => b.count - a.count),
+    by_disposition: byDisposition,
+    promoted_total: promotedRows.length,
+    promoted_filed: promotedRows.filter((r) => !r.instance_of).length,
+    rows,
+  };
+}
+
+// CLI arm: `watchtower-ring2.mjs --replay-rule-classifier [--project P]
+// [--since YYYY-MM-DD] [--resolved-on YYYY-MM-DD] [--limit N] [--out FILE]`.
+// Reads the real queue and the real encoded set, calls the real model once
+// per item, prints the tally as JSON. Rows go to --out (or are omitted).
+async function runRuleClassifierReplay(args) {
+  const opt = (flag) => { const i = args.indexOf(flag); return i !== -1 ? args[i + 1] : undefined; };
+  const project = opt('--project') || 'claude-cabinet';
+  const since = opt('--since') || '2026-08-17';
+  const resolvedOn = opt('--resolved-on');
+  const limit = opt('--limit') ? Number(opt('--limit')) : Infinity;
+  const out = opt('--out');
+  const config = loadConfig();
+  const encodedSet = buildEncodedRuleSet(config);
+  let items = listItems({ project, category: 'pattern-promotion', since })
+    .filter((i) => i.status !== 'pending');
+  if (resolvedOn) items = items.filter((i) => typeof i.resolved_at === 'string' && i.resolved_at.startsWith(resolvedOn));
+  items = items.slice(0, limit);
+  const result = await replayRuleClassifier({
+    items, encodedSet, classifyFn: classifyPatternAgainstRules,
+    onProgress: (n, total, row) => { if (n % 10 === 0 || n === total) process.stderr.write(`${n}/${total} ${row.instance_of ? 'instance' : 'novel'}\n`); },
+  });
+  const { rows, ...summary } = result;
+  summary.project = project;
+  summary.since = since;
+  summary.resolved_on = resolvedOn || null;
+  if (out) atomicWrite(out, JSON.stringify({ ...summary, rows }, null, 2));
+  process.stdout.write(JSON.stringify(summary, null, 2) + '\n');
+}
+
 function collectCabinetMembers(config) {
   const members = [];
   for (const [name, projConfig] of Object.entries(config.projects || {})) {
@@ -1853,20 +1999,34 @@ function collectCabinetMembers(config) {
   return members;
 }
 
-async function routePatternToMember(pattern, members) {
+// Routes a theme's primary pattern (told about its siblings) to ONE TO THREE
+// members, best first. The first is `target_member` (what the write path and
+// the fold sweep key on today); the rest ride in `target_members`. One item
+// per theme naming the members — never one per member.
+async function routePatternToMember(pattern, members, { siblings = [] } = {}) {
   const seen = new Set();
   const unique = members.filter(m => { if (seen.has(m.name)) return false; seen.add(m.name); return true; });
   const memberList = unique.map(m => `- ${m.name}: ${m.description.slice(0, 120)}`).join('\n');
+  const related = siblings.length
+    ? `\n\nRelated patterns in the same theme:\n${siblings.map((s) => `- ${s.title}`).join('\n')}`
+    : '';
 
   const result = await askClaude(
-    'You route audit patterns to the cabinet member whose portfolio best matches. Respond with EXACTLY one line: the member name (no "cabinet-" prefix). If no member is a good match, respond "NONE".',
-    `Pattern:\nTitle: ${pattern.title}\n${pattern.body.slice(0, 500)}\n\nCabinet members:\n${memberList}\n\nWhich member should own this pattern?`,
+    'You route audit patterns to the cabinet members whose portfolios best match. Respond with ONE to THREE member names, one per line, best match first (no "cabinet-" prefix, nothing else). If no member is a good match, respond "NONE".',
+    `Pattern:\nTitle: ${pattern.title}\n${pattern.body.slice(0, 500)}${related}\n\nCabinet members:\n${memberList}\n\nWhich member(s) should own this pattern?`,
     64,
   );
 
-  const memberName = result.trim().split('\n')[0].trim().toLowerCase().replace(/^cabinet-/, '');
-  if (memberName === 'none' || !memberName) return null;
-  return members.find(m => m.name === memberName) || null;
+  const names = result.split('\n')
+    .map((l) => l.trim().toLowerCase().replace(/^[-*\d.)\s]+/, '').replace(/^cabinet-/, ''))
+    .filter(Boolean);
+  if (!names.length || names[0] === 'none') return null;
+  const routed = [];
+  for (const name of names.slice(0, 3)) {
+    const m = members.find((x) => x.name === name);
+    if (m && !routed.includes(m)) routed.push(m);
+  }
+  return routed.length ? routed : null;
 }
 
 export async function scanAuditPatterns(config, deps = {}) {
@@ -1876,6 +2036,10 @@ export async function scanAuditPatterns(config, deps = {}) {
     routeFn = routePatternToMember,
     createItemFn = createItem,
     listPendingFn = listPending,
+    listItemsFn = listItems,
+    classifyFn = classifyPatternAgainstRules,
+    encodedSetFn = buildEncodedRuleSet,
+    nowIso = () => new Date().toISOString(),
   } = deps;
   const patternsPath = join(watchtowerDir, 'state', 'audit-patterns.md');
   if (!existsSync(patternsPath)) {
@@ -1953,6 +2117,27 @@ export async function scanAuditPatterns(config, deps = {}) {
   // by default would leave the hole open. The flag exists so it can be turned
   // OFF if it ever over-rejects, not so it has to be turned on.
   const gapAssertionGate = config?.defaults?.pattern_gap_assertion !== false;
+
+  // Rule-instance classification (act:a49b9191) — see the 5a header. The
+  // classifier is an opt-IN (`=== true`, ships OFF) per "New Dedup Corpora
+  // Ship OFF": OFF classifies and COUNTS but files exactly as before; ON
+  // suppresses instances, files threshold proposals, and collapses themes.
+  const classifierOn = config?.defaults?.pattern_rule_classifier === true;
+  let encodedSet = [];
+  try {
+    encodedSet = encodedSetFn(config, {
+      listItemsFn,
+      ...(deps.globalRulesDir ? { globalDir: deps.globalRulesDir } : {}),
+      ...(deps.memoryDirFn ? { memoryDirFn: deps.memoryDirFn } : {}),
+    });
+  } catch (e) {
+    logError(`Encoded rule set unreadable, classifying against nothing: ${e.message}`);
+  }
+  let ruleInstances = 0;
+  let suppressedInstances = 0;
+  let classifierErrors = 0;
+  const survivors = [];
+
   for (const pattern of batch) {
     try {
       // Shape gate (act:09184ad7): reject BEFORE routing, so a document echo
@@ -1979,45 +2164,168 @@ export async function scanAuditPatterns(config, deps = {}) {
         continue;
       }
 
-      const routing = await routeFn(pattern, members);
-      if (!routing) { processedSet.add(pattern.hash); continue; }
+      // Classify against the encoded set BEFORE routing. A classifier error
+      // reads as NOVEL — fail open toward filing, never toward suppression.
+      let verdict = { instance_of: null, theme: null, parse_error: false };
+      if (encodedSet.length > 0) {
+        try {
+          verdict = (await classifyFn(pattern, encodedSet)) || verdict;
+        } catch (e) {
+          classifierErrors++;
+          logError(`Rule classification failed (pattern files as novel): ${e.message}`);
+          verdict = { instance_of: null, theme: null, parse_error: true };
+        }
+      }
+      const entry = verdict.instance_of ? encodedSet[verdict.instance_of - 1] : null;
+      if (entry) {
+        ruleInstances++;
+        appendRuleInstance(watchtowerDir, entry.project, {
+          rule: entry.title,
+          rule_hash: entry.hash,
+          rule_kind: entry.kind,
+          rule_file: entry.file || null,
+          rule_scope: entry.scope,
+          project: entry.project,
+          session_id: null,
+          pattern_hash: pattern.hash,
+          pattern_title: pattern.title,
+          source_date: pattern.date,
+          evidence: extractLabeledBlock(pattern.body, EVIDENCE_MARKER) || pattern.body.slice(0, 300),
+          theme: verdict.theme,
+          filed_at: nowIso(),
+          classifier_on: classifierOn,
+          filed_item: !classifierOn,
+        });
+        log(`Slow: pattern is an instance of "${entry.title}"${classifierOn ? ' — counted, not filed' : ' — counted AND filed (classifier off)'}: ${pattern.title.slice(0, 60)}`);
+        if (classifierOn) {
+          suppressedInstances++;
+          processedSet.add(pattern.hash);
+          continue;
+        }
+      }
+      survivors.push({ ...pattern, theme: verdict.theme, instance: entry ? { rule: entry.title, rule_hash: entry.hash } : null });
+    } catch (e) {
+      logError(`Pattern classification failed: ${e.message}`);
+      processedSet.add(pattern.hash);
+    }
+  }
 
-      const existing = listPendingFn({ category: 'pattern-promotion' }).some(qi =>
-        qi.evidence?.pattern_hash === pattern.hash
-      );
+  // Theme collapse before member fan-out (ON only; OFF keeps one item per
+  // pattern exactly as before).
+  const groups = classifierOn
+    ? groupPatternsByTheme(survivors)
+    : survivors.map((p) => ({ key: `self:${p.hash}`, patterns: [p] }));
+
+  for (const group of groups) {
+    const primary = group.patterns[0];
+    const siblings = group.patterns.slice(1);
+    const hashes = group.patterns.map((p) => p.hash);
+    try {
+      const routed = normalizeRouting(await routeFn(primary, members, { siblings }));
+      if (!routed.length) { for (const h of hashes) processedSet.add(h); continue; }
+      const lead = routed[0];
+
+      const existing = listPendingFn({ category: 'pattern-promotion' }).some((qi) => {
+        const ev = (qi && qi.evidence) || {};
+        return hashes.includes(ev.pattern_hash)
+          || (Array.isArray(ev.theme_hashes) && ev.theme_hashes.some((h) => hashes.includes(h)));
+      });
 
       if (!existing) {
+        const related = siblings.length ? ` (+${siblings.length} related)` : '';
         createItemFn({
-          project: routing.project,
-          project_path: routing.project_path,
+          project: lead.project,
+          project_path: lead.project_path,
           filed_by: 'ring2-slow',
           category: 'pattern-promotion',
           urgency: 'low',
-          title: `Pattern for cabinet-${routing.name}: ${pattern.title.slice(0, 50)}`,
-          summary: pattern.body.slice(0, 300),
-          context_anchor: `audit-patterns.md, ${pattern.date}`,
+          title: `Pattern for cabinet-${lead.name}: ${primary.title.slice(0, 50)}${related}`,
+          summary: primary.body.slice(0, 300),
+          context_anchor: `audit-patterns.md, ${primary.date}`,
           evidence: {
-            pattern_hash: pattern.hash,
-            target_member: routing.name,
-            target_project: routing.project,
-            target_project_path: routing.project_path,
-            pattern_title: pattern.title,
-            pattern_text: pattern.body,
-            source_date: pattern.date,
+            pattern_hash: primary.hash,
+            target_member: lead.name,
+            target_members: routed.map((m) => m.name),
+            target_project: lead.project,
+            target_project_path: lead.project_path,
+            pattern_title: primary.title,
+            pattern_text: primary.body,
+            source_date: primary.date,
+            theme: primary.theme || null,
+            theme_key: group.key,
+            theme_hashes: hashes,
+            theme_patterns: group.patterns.map((p) => ({ hash: p.hash, title: p.title, source_date: p.date, text: p.body })),
+            ...(primary.instance ? { instance_of_rule: primary.instance } : {}),
           },
           options: [
-            { value: 'write', label: 'Write to member', description: `Add to cabinet-${routing.name}/patterns-project.md` },
+            { value: 'write', label: 'Write to member', description: `Add to cabinet-${lead.name}/patterns-project.md` },
             { value: 'promote', label: 'Promote upstream', description: 'File as upstream feedback for CC maintainer' },
             { value: 'dismiss', label: 'Dismiss', description: 'Not worth capturing as a pattern' },
           ],
         });
-        log(`Slow: filed pattern-promotion for cabinet-${routing.name}: ${pattern.title.slice(0, 40)}`);
+        log(`Slow: filed pattern-promotion for cabinet-${lead.name}${routed.length > 1 ? ` (+${routed.length - 1} members)` : ''}: ${primary.title.slice(0, 40)}${related}`);
       }
-      processedSet.add(pattern.hash);
+      for (const h of hashes) processedSet.add(h);
     } catch (e) {
       logError(`Pattern routing failed: ${e.message}`);
-      processedSet.add(pattern.hash);
+      for (const h of hashes) processedSet.add(h);
     }
+  }
+
+  // Promotion proposals — the Promote stage finally has a producer (ON only:
+  // OFF must never add an item).
+  let proposalsFiled = 0;
+  if (classifierOn) {
+    for (const [name, projConfig] of Object.entries(config?.projects || {})) {
+      try {
+        const instances = readRuleInstances(watchtowerDir, name);
+        if (!instances.length) continue;
+        const existingProposals = listItemsFn({ category: 'pattern-promotion', project: name })
+          .filter((i) => i && i.evidence && i.evidence.proposal_key);
+        const nowMs = Date.parse(nowIso());
+        for (const p of proposePromotions(instances, { existingProposals, now: Number.isNaN(nowMs) ? Date.now() : nowMs })) {
+          const projectPath = (projConfig && projConfig.path) || projConfig;
+          createItemFn({
+            project: name,
+            project_path: typeof projectPath === 'string' ? projectPath : null,
+            filed_by: 'ring2-slow',
+            category: 'pattern-promotion',
+            urgency: 'normal',
+            title: `Promotion proposal: ${p.rule} — ${p.instance_count} instances in ${PROMOTION_WINDOW_DAYS} days`,
+            summary: `${p.instance_count} observed instances of "${p.rule}" between ${p.window_start.slice(0, 10)} and ${p.window_end.slice(0, 10)}. A rule this often not followed is the Monitor-stage condition (enforcement-pipeline.md §5): the encoding is at the wrong layer. Review the instances and decide whether to move the rule up the compliance stack.`,
+            context_anchor: `state/${RULE_INSTANCE_DIR}/${slugify(name)}.jsonl`,
+            evidence: {
+              proposal_key: p.proposal_key,
+              rule: p.rule,
+              rule_hash: p.rule_hash,
+              rule_file: p.rule_file,
+              rule_kind: p.rule_kind,
+              window_start: p.window_start,
+              window_end: p.window_end,
+              instance_count: p.instance_count,
+              instances: p.instances,
+            },
+            options: [
+              { value: 'promote', label: 'Promote the rule', description: 'File an action to move this rule up the compliance stack (rule → hook → structural)' },
+              { value: 'dismiss', label: 'Dismiss', description: 'The instances do not justify a mechanism yet' },
+            ],
+          });
+          proposalsFiled++;
+          log(`Slow: filed promotion proposal for "${p.rule}" (${p.instance_count} instances)`);
+        }
+      } catch (e) {
+        logError(`Promotion proposal pass failed for ${name}: ${e.message}`);
+      }
+    }
+  }
+
+  // Ambient summary for the briefing line — recomputed every scan, never a
+  // queue item (watchtower-contracts.md "Queue Items Require a Decision").
+  try {
+    const nowMs = Date.parse(nowIso());
+    writeRuleInstanceSummary(watchtowerDir, config, encodedSet, Number.isNaN(nowMs) ? Date.now() : nowMs);
+  } catch (e) {
+    logError(`Rule-instance summary failed: ${e.message}`);
   }
 
   state.audit_patterns_mtime = currentMtime;
@@ -2030,11 +2338,25 @@ export async function scanAuditPatterns(config, deps = {}) {
   state.last_scan_rejected_gap_negating = rejectedGapNegating;
   state.skipped_stale_total = (state.skipped_stale_total || 0) + skippedStale;
   state.last_scan_skipped_stale = skippedStale;
+  state.rule_instances_total = (state.rule_instances_total || 0) + ruleInstances;
+  state.last_scan_rule_instances = ruleInstances;
+  state.suppressed_instances_total = (state.suppressed_instances_total || 0) + suppressedInstances;
+  state.last_scan_suppressed_instances = suppressedInstances;
+  state.classifier_errors_total = (state.classifier_errors_total || 0) + classifierErrors;
+  state.last_scan_classifier_errors = classifierErrors;
+  state.last_scan_themes = groups.length;
+  state.promotion_proposals_total = (state.promotion_proposals_total || 0) + proposalsFiled;
+  state.last_scan_promotion_proposals = proposalsFiled;
+  state.encoded_set_size = encodedSet.length;
   atomicWrite(statePath, JSON.stringify(state, null, 2));
   if (rejectedMalformed > 0) {
     log(`Slow: ${rejectedMalformed} malformed pattern(s) rejected this scan `
       + `(${rejectedGapNegating} for asserting no gap; `
       + `${state.rejected_malformed_total} total since install)`);
+  }
+  if (ruleInstances > 0) {
+    log(`Slow: ${ruleInstances} rule instance(s) counted this scan `
+      + `(${suppressedInstances} not filed; ${state.rule_instances_total} total since install)`);
   }
 }
 
@@ -3036,114 +3358,78 @@ export function runDraftAnnotationSweep(config, deps = {}) {
   return summary;
 }
 
-async function runSlow() {
-  log('Ring 2 slow tier starting');
-  const config = loadConfig();
-  const slowState = { started_at: new Date().toISOString() };
-
-  // 1. Memory hygiene (feature-flagged)
-  if (config.defaults?.memory_hygiene !== false) {
-    try {
-      const memResults = await runMemoryHygiene(config);
-      slowState.memory_hygiene = memResults;
-    } catch (e) {
-      logError(`Memory hygiene failed: ${e.message}`);
-      slowState.memory_hygiene = { error: e.message };
-    }
-  }
-
-  // 2. Cross-project memory synthesis — idle-gated (act:0f961349): re-comparing
-  // memory pairs with no new memories is idle spend. Run on activity/idle-floor.
-  const _slowSig = computeActivitySignature(WATCHTOWER_DIR);
-  const _synGate = shouldRunIdlePass('slow-synthesis', { watchtowerDir: WATCHTOWER_DIR, signature: _slowSig });
-  if (_synGate.run) {
-    try {
-      await crossProjectMemorySynthesis(config);
-    } catch (e) {
-      logError(`Cross-project synthesis failed: ${e.message}`);
-    }
-    markIdlePassRan('slow-synthesis', { watchtowerDir: WATCHTOWER_DIR, signature: _slowSig });
-  } else {
-    log(`Slow: cross-project synthesis skipped (${_synGate.reason})`);
-  }
-
+// The slow tier's step list — ONE introspectable seam (Simplification
+// Project 1, plan A3). Each entry: `name` (stable id), `label` (log prose),
+// optional `flag` (a config.defaults key; `false` disables the step), and
+// `run(config, slowState)`. A step that must record its own failure shape
+// into slowState declares `onError`. Exported so a test can assert what the
+// tier runs without running the model: `runSlow` iterates this list in order,
+// so a step that is not here does not run.
+export const SLOW_STEPS = [
+  // 1. (Memory hygiene ran here until Simplification Project 1, plan A5,
+  // deleted it with the curated memory write path — see the retirement note
+  // above `detectStaleWork`. Its `memory_hygiene` flag is gone from the config
+  // template; a stale key in a consumer's config.json is simply ignored.)
+  // 2. (Cross-project memory synthesis ran here until Simplification Project
+  // 1, plan A3, deleted it — it filed knowledge-extraction items from MEMORY.md
+  // title pairs, a retired category. Its sidecar state/cross-project-synth.json
+  // and the idle-gate key 'slow-synthesis' are residue for plan C4.)
   // 3. Stale work detection (feature-flagged)
-  if (config.defaults?.stale_work_detection !== false) {
-    try {
-      await detectStaleWork(config);
-    } catch (e) {
-      logError(`Stale work detection failed: ${e.message}`);
-    }
-  }
-
+  { name: 'stale-work', label: 'Stale work detection', flag: 'stale_work_detection', run: (config) => detectStaleWork(config) },
   // 4. Thread absorption
-  try {
-    await absorbThreadSessions();
-  } catch (e) {
-    logError(`Thread absorption failed: ${e.message}`);
-  }
-
+  { name: 'thread-absorption', label: 'Thread absorption', run: () => absorbThreadSessions() },
   // 5. Audit pattern detection (feature-flagged)
-  if (config.defaults?.audit_pattern_detection !== false) {
-    try {
-      await scanAuditPatterns(config);
-    } catch (e) {
-      logError(`Audit pattern detection failed: ${e.message}`);
-    }
-  }
-
+  { name: 'audit-patterns', label: 'Audit pattern detection', flag: 'audit_pattern_detection', run: (config) => scanAuditPatterns(config) },
   // 6. Cabinet-roster review (occasional cadence, feature-flagged). Its own
   // weekly gate keeps it from firing every slow run; gating here only lets the
   // operator disable it entirely.
-  if (config.defaults?.roster_review !== false) {
-    try {
-      await reviewCabinetRoster(config);
-    } catch (e) {
-      logError(`Cabinet-roster review failed: ${e.message}`);
-    }
-  }
-
+  { name: 'roster-review', label: 'Cabinet-roster review', flag: 'roster_review', run: (config) => reviewCabinetRoster(config) },
   // 7. Verify-plan backfill scan (feature-flagged; per-project verify gate).
-  if (config.defaults?.verify_backfill !== false) {
-    try {
-      verifyBackfillScan(config);
-    } catch (e) {
-      logError(`Verify-backfill scan failed: ${e.message}`);
-    }
-  }
-
+  { name: 'verify-backfill', label: 'Verify-backfill scan', flag: 'verify_backfill', run: (config) => { verifyBackfillScan(config); } },
   // 8. Recall over-suppression canary (M5, feature-flagged)
-  if (config.defaults?.recall_canary !== false) {
-    try {
-      recallCanary(config);
-    } catch (e) {
-      logError(`Recall canary failed: ${e.message}`);
-    }
-  }
-
+  { name: 'recall-canary', label: 'Recall canary', flag: 'recall_canary', run: (config) => { recallCanary(config); } },
+  // 8b. Retrieval instrument (Simplification Project 1, plan B1, act:8b206268).
+  // Daily, not per tick: the step itself no-ops until
+  // config.defaults.retrieval_instrument_interval_hours (template default 24)
+  // have passed since the last computed_at. Writes state/retrieval-instrument.json
+  // + its transcript-verdict cache; Ring 1 renders, /briefing 3b reads. No flag:
+  // with no registered projects it has nothing to measure and returns skipped.
+  {
+    name: 'retrieval-instrument', label: 'Retrieval instrument',
+    run: (config, slowState) => { slowState.retrieval_instrument = runRetrievalInstrument(config); },
+    onError: (slowState, e) => { slowState.retrieval_instrument = { error: e.message }; },
+  },
   // 9. Draft surfacing-intelligence sweep (freshness + fold annotations)
-  if (config.defaults?.draft_annotations !== false) {
+  {
+    name: 'draft-annotations', label: 'Draft annotation sweep', flag: 'draft_annotations',
+    run: (config, slowState) => { slowState.draft_annotations = runDraftAnnotationSweep(config); },
+    onError: (slowState, e) => { slowState.draft_annotations = { error: e.message }; },
+  },
+  // 10. Consumer hooks
+  { name: 'consumer-hooks', label: 'Consumer hooks', run: (config, slowState) => { slowState.hook_results = runSlowConsumerHooks(config, slowState); } },
+];
+
+export async function runSlow({ steps = SLOW_STEPS, config = null } = {}) {
+  log('Ring 2 slow tier starting');
+  const cfg = config || loadConfig();
+  const slowState = { started_at: new Date().toISOString() };
+
+  for (const step of steps) {
+    if (step.flag && cfg.defaults?.[step.flag] === false) continue;
     try {
-      slowState.draft_annotations = runDraftAnnotationSweep(config);
+      await step.run(cfg, slowState);
     } catch (e) {
-      logError(`Draft annotation sweep failed: ${e.message}`);
-      slowState.draft_annotations = { error: e.message };
+      logError(`${step.label} failed: ${e.message}`);
+      if (step.onError) step.onError(slowState, e);
     }
   }
 
-  // 10. Consumer hooks
-  try {
-    const hookResults = runSlowConsumerHooks(config, slowState);
-    slowState.hook_results = hookResults;
-  } catch (e) {
-    logError(`Consumer hooks failed: ${e.message}`);
-  }
-
-  // 8. Trigger Ring 1 re-eval
+  // Trigger Ring 1 re-eval
   triggerRing1Reeval();
 
   slowState.completed_at = new Date().toISOString();
   log('Ring 2 slow tier complete');
+  return slowState;
 }
 
 // ===================================================================
@@ -3152,6 +3438,10 @@ async function runSlow() {
 
 async function main() {
   const args = process.argv.slice(2);
+  if (args[0] === '--replay-rule-classifier') {
+    await runRuleClassifierReplay(args.slice(1));
+    return;
+  }
   const tier = args.find(a => a === '--fast' || a === '--slow');
   const startTime = Date.now();
   let status = 'success';
@@ -3159,7 +3449,7 @@ async function main() {
   let tierName = 'unknown';
 
   if (!tier) {
-    console.error('Usage: watchtower-ring2.mjs --fast | --slow');
+    console.error('Usage: watchtower-ring2.mjs --fast | --slow | --replay-rule-classifier [--project P] [--since D] [--resolved-on D] [--limit N] [--out FILE]');
     process.exit(1);
   }
 

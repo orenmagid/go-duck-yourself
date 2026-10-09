@@ -32,7 +32,7 @@ import {
   atomicWrite, loadConfig, slugify, log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, getItem, loadBetterSqlite3,
   writeProjectStatePreservingRing3, flushFeedbackOutbox, resolveCcSourceRepo,
-  authoredClaudeDirs, claudeChurnIsDisposable, checkMemoryReachability,
+  authoredClaudeDirs, claudeChurnIsDisposable,
   autoReconcileItem,
 } from './watchtower-lib.mjs';
 // listItems for the dismissal-aware worktree dedup (act:6dcb8015) — the
@@ -41,6 +41,10 @@ import {
 import { listItems } from './watchtower-queue.mjs';
 import { runRoutinePass } from './watchtower-routines.mjs';
 import { analyze, resolveRoots } from './watchtower-sync.mjs';
+// The recall index refresh (Simplification Project 1, plan B3, act:79be8765):
+// one mechanical, incremental refresh per registered project per tick, so the
+// first /recall of a session is fast. Rebuild only when the index is missing.
+import { refreshIndex as refreshRecallIndex } from './watchtower-recall.mjs';
 
 const WATCHTOWER_DIR = getWatchtowerDir();
 
@@ -586,17 +590,11 @@ function collectPibState(projectPath) {
 // Active session detection
 // ---------------------------------------------------------------------------
 
-function checkMemoryIntegrity(projectPath) {
-  const encoded = projectPath.replace(/\//g, '-');
-  const memDir = join(CLAUDE_HOME, 'projects', encoded, 'memory');
-  // Reachability, not substring: a file is an orphan only when neither a
-  // direct index line (MEMORY.md or MEMORY-archive.md) nor a region
-  // pointer's glob covers it — the same rule scripts/validate-memory.mjs
-  // enforces. The old filename-substring scan predated region pointers and
-  // the archive index and flagged 203 false orphans while the validator
-  // passed green (act:49cb1c27).
-  return checkMemoryReachability(memDir);
-}
+// (Ring 1's memory-integrity check — the per-tick reachability scan that
+// rendered "N orphaned memory file(s)" into the attention line — was deleted
+// 2026-09-29 by Simplification Project 1, plan A5 (act:7c1ce89a). The memory
+// index holds standing facts only; a file with no index line is not an orphan,
+// it is the recall corpus. See cabinet/memory-contract.md.)
 
 function detectActiveSessions(projectPath) {
   // Claude Code stores session transcripts as .jsonl files under
@@ -1748,15 +1746,6 @@ function assembleSummary(projectStates, config, extraAttention = []) {
       if (proposalCount > 0) parts.push(`${proposalCount} pending extraction proposal(s) in proposals/`);
       attention.unshift(`⚠ ${ps.name}: ${parts.join(' + ')} — TRIAGE AT ARRIVAL (file to pib-db or decline, then stamp + move to feedback/resolved/)`);
     }
-    if (ps.memoryIntegrity) {
-      const mi = ps.memoryIntegrity;
-      if (mi.orphans.length > 0) {
-        attention.push(`${ps.name}: ${mi.orphans.length} orphaned memory file(s) — not reachable from MEMORY.md (no index line or region pointer)`);
-      }
-      if (mi.missing.length > 0) {
-        attention.push(`${ps.name}: ${mi.missing.length} broken memory reference(s) — indexed but file missing`);
-      }
-    }
   }
   // pib collection errors aggregate to ONE line: they are almost always a
   // single system-level fault (loader/ABI breakage hits every project at
@@ -1922,6 +1911,76 @@ function readRosterMetrics() {
   try {
     return JSON.parse(readFileSync(path, 'utf8')).metrics || {};
   } catch { return {}; }
+}
+
+// readRetrievalInstrument — the Ring 2 slow retrieval-instrument sidecar
+// (Simplification Project 1, plan B1, act:8b206268): is memory REACHED? The
+// same relationship again — Ring 2 measures once a day into
+// state/retrieval-instrument.json, Ring 1 renders each project's numbers into
+// Standing Issues. Absent or corrupt yields {} — a project with no entry
+// renders nothing (no "0 / 0 / 0%" standing in for "never measured").
+function readRetrievalInstrument() {
+  const path = join(WATCHTOWER_DIR, 'state', 'retrieval-instrument.json');
+  if (!existsSync(path)) return {};
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')).projects || {};
+  } catch { return {}; }
+}
+
+// renderRetrievalInstrumentEntries — ONE Standing Issues line carrying the
+// instrument's three numbers for a measured project (files read without the
+// verb, split indexed/unindexed; /recall invocations; hit rate), plus the two
+// counts that qualify them (sessions reading of sessions scanned; sessions
+// excluded for writes — under the one-writer decision those are the sessions
+// that captured something). Rendered whenever the project was measured: the
+// plan's decision (e) puts the numbers in front of the operator every day of
+// month one so thresholds are set against something seen, not furniture that
+// was tuned out. No rate is fabricated: zero invocations reads "no rate".
+// Pure (no I/O) for the hermetic suite.
+export function renderRetrievalInstrumentEntries(r) {
+  if (!r || typeof r !== 'object') return [];
+  const rate = (r.recall_invocations > 0 && typeof r.recall_hit_rate === 'number')
+    ? `${Math.round(r.recall_hit_rate * 100)}% hit`
+    : 'no rate yet';
+  const days = r.window_days || 30;
+  return [
+    `memory retrieval (${days}d): ${r.indexed_files_read || 0} indexed + ${r.unindexed_files_read || 0} unindexed file(s) read `
+    + `by ${r.sessions_reading || 0} of ${r.sessions_scanned || 0} session(s), ${r.sessions_excluded_for_writes || 0} excluded for writes; `
+    + `/recall ${r.recall_invocations || 0} invocation(s), ${rate}`
+    + (r.autodream_modified_files ? `; auto-dream touched ${r.autodream_modified_files} file(s)` : '')
+    + ` (retrieval-instrument.json)`,
+  ];
+}
+
+// refreshRecallIndexes — the Ring 1 tick step for the recall index
+// (Simplification Project 1, plan B3, act:79be8765). One bounded,
+// mechanical refresh per registered project; each wrapped so a failure on
+// one project (a locked index, an unresolvable better-sqlite3) logs and
+// CONTINUES to the next — the recordTriggerCheck precedent: a ring that dies
+// on one project's index stops refreshing every remaining project. No model
+// call. The refresh is injectable so the hermetic test can prove the
+// continue-on-throw without touching disk.
+export function refreshRecallIndexes(projects, {
+  refresh = refreshRecallIndex, log: logFn = log, logError: logErrorFn = logError,
+  watchtowerDir = WATCHTOWER_DIR,
+} = {}) {
+  const refreshed = [];
+  const failed = [];
+  for (const [name, entry] of Object.entries(projects || {})) {
+    const projectPath = entry?.path || entry;
+    try {
+      const r = refresh(name, { projectPath, watchtowerDir });
+      refreshed.push(name);
+      if (r && r.built) logFn(`recall index built for ${name} (${r.docs ?? '?'} docs)`);
+      else if (r && r.refresh && (r.refresh.added || r.refresh.updated || r.refresh.removed)) {
+        logFn(`recall index ${name}: +${r.refresh.added} ~${r.refresh.updated} -${r.refresh.removed}`);
+      }
+    } catch (e) {
+      failed.push({ name, error: e.message });
+      logErrorFn(`recall index refresh failed for ${name}: ${e.message} — continuing`);
+    }
+  }
+  return { refreshed, failed };
 }
 
 // Cap on skill names listed inline, matching FLAGGED_RENDER_CAP's discipline:
@@ -2098,6 +2157,10 @@ function assembleProjectState(ps) {
   // items: a count describes a condition, it doesn't ask the operator to
   // decide anything. Rendered on CHANGE only; see renderRosterEntries.
   for (const line of renderRosterEntries(ps.roster)) issues.push(line);
+  // Retrieval instrument (Simplification Project 1, plan B1) — ambient state:
+  // the three memory-retrieval numbers for a measured project, nothing for an
+  // unmeasured one. /briefing 3b reads the same sidecar.
+  for (const line of renderRetrievalInstrumentEntries(ps.retrieval)) issues.push(line);
   // Worktree scan coverage (act:6dcb8015) — ambient state, so it lives here
   // rather than in the queue. A partial warning reads as a complete answer, so
   // "no worktree warnings" must be distinguishable from "the scan never ran".
@@ -2193,6 +2256,20 @@ function main() {
     // Ring 2's weekly cabinet-roster measurement, rendered by Ring 1 (which
     // owns the per-project state file) — the recall-canary relationship.
     const rosterMetrics = readRosterMetrics();
+    // Ring 2's daily retrieval instrument, rendered by Ring 1 — same shape.
+    const retrievalProjects = readRetrievalInstrument();
+
+    // Recall index refresh — per project, mechanical, continue-on-failure
+    // (plan B3). Runs before state collection so a slow first build never
+    // delays the summary write past the tick's budget by more than itself.
+    try {
+      const rr = refreshRecallIndexes(projects);
+      if (rr.failed.length > 0) {
+        logError(`recall index: ${rr.refreshed.length} refreshed, ${rr.failed.length} failed (${rr.failed.map((f) => f.name).join(', ')})`);
+      }
+    } catch (e) {
+      logError(`recall index refresh pass failed: ${e.message}`);
+    }
 
     // Branch-diverged reconciliation inputs, resolved ONCE per tick: the
     // exclusion matcher (config-driven) and one pending-items snapshot —
@@ -2221,9 +2298,9 @@ function main() {
         activeSessions: detectActiveSessions(projectPath),
         deployment: detectDeployment(projectPath),
         ccFeedbackArrival: checkCcFeedbackArrival(projectPath),
-        memoryIntegrity: checkMemoryIntegrity(projectPath),
         recall: recallCanaryProjects[name] || null,
         roster: rosterMetrics[name] || null,
+        retrieval: retrievalProjects[name] || null,
         divergedBranches: [],
         hookResults: [],
       };

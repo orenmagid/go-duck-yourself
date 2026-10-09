@@ -44,13 +44,21 @@ const MAX_PATTERN_LINES = 5;
 function parseArgs() {
   const args = process.argv.slice(2);
   let projectPath = null;
+  let sessionId = null;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--project-path' && args[i + 1]) {
       projectPath = resolve(args[i + 1]);
       i++;
+    } else if (args[i] === '--session-id' && args[i + 1]) {
+      // The hook parses the id off its stdin payload (CLAUDE_SESSION_ID is
+      // NOT set in the Bash tool's environment); the acknowledgment line
+      // carries it so /recall can pass --session-id and the recall log joins
+      // to this transcript (Simplification Project 1, plan B2, default 26).
+      sessionId = /^[A-Za-z0-9._-]{1,128}$/.test(args[i + 1]) ? args[i + 1] : null;
+      i++;
     }
   }
-  return { projectPath };
+  return { projectPath, sessionId };
 }
 
 // --- Safe file readers ---
@@ -177,11 +185,10 @@ function reverifyGitAttention(summaryText, sidecar, exec = gitRunner) {
 
 function countQueueItems() {
   const queueDir = join(WATCHTOWER_DIR, 'queue', 'items');
-  if (!existsSync(queueDir)) return { total: 0, urgent: 0, byCategory: {}, draftsReady: 0 };
+  if (!existsSync(queueDir)) return { total: 0, urgent: 0, byCategory: {} };
 
   let total = 0;
   let urgent = 0;
-  let draftsReady = 0;
   const byCategory = {};
 
   try {
@@ -194,25 +201,24 @@ function countQueueItems() {
       if (item.urgency === 'urgent') urgent++;
       const cat = item.category || 'uncategorized';
       byCategory[cat] = (byCategory[cat] || 0) + 1;
-      if (cat === 'knowledge-extraction' && item.draft_artifact) draftsReady++;
     }
   } catch {
     // Queue unreadable — degrade gracefully
   }
 
-  return { total, urgent, byCategory, draftsReady };
+  return { total, urgent, byCategory };
 }
 
 // A bare count is a scary number; a category breakdown is a work plan.
-// "33 knowledge-extraction (drafts ready), 9 worktree-unmerged, 6 routing-decision"
-function renderCategoryBreakdown(byCategory, draftsReady) {
-  const parts = Object.entries(byCategory)
+// "9 worktree-unmerged, 6 routing-decision, 2 advisor-finding"
+// (The "(drafts ready)" annotation on knowledge-extraction was removed by
+// Simplification Project 1, plan A6: the category is retired and nothing
+// fills it, so the injection must not advertise it.)
+function renderCategoryBreakdown(byCategory) {
+  return Object.entries(byCategory)
     .sort((a, b) => b[1] - a[1])
-    .map(([cat, n]) => {
-      const annotation = cat === 'knowledge-extraction' && draftsReady > 0 ? ' (drafts ready)' : '';
-      return `${n} ${cat}${annotation}`;
-    });
-  return parts.join(', ');
+    .map(([cat, n]) => `${n} ${cat}`)
+    .join(', ');
 }
 
 // --- Thread / focal zoom helpers ---
@@ -386,11 +392,19 @@ function isMainCheckout(projectPath) {
 // confirmation the context loaded (no-silent-failures), replacing the
 // signal orient's briefing used to give. Prompt-layer convention only:
 // nothing is blocked if the line is skipped.
-function renderSessionAckSection() {
-  return [
+function renderSessionAckSection(sessionId = null) {
+  const lines = [
     '--- Session-Start Acknowledgment ---',
     'Open your first reply of this session with ONE plain-English line confirming this watchtower context loaded: where the operator left off, what needs attention in this project, and the inbox count — e.g. "Watchtower: picked up where you left off (merged the auth fix to main, 2h ago); 1 flagged action here; inbox 12 pending." If the state below carries a staleness or health warning, lead with that warning instead. A frontier-model warning above this block stays first. One line, then proceed with the operator\'s request. Skip it if the conversation already has replies (context re-injected on resume).',
-  ].join('\n');
+  ];
+  // The session id rides here because nothing else exposes it to the session
+  // (CLAUDE_SESSION_ID is not set in Bash). /recall passes it as --session-id
+  // so its recall-log line joins to this transcript; never echo it to the
+  // operator (Simplification Project 1, plan B2, decision default 26).
+  if (sessionId) {
+    lines.push(`Session id: ${sessionId} — pass it to /recall as --session-id; do not print it to the operator.`);
+  }
+  return lines.join('\n');
 }
 
 function renderMissedRoutineSection(pendingItems, projectName, projectPath) {
@@ -428,7 +442,7 @@ function renderRing3FailedSection() {
 // --- Main ---
 
 function main() {
-  const { projectPath } = parseArgs();
+  const { projectPath, sessionId } = parseArgs();
 
   // Step 1: Read config.json. No config → empty output (hook exits silently).
   const configPath = join(WATCHTOWER_DIR, 'config.json');
@@ -463,7 +477,7 @@ function main() {
   // visible-confirmation contract sits at the top of the injection
   // (act:058d00f0). The shell hook prepends any frontier-model warning above
   // the builder output, so that warning still comes first overall.
-  sections.push({ key: 'session-ack', content: renderSessionAckSection(), priority: PRIORITY_NEVER });
+  sections.push({ key: 'session-ack', content: renderSessionAckSection(sessionId), priority: PRIORITY_NEVER });
 
   // Step 2: Read state/summary.md
   const summaryPath = join(WATCHTOWER_DIR, 'state', 'summary.md');
@@ -577,9 +591,9 @@ function main() {
   }
 
   // Step 6: Inbox summary — one number, decomposed by category
-  const { total, urgent, byCategory, draftsReady } = countQueueItems();
+  const { total, urgent, byCategory } = countQueueItems();
   if (total > 0) {
-    const breakdown = renderCategoryBreakdown(byCategory, draftsReady);
+    const breakdown = renderCategoryBreakdown(byCategory);
     const headline = urgent > 0
       ? `⚡ ${total} pending (${urgent} urgent) — run /inbox`
       : `${total} pending — run /inbox when ready`;

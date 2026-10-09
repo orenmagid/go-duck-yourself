@@ -73,7 +73,10 @@ export function autoReconcileItem(id, { resolution, notes, actor = 'ring1', evid
 //
 // The Detector Symmetry contract (watchtower-contracts.md): every ring-filed
 // inbox category declares its RECONCILER (the mechanical per-tick retraction
-// + its filing exclusions) or an explicit EXEMPT rationale — exactly one.
+// + its filing exclusions) or an explicit EXEMPT rationale — exactly one —
+// or, once its producers are deleted, RETIRED: { date, reason } (Simplification
+// Project 1, plan A4). A retired entry stays so historical items remain
+// readable, and the structural test asserts it has NO live filing site.
 // The structural test (templates/scripts/__tests__/detector-registry.test.mjs)
 // scans the `category:` literals at createItem filing sites across ring1,
 // ring2, and ring3-close and fails the suite when a filed category is
@@ -131,9 +134,15 @@ export const INBOX_DETECTOR_REGISTRY = {
       + 'coverage debt cleared".',
   },
   'knowledge-extraction': {
-    exempt: 'pure extraction — no world-state to re-check (the contract\'s canonical '
-      + 'no-possible-retraction case). Filed by ring2 slow and ring3; deduped at filing '
-      + 'across the five recall corpora.',
+    retired: {
+      date: '2026-09-29',
+      reason: 'Project 1 (prj:a4c6052b): producers deleted (Ring 3 Phase 2d, the Phase 2g '
+        + 'durable arm, Ring 2 cross-project synthesis); the ~1,180 pending + expired items '
+        + 'are archived to runtime state by plan C1 and closed resolution_type \'archived\'; '
+        + 'see .claude/plans/simplification-1-memory-retrieval.md. Was exempt: pure '
+        + 'extraction — no world-state to re-check. The entry stays so historical items '
+        + 'remain readable and the census can prove nothing files it.',
+    },
   },
   'methodology-capture': {
     exempt: 'pure extraction (session methodology) — nothing mechanical to re-verify.',
@@ -167,21 +176,20 @@ export const INBOX_DETECTOR_REGISTRY = {
       + 'reconciler: the referenced deferred action closed.',
   },
   'watchtower-health': {
-    reconciler: 'retractClearedMemoryBudgetItems (ring2 slow, act:ea23b3a5): the '
-      + 'memory-budget alarm retracts on the SAME pass that measures it — '
-      + 'runMemoryHygiene already shells every project\'s validate-memory (exit 0 = '
-      + 'pass) and already computes passProjects, so the retraction condition is in '
-      + 'hand. Deliberately NOT in Ring 1: a second memory-health producer is forbidden '
-      + 'by name in this doc, and at a 30-minute throttle against ring2\'s 30-minute '
-      + 'cadence it would buy zero freshness. Fails toward KEEPING — only a project '
-      + 'positively classified `pass` retracts; any nonzero exit maps to `violations`. '
-      + 'The selector matches BOTH the new evidence.debt_class and the legacy '
-      + '{violations, streak} title shape, because every item on disk when this shipped '
-      + 'carried the latter. Filing side: ONE accumulating item per project, keyed by '
-      + 'CALENDAR DAY (a per-run key would count ~48 cron ticks a day), appended via '
-      + 'annotateItemEvidence so filed_at is never bumped. Other watchtower-health '
-      + 'filings (stale/failing ring windows) remain exempt — recovery is visible in the '
-      + 'ring health sidecars.',
+    retired: {
+      date: '2026-09-29',
+      reason: 'Project 1 (prj:a4c6052b), plan A5 / decision default 20: memory-budget '
+        + 'violations retired with the cap machinery. Its ONLY filing site was the '
+        + 'memory-budget standing debt inside Ring 2 slow\'s runMemoryHygiene '
+        + '(surfacePersistentViolations, act:ea23b3a5), and its reconciler was '
+        + 'retractClearedMemoryBudgetItems on the same pass — both deleted with '
+        + 'validate-memory.mjs, the validator they shelled. The platform enforces its '
+        + 'own index cap and reminds the session; no CC machinery measures it now. '
+        + 'The entry stays so historical items render and the census can prove '
+        + 'nothing files it. (The stale/failing ring-window filings this category once '
+        + 'covered had no live producer at retirement either.) See '
+        + '.claude/plans/simplification-1-memory-retrieval.md.',
+    },
   },
   // ring4-filed (in the census since act:ea23b3a5; ring4 was outside it before)
   'doc-drift': {
@@ -223,14 +231,15 @@ export const INBOX_DETECTOR_REGISTRY = {
   },
   // ring3-filed, ring1-reconciled (act:5182beda, N3/Reach 1 of grp:retro-remeaning)
   'pending-relation': {
-    reconciler: 'autoReconcilePendingRelations (ring1): a proposal that two still-PENDING '
-      + 'inbox items relate (pairs_with/answers/contradicts) retracts when EITHER cited '
-      + 'side (evidence.from_id / evidence.to_id) leaves pending — a relation between two '
-      + 'open questions no longer applies once one resolves. Fails toward KEEPING: a cited '
-      + 'id that no longer resolves via getItem is ambiguous, not evidence of resolution. '
-      + 'Filing exclusion: dedup by evidence.relation_key (sorted ids + relation verb) '
-      + 'across ALL statuses, UNWINDOWED (act:bcb7edd4 tightening) — a dismissed relation '
-      + 'never refiles, ever; never a refile loop.',
+    retired: {
+      date: '2026-09-29',
+      reason: 'Project 1 (prj:a4c6052b), plan A1: its ONLY producer was Reach 1 '
+        + '(fileRelationProposal inside Phase 2d), deleted with the extractor. '
+        + 'autoReconcilePendingRelations (ring1) keeps running over the HISTORICAL items '
+        + '— it retracts when either cited side leaves pending, fails toward keeping — but '
+        + 'no new proposal can be filed; the filing-side dedup (evidence.relation_key, all '
+        + 'statuses, unwindowed) went with the producer.',
+    },
   },
   // ring3-filed, ring1-reconciled (act:bcb7edd4, Reach 2 of grp:retro-remeaning)
   'significance-change': {
@@ -494,6 +503,35 @@ export function appendThreadRecolor(threadsDir, threadSlug, entry) {
 
 export function apiUsageLedgerPath(watchtowerDir) {
   return join(watchtowerDir || getWatchtowerDir(), 'state', 'api-usage.jsonl');
+}
+
+// The model the rings call (ring2 exports the same literal as CLAUDE_MODEL;
+// API_PRICING below is keyed on it). Shared here so a non-ring caller — the
+// recall probe (plan B4) — names the same model the ledger prices.
+export const WATCHTOWER_CLAUDE_MODEL = 'claude-sonnet-4-6';
+
+// loadAnthropicClient — the SDK client the rings build, as a shared helper
+// (Simplification Project 1, plan B4, act:79be8765). ESM import() ignores
+// NODE_PATH, so the SDK is resolved through createRequire — the global
+// install (`npm install -g @anthropic-ai/sdk`) is what the launchd/cron env
+// sees. Throws with the install hint when the SDK or the key is missing; the
+// rings keep their private copies of this shape until Project 4 consolidates
+// them (ring2:101, ring3-close:168).
+export function loadAnthropicClient({ requireKey = true } = {}) {
+  let Anthropic;
+  try {
+    const mod = require('@anthropic-ai/sdk');
+    Anthropic = mod.default || mod.Anthropic || mod;
+  } catch (e) {
+    throw new Error(
+      'the Anthropic SDK is required (@anthropic-ai/sdk). Install it: npm install -g @anthropic-ai/sdk\n'
+      + `Import error: ${e.message}`
+    );
+  }
+  if (requireKey && !process.env.ANTHROPIC_API_KEY) {
+    throw new Error('ANTHROPIC_API_KEY environment variable is not set.');
+  }
+  return new Anthropic();
 }
 
 // $/token estimate (Anthropic Console authoritative). Sonnet 4.6: $3/M in, $15/M out.
@@ -1545,87 +1583,14 @@ export function loadBetterSqlite3(projectPath) {
 }
 
 // ---------------------------------------------------------------------------
-// Memory reachability — mirrors scripts/validate-memory.mjs, the
-// authoritative owner of the rule (memory module; contract in
-// cabinet/memory-lifecycle-contract.md). A memory file is reachable when a
-// direct index line references it (MEMORY.md or the linked
-// MEMORY-archive.md cold tier) OR a region pointer's glob covers it.
-// Ring 1's memory-integrity check must apply the SAME rule as the
-// validator or the two contradict each other (act:49cb1c27: the old
-// filename-substring scan flagged 203 false orphans — 172 region-covered
-// + 31 archive-indexed — while the validator passed green). The watchtower
-// runtime cannot import the validator (validate-memory.mjs is not part of
-// the runtime script set), so these helpers are a deliberate mirror, kept
-// in lockstep by the parity test in __tests__/memory-reachability.test.mjs.
+// (The memory-reachability mirror — parseMemoryIndex, parseMemoryRegionPointers,
+// memoryGlobToRegex, isMemoryFileReachable, checkMemoryReachability — lived
+// here from act:49cb1c27 until 2026-09-29. Simplification Project 1, plan A5
+// (act:7c1ce89a) retired it with the validator it mirrored: the memory index
+// is the platform's, holding standing facts only, and "reachable from
+// MEMORY.md" is no longer a property anything enforces. Everything else is
+// recalled on cue; see cabinet/memory-contract.md.)
 // ---------------------------------------------------------------------------
-
-// Index files are not memory entries — never counted as orphans or missing.
-const NON_MEMORY_INDEX_FILES = new Set(['MEMORY.md', 'MEMORY-archive.md', 'edges.json', '.DS_Store']);
-
-// Extract all `.md` filenames directly referenced from an index file.
-// Both index formats: `- **decisions.md** (56)` and `- [Title](file.md)`.
-export function parseMemoryIndex(indexText) {
-  const refs = new Set();
-  for (const m of indexText.matchAll(/\*\*([a-z0-9_.-]+\.md)\*\*/gi)) refs.add(m[1]);
-  for (const m of indexText.matchAll(/\]\(([a-z0-9_.-]+\.md)\)/gi)) refs.add(m[1]);
-  return refs;
-}
-
-// Parse region pointers: `- region \`lesson_*.md\` → …` lines whose
-// backtick-quoted glob makes a whole class of files reachable.
-export function parseMemoryRegionPointers(indexText) {
-  const pointers = [];
-  for (const m of indexText.matchAll(/^[\s>]*-\s*region\s+`([^`]+)`/gim)) {
-    pointers.push(m[1].trim());
-  }
-  return pointers;
-}
-
-// Convert a region-pointer glob to an anchored RegExp over a bare filename.
-export function memoryGlobToRegex(glob) {
-  const escaped = glob
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*/g, '.*')
-    .replace(/\?/g, '.');
-  return new RegExp(`^${escaped}$`);
-}
-
-export function isMemoryFileReachable(name, referenced, regionRegexes) {
-  if (referenced.has(name)) return true;
-  return regionRegexes.some((re) => re.test(name));
-}
-
-// Full check over one memory dir. Returns null when healthy (or when there
-// is nothing to check / the check itself fails — fail-open, matching the
-// prior checkMemoryIntegrity contract), else { orphans, missing }.
-export function checkMemoryReachability(memDir) {
-  const indexPath = join(memDir, 'MEMORY.md');
-  if (!existsSync(memDir) || !existsSync(indexPath)) return null;
-
-  try {
-    const indexText = readFileSync(indexPath, 'utf8');
-    const archivePath = join(memDir, 'MEMORY-archive.md');
-    const archiveText = existsSync(archivePath) ? readFileSync(archivePath, 'utf8') : '';
-
-    const referenced = parseMemoryIndex(indexText);
-    for (const ref of parseMemoryIndex(archiveText)) referenced.add(ref);
-    const regionRegexes = [
-      ...parseMemoryRegionPointers(indexText),
-      ...parseMemoryRegionPointers(archiveText),
-    ].map(memoryGlobToRegex);
-
-    const files = readdirSync(memDir)
-      .filter((f) => f.endsWith('.md') && !NON_MEMORY_INDEX_FILES.has(f));
-    const orphans = files.filter((f) => !isMemoryFileReachable(f, referenced, regionRegexes));
-    const missing = [...referenced]
-      .filter((f) => !NON_MEMORY_INDEX_FILES.has(f) && !existsSync(join(memDir, f)));
-
-    if (orphans.length === 0 && missing.length === 0) return null;
-    return { orphans, missing };
-  } catch {
-    return null;
-  }
-}
 
 // ---------------------------------------------------------------------------
 // log / logError — structured logging with ring name and ISO timestamp

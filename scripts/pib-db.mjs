@@ -12,6 +12,7 @@
 //   node scripts/pib-db.mjs list-actions --unfiled      # Actions with NO container
 //   node scripts/pib-db.mjs update-action act:abc --status in-progress
 //   node scripts/pib-db.mjs complete-action act:abc123
+//   node scripts/pib-db.mjs write-breadcrumb act:abc123 --summary "<what you verified>"
 //   node scripts/pib-db.mjs create-project "My Area"                          # area (default): never completes
 //   node scripts/pib-db.mjs create-project "Ship X" --kind project --notes "done when …" --parent prj:abc
 //                                                     # …and the AREA it serves
@@ -43,7 +44,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import * as lib from './pib-db-lib.mjs';
-import { resolvePibDbPath } from './pib-db-path.mjs';
+import { resolvePibDbPath, resolveVerificationDir } from './pib-db-path.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_PATH = resolvePibDbPath();
@@ -278,6 +279,18 @@ switch (command) {
   case 'complete-action':
     printResult(lib.completeAction(getDb(), { fid: args[0] }));
     break;
+  case 'write-breadcrumb': {
+    // The path is COMPUTED from the fid and resolved to the MAIN checkout —
+    // the spelling the completion gate reads (act:c17510a8). The caller types
+    // the fid and the summary, never the filename.
+    const { flags, positional } = parseFlags(args);
+    printResult(lib.writeBreadcrumb(getDb(), {
+      fid: positional[0],
+      summary: typeof flags.summary === 'string' ? flags.summary : undefined,
+      verifyDir: resolveVerificationDir(),
+    }));
+    break;
+  }
   case 'defer-with-trigger': {
     const { flags, positional } = parseFlags(args);
     printResult(lib.deferWithTrigger(getDb(), {
@@ -452,7 +465,10 @@ switch (command) {
 Commands:
   init                              Create/migrate the database
   query "SQL"                       Run a SQL query
-  create-action "text" [--projectFid X] [--due X] [--notes X]  Create an action
+  create-action "text" [--projectFid X] [--due X] [--notes X] [--needs X]
+                                    Create an action. --needs types the work at
+                                    filing time, when the type is actually known
+                                    (see update-action for the vocabulary).
   get-action <fid>                  Print one action (read-only; exit 1 if absent)
   list-actions [--status X] [--project X] [--scope direct|rolled-up] [--unfiled]
                                     List actions (default: open). --scope rolled-up
@@ -461,9 +477,19 @@ Commands:
                                     the ones no container view can reach. It is a bare
                                     switch and cannot be combined with --project
                                     (the pair is refused, never silently empty).
-  update-action <fid> [--status X] [--text X] [--tags X] [--notes X] [--projectFid prj:X]
+  update-action <fid> [--status X] [--text X] [--tags X] [--notes X] [--projectFid prj:X] [--needs X]
                                     (--projectFid reparents; the target project must exist)
+                                    --needs is a CLOSED vocabulary — one of
+                                    code-fix | qa-verify | decision | operator | event-gated
+                                    (or null to clear). Anything else is refused.
   complete-action <fid>             Mark action complete (status=done)
+  write-breadcrumb <fid> --summary "<what you verified>"
+                                    Write the verification breadcrumb the completion
+                                    gate reads, at the path computed from the fid
+                                    (MAIN checkout's .claude/verification/<fid>.json —
+                                    never type it). Without --summary it records
+                                    ac_verified:false and the gate still refuses.
+                                    Refuses an unknown fid and a done action
   defer-with-trigger <fid> --trigger "<text>" [--cascade]
                                     Defer with a return condition
   list-triggered [--include-done] [--include-released]

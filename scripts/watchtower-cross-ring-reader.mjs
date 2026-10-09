@@ -118,8 +118,13 @@ export const DISCARDED_TYPES = ['stale', 'noise'];
 // windows naturally). Machine acts are structurally EXCLUDED from
 // ENGAGED_TYPES — cron activity masquerading as operator engagement would
 // silently defeat the not-consumed detector (the assessment's worked_recent
-// skips this bucket for the same reason).
-export const MACHINE_TYPES = ['auto-reconciled'];
+// skips this bucket for the same reason). 'archived' (Simplification
+// Project 1, plan A6/C1): the one-time migration that closes every pending
+// and expired knowledge-extraction item with resolution_type 'archived' and
+// a resolution naming the archive path — ~1,180 closures that are a
+// script's act, not the operator keeping them; counting them as engaged
+// would inflate the keep ratio by the size of the whole migration.
+export const MACHINE_TYPES = ['auto-reconciled', 'archived'];
 
 // bucketResolution — THE single resolution_type → bucket classifier. Returns
 // 'engaged' | 'discarded' | 'machine' | 'other' ('other' = null/untyped or an

@@ -57,10 +57,18 @@ const WATCHTOWER_DIR = process.env.WATCHTOWER_DIR
 
 export const NARRATIVE_CORPUS_SCHEMA_VERSION = 1;
 
-// Decisions live in the inbox under this category (Ring 3's knowledge
-// extraction files them here). Constraints/lessons/preferences ride the same
+// Decisions lived in the inbox under this category (Ring 3's knowledge
+// extraction filed them here). Constraints/lessons/preferences rode the same
 // category, distinguished by evidence.type — the consumer leads with
 // decision+constraint for the "what still constrains this" answer.
+//
+// RETIRED SUBSTRATE (Simplification Project 1, prj:a4c6052b, plan A6,
+// 2026-09-29): the category's producers are deleted and its items are
+// archived to runtime state (`state/recall/<slug>/archive/extraction-drafts/`)
+// by plan C1, closed with resolution_type 'archived'. This reader still
+// works over the HISTORICAL items (statuses below include resolved), but
+// nothing new arrives. Plan 12 (act:a2efc0ce, deferred) would read the
+// recall retriever + the per-session records instead of this queue.
 const DECISION_CATEGORY = 'knowledge-extraction';
 
 // A resolved knowledge-extraction item with this resolution_type WAS written

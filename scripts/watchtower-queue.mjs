@@ -333,6 +333,44 @@ export function verifyMergedAncestry(projectPath, mergedCommit) {
   }
 }
 
+/**
+ * Does `sha` name a real commit in the project repo? (act:b9986c1b)
+ *
+ * Sibling of verifyMergedAncestry with the same three-state honesty: a
+ * sha-shaped string is necessary, git is the proof. Four times a verdict or
+ * handoff carried a fabricated hash — a short sha padded to 40 hex to satisfy
+ * the shape check, twice by a session that had just filed the same failure as
+ * a lesson. Shape checks cannot see that; `rev-parse --verify` can, and it
+ * also expands a real short sha to the full form so the stored verdict is
+ * unambiguous.
+ *
+ *   verified     — the sha resolves; `sha` carries the FULL form
+ *   refuted      — git answered definitively "no such object" (exit 128 on
+ *                  --verify) → the verdict is rejected
+ *   unverifiable — no project_path on disk, or git itself unavailable →
+ *                  the verdict proceeds with a visible commit_verified stamp
+ *
+ * Same runGit / 5s timeout / args-only discipline as the ancestry check.
+ * @returns {{state: 'verified', sha: string} | {state: 'refuted'|'unverifiable', reason: string}}
+ */
+export function verifyCommitExists(projectPath, sha) {
+  if (typeof sha !== 'string' || !SHA_RE.test(sha.trim())) {
+    return { state: 'unverifiable', reason: 'commit_tested is not sha-shaped' };
+  }
+  if (typeof projectPath !== 'string' || !projectPath || !existsSync(projectPath)) {
+    return { state: 'unverifiable', reason: 'project_path missing or not on disk' };
+  }
+  try {
+    const full = runGit(projectPath, ['rev-parse', '--verify', '--quiet', `${sha.trim()}^{commit}`]).trim();
+    return full ? { state: 'verified', sha: full } : { state: 'refuted', reason: 'no such commit' };
+  } catch (err) {
+    // `--verify --quiet` exits 1 for an unknown object; 128 for "not a git
+    // repository" and friends; a killed process (timeout) has no status.
+    if (err && err.status === 1) return { state: 'refuted', reason: 'no such commit' };
+    return { state: 'unverifiable', reason: `git error${err && err.status ? ` (exit ${err.status})` : ''}` };
+  }
+}
+
 function gateError(item, message) {
   // Never echo resolution/notes content back — name fields only.
   return new Error(`qa-handoff gate: cannot close ${item.id} — ${message}`);
@@ -405,6 +443,18 @@ export function validateQaVerdict(item, qa_verdict) {
   }
   if (typeof qa_verdict.commit_tested !== 'string' || !qa_verdict.commit_tested.trim()) {
     throw gateError(item, 'qa_verdict.commit_tested is required (the main commit the QA ran against)');
+  }
+  // Sha-shaped is not a commit (act:b9986c1b). Refute a fabricated hash
+  // outright; expand a real short one; stamp the cases git cannot answer so
+  // "verified" is never inferred from silence. The stamp lands on the verdict
+  // object the caller stores, the same way the ancestry check stamps evidence.
+  {
+    const check = verifyCommitExists(item && item.project_path, qa_verdict.commit_tested);
+    if (check.state === 'refuted') {
+      throw gateError(item, `qa_verdict.commit_tested "${qa_verdict.commit_tested}" is not a commit in the project repo — a sha-shaped string is not a commit; get the real value from git before stamping`);
+    }
+    if (check.state === 'verified') qa_verdict.commit_tested = check.sha;
+    qa_verdict.commit_verified = check.state === 'verified' ? 'verified' : `unverifiable: ${check.reason}`;
   }
   if (qa_verdict.tier !== 'narrow' && qa_verdict.tier !== 'full') {
     throw gateError(item, "qa_verdict.tier is required ('narrow' | 'full')");
@@ -1428,6 +1478,59 @@ export function supersedeItem(id, { reason = null } = {}) {
   item.resolution_notes = reason;
   atomicWrite(fp, item);
   if (DISPATCHED_CATEGORIES.has(item.category)) clearDispatchEntries(item);
+  return item;
+}
+
+// The resolution_type archiveItem stamps. A MACHINE type in the inbox
+// assessment (watchtower-cross-ring-reader.mjs MACHINE_TYPES) — these closures
+// are a migration, not an operator keeping anything.
+export const ARCHIVED_RESOLUTION_TYPE = 'archived';
+
+/**
+ * Close a knowledge-extraction item whose content has been written to the
+ * recall archive (Simplification Project 1, plan C1, act:93a52285 — the
+ * category's producers are deleted; watchtower-archive-drafts.mjs is the one
+ * caller). The closure is `resolved` + resolution_type 'archived' — NOT a new
+ * status — so the resolved/dismissed/superseded title corpus already covers
+ * these items and nothing refiles.
+ *
+ * Why its own door instead of resolveItem: it must accept an EXPIRED item
+ * (resolveItem refuses anything non-pending, and half of what the migration
+ * archives had already expired unread), and it must not erase the expiry
+ * history — the prior status and the prior resolution_notes are PREPENDED to
+ * the new note.
+ *
+ * The door is fenced to its one category: any other category THROWS, so this
+ * can never be used to walk a gated item (a qa-handoff, a relation proposal)
+ * out of the queue without its gate. An item that is already resolved,
+ * dismissed or superseded is a no-op (null) — never an error, never a
+ * re-stamp. The archive file must already exist: an item is never closed
+ * against a path nothing was written to.
+ * @param {string} id
+ * @param {object} params
+ * @param {string} params.archive_path - absolute path of the written archive file
+ * @returns {object|null} the updated item; null when not pending/expired
+ */
+export function archiveItem(id, { archive_path } = {}) {
+  const fp = itemPath(id);
+  const item = readItem(fp);
+  if (item.category !== KNOWLEDGE_CATEGORY) {
+    throw new Error(`archiveItem: cannot close ${item.id} — this door closes ${KNOWLEDGE_CATEGORY} items only; a ${item.category} item leaves the queue through its own door (resolve / dismiss / supersede), never through the archive`);
+  }
+  if (item.status !== 'pending' && item.status !== 'expired') return null;
+  if (typeof archive_path !== 'string' || !archive_path.trim() || !existsSync(archive_path)) {
+    throw new Error(`archiveItem: archive_path must name the archive file already written for ${id} — got ${JSON.stringify(archive_path ?? null)}`);
+  }
+  const priorStatus = item.status;
+  const priorNotes = typeof item.resolution_notes === 'string' && item.resolution_notes.trim()
+    ? item.resolution_notes
+    : null;
+  item.status = 'resolved';
+  item.resolved_at = new Date().toISOString();
+  item.resolution = archive_path;
+  item.resolution_type = ARCHIVED_RESOLUTION_TYPE;
+  item.resolution_notes = `[was ${priorStatus}${priorNotes ? `: ${priorNotes}` : ''}] Archived as a searchable recall draft; nothing deleted.`;
+  atomicWrite(fp, item);
   return item;
 }
 
