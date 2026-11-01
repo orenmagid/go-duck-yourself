@@ -14,7 +14,10 @@ import { readFileSync, readdirSync, existsSync, statSync, mkdirSync, realpathSyn
 import { execSync } from 'child_process';
 import { pathToFileURL } from 'url';
 import { join, resolve, basename } from 'path';
-import { currentCursor, resolveProjectIdentity } from './watchtower-lib.mjs';
+import {
+  currentCursor, resolveProjectIdentity, slugify,
+  INBOX_DETECTOR_REGISTRY, readCarry, markCarryShown,
+} from './watchtower-lib.mjs';
 import { runAdvisoryPass } from './watchtower-advisories.mjs';
 import { listPending } from './watchtower-queue.mjs';
 import { buildPickupPrompt } from './watchtower-routines.mjs';
@@ -38,6 +41,18 @@ const PRIORITY_DOMAIN = 3;   // injected domain files
 const PRIORITY_PATTERNS = 4; // enforcement patterns — nice-to-have, drop first
 
 const MAX_PATTERN_LINES = 5;
+
+// Simplification Project 2, plan B2 (act:faf91294; Q2, EP3, decision
+// defaults 2 and 27). The session-start block is the surface that replaced
+// inbox expiry: it names this project's oldest pending items with their age
+// and carries what rides from earlier sessions of the same project.
+const DAY_MS = 24 * 60 * 60 * 1000;
+const OLDEST_HERE_MAX = 3;      // EP3: up to 3 of this project's oldest, then one portfolio line
+const CARRY_FRICTION_MAX = 5;   // decision default 27 — the persistent budget, friction + loose ends
+const CARRY_ADVISOR_MAX = 3;
+const CARRY_RECOLOR_MAX = 3;
+const CARRY_LINE_MAX = 200;
+const CARRY_HEADER = '--- Carried from earlier sessions ---';
 
 // --- Argument parsing ---
 
@@ -183,13 +198,16 @@ function reverifyGitAttention(summaryText, sidecar, exec = gitRunner) {
 
 // --- Queue helpers ---
 
+// Counts every pending item and keeps `{ filed_at, category, project, title }`
+// per item so the oldest-items lines (plan B2) can be rendered from one read.
 function countQueueItems() {
   const queueDir = join(WATCHTOWER_DIR, 'queue', 'items');
-  if (!existsSync(queueDir)) return { total: 0, urgent: 0, byCategory: {} };
+  if (!existsSync(queueDir)) return { total: 0, urgent: 0, byCategory: {}, items: [] };
 
   let total = 0;
   let urgent = 0;
   const byCategory = {};
+  const items = [];
 
   try {
     const entries = readdirSync(queueDir, { withFileTypes: true });
@@ -201,12 +219,197 @@ function countQueueItems() {
       if (item.urgency === 'urgent') urgent++;
       const cat = item.category || 'uncategorized';
       byCategory[cat] = (byCategory[cat] || 0) + 1;
+      items.push({
+        filed_at: typeof item.filed_at === 'string' ? item.filed_at : null,
+        category: cat,
+        project: typeof item.project === 'string' ? item.project : null,
+        title: typeof item.title === 'string' ? item.title : '',
+      });
     }
   } catch {
     // Queue unreadable — degrade gracefully
   }
 
-  return { total, urgent, byCategory };
+  return { total, urgent, byCategory, items };
+}
+
+// Plain-English category name from the detector registry (plan B2 / T16);
+// a category the registry does not know (qa-handoff until plan B1 lands,
+// anything unregistered) falls back to its key.
+function categoryLabel(category) {
+  const entry = INBOX_DETECTOR_REGISTRY[category];
+  return entry && typeof entry.label === 'string' && entry.label.trim() ? entry.label : category;
+}
+
+// An unparseable timestamp is null: counted, never named with an age
+// (plan §Edge Cases — "excluded from the oldest line, never named with a
+// nonsense age, still counted").
+function parseIso(value) {
+  if (typeof value !== 'string' || !value) return null;
+  const t = Date.parse(value);
+  return Number.isFinite(t) ? t : null;
+}
+
+function wholeDaysSince(ms, now) {
+  return Math.max(0, Math.floor((now - ms) / DAY_MS));
+}
+
+function daysPhrase(n) {
+  return `${n} day${n === 1 ? '' : 's'}`;
+}
+
+// Items name their project by the config key (createItem's `project`); the
+// session knows its name AND its slug, so match on either — a slug-shaped
+// `project` on an item is still this project.
+function isThisProject(item, projectName, projectSlug) {
+  if (!item.project) return false;
+  if (projectName && item.project === projectName) return true;
+  return !!projectSlug && slugify(item.project) === projectSlug;
+}
+
+// The oldest-items lines (EP3, decision default 2):
+//   oldest here: <label>, <N> days · <label>, <N> days · <label>, <N> days
+//   rest of portfolio: <M> pending, oldest <label> (<project>), <N> days
+// "here" = up to 3 of THIS project's oldest; "rest" = every other pending
+// item (the remainder after the named ones). Either line is omitted when it
+// has nothing to say.
+function renderOldestLines(items, projectName, projectSlug, now = Date.now()) {
+  const lines = [];
+  const dated = (it) => ({ it, t: parseIso(it.filed_at) });
+  const byAge = (a, b) => a.t - b.t;
+
+  const here = items
+    .filter((it) => isThisProject(it, projectName, projectSlug))
+    .map(dated)
+    .filter((x) => x.t !== null)
+    .sort(byAge)
+    .slice(0, OLDEST_HERE_MAX);
+  if (here.length > 0) {
+    lines.push('oldest here: ' + here
+      .map((x) => `${categoryLabel(x.it.category)}, ${daysPhrase(wholeDaysSince(x.t, now))}`)
+      .join(' · '));
+  }
+
+  const named = new Set(here.map((x) => x.it));
+  const rest = items.filter((it) => !named.has(it));
+  if (rest.length > 0) {
+    let line = `rest of portfolio: ${rest.length} pending`;
+    const oldest = rest.map(dated).filter((x) => x.t !== null).sort(byAge)[0];
+    if (oldest) {
+      line += `, oldest ${categoryLabel(oldest.it.category)} (${oldest.it.project || 'unknown project'}), ${daysPhrase(wholeDaysSince(oldest.t, now))}`;
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+// --- The carry block (plan B2; Decision 4, EP1, EP2; decision defaults 20, 27) ---
+//
+// Reads the project's carry ledger (state/projects/<slug>/carry.json, the
+// ONE per-project carrier lane B3 built) and renders what rides from earlier
+// sessions of this project: unresolved friction every session until a /close
+// settles it; advisor findings and thread re-reading proposals once. Each
+// line is capped at CARRY_LINE_MAX; the section stays well inside the
+// 9,500-char budget. The builder's ONLY write is the `shown` stamp on the
+// advisor and recolor entries this block surfaced — through the shared
+// `markCarryShown` helper (fail-open: a failed stamp means the entry shows
+// again — duplication, never loss), and never through anything else (T9).
+
+// Keep a fixed tail intact and spend the budget on the variable head.
+function fitLine(head, tail = '') {
+  const budget = CARRY_LINE_MAX - tail.length;
+  const h = String(head).replace(/\s+/g, ' ').trim();
+  const fitted = h.length <= budget ? h : h.slice(0, Math.max(0, budget - 1)) + '…';
+  return (fitted + tail).slice(0, CARRY_LINE_MAX);
+}
+
+function isUnshown(entry) {
+  return !(Array.isArray(entry.shown) && entry.shown.length > 0);
+}
+
+// Where the overflow advisor findings live: the project's session record
+// when every overflow entry came from one session and that record exists,
+// else the project's sessions directory (the records hold them under
+// "## Advisor findings").
+function advisorOverflowPointer(overflow, slug) {
+  const dir = join(WATCHTOWER_DIR, 'state', 'projects', slug, 'sessions');
+  const sessions = new Set(overflow.map((e) => e.source_session).filter(Boolean));
+  if (sessions.size === 1) {
+    const sid = [...sessions][0];
+    try {
+      const file = readdirSync(dir).find((n) => n.endsWith(`-${sid}.md`));
+      if (file) return join(dir, file);
+    } catch { /* fall through to the directory */ }
+  }
+  return dir + '/';
+}
+
+// A recolor entry (written by plan A8) renders from its structured `source`
+// — { thread, thread_slug, verb, prior_date, explanation } — when present,
+// else from title/detail (A8 may compose the title itself).
+function recolorLine(entry) {
+  const s = entry.source || {};
+  if (s.thread && s.verb && s.prior_date) {
+    return fitLine(`- thread "${s.thread}": this session ${s.verb} the ${s.prior_date} entry — ${s.explanation || entry.detail || ''}`);
+  }
+  const detail = entry.detail && entry.detail !== entry.title ? ` — ${entry.detail}` : '';
+  return fitLine(`- thread ${entry.title}${detail}`);
+}
+
+function advisorLine(entry) {
+  const member = entry.source && entry.source.member;
+  if (member) return fitLine(`- ${member}: ${entry.detail || entry.title}`);
+  const detail = entry.detail && entry.detail !== entry.title ? ` — ${entry.detail}` : '';
+  return fitLine(`- ${entry.title}${detail}`);
+}
+
+// Returns { content, shownIds } or null when nothing is carried. `shownIds`
+// is every advisor/recolor entry this block surfaced — the rendered lines
+// AND the ones counted in an overflow pointer (the pointer is their
+// surfacing; the plan's second-render case shows none of them again).
+function renderCarrySection(ledger, { slug, now = Date.now() }) {
+  const entries = Array.isArray(ledger && ledger.entries) ? ledger.entries.filter((e) => e && typeof e === 'object') : [];
+  const byCreated = (a, b) => (parseIso(a.created_at) ?? Infinity) - (parseIso(b.created_at) ?? Infinity);
+  // The PERSISTENT kinds — friction (EP2) and loose ends (operator ruling
+  // 2026-10-31, act:dafa9afa) — ride every start block until a /close settles
+  // them. They share ONE ≤5-line budget, oldest first across both, so the
+  // section keeps plan B2's size bound; each keeps its own label.
+  const persistent = entries
+    .filter((e) => (e.kind === 'friction' || e.kind === 'loose-end') && !e.resolved).sort(byCreated);
+  const advisor = entries.filter((e) => e.kind === 'advisor' && !e.resolved && isUnshown(e)).sort(byCreated);
+  const recolor = entries.filter((e) => e.kind === 'recolor' && !e.resolved && isUnshown(e)).sort(byCreated);
+  if (persistent.length === 0 && advisor.length === 0 && recolor.length === 0) return null;
+
+  const lines = [CARRY_HEADER];
+
+  for (const e of persistent.slice(0, CARRY_FRICTION_MAX)) {
+    const t = parseIso(e.created_at);
+    const age = t === null ? 'age unknown' : daysPhrase(wholeDaysSince(t, now));
+    const from = t === null ? 'an unknown date' : new Date(t).toISOString().slice(0, 10);
+    if (e.kind === 'loose-end') {
+      lines.push(fitLine(`- loose end: ${e.title}`, ` (${age}, from ${from}) — settle it this session: finish it, or /close will offer to file it or drop it`));
+    } else {
+      lines.push(fitLine(`- friction: ${e.title}`, ` (${age}, from ${from}) — settle it this session: fix it, or /close will offer to file it or drop it`));
+    }
+  }
+  if (persistent.length > CARRY_FRICTION_MAX) lines.push(`…and ${persistent.length - CARRY_FRICTION_MAX} more unresolved`);
+
+  for (const e of advisor.slice(0, CARRY_ADVISOR_MAX)) lines.push(advisorLine(e));
+  if (advisor.length > CARRY_ADVISOR_MAX) {
+    const overflow = advisor.slice(CARRY_ADVISOR_MAX);
+    lines.push(fitLine(`…and ${overflow.length} more in ${advisorOverflowPointer(overflow, slug)}`));
+  }
+
+  for (const e of recolor.slice(0, CARRY_RECOLOR_MAX)) lines.push(recolorLine(e));
+  if (recolor.length > CARRY_RECOLOR_MAX) {
+    const overflow = recolor.slice(CARRY_RECOLOR_MAX);
+    const slugs = new Set(overflow.map((e) => e.source && e.source.thread_slug).filter(Boolean));
+    const verb = slugs.size === 1 ? `/threads arc ${[...slugs][0]}` : '/threads';
+    lines.push(fitLine(`…and ${overflow.length} more — ${verb}`));
+  }
+
+  const shownIds = [...advisor, ...recolor].map((e) => e.id).filter((id) => typeof id === 'string' && id);
+  return { content: lines.join('\n'), shownIds };
 }
 
 // A bare count is a scary number; a category breakdown is a work plan.
@@ -577,6 +780,24 @@ function main() {
     }
   }
 
+  // Step 4b: Carried from earlier sessions (plan B2). Unresolved friction
+  // rides every session until /close settles it; advisor findings and
+  // thread re-reading proposals ride once. The `shown` stamp is deferred to
+  // after assembly so an entry counts as shown only if its section survived
+  // the budget — and it is the builder's one write, through one helper (T9).
+  let carryShownIds = [];
+  if (projectSlug) {
+    try {
+      const carry = renderCarrySection(readCarry(projectSlug), { slug: projectSlug });
+      if (carry) {
+        sections.push({ key: 'carry', content: carry.content, priority: PRIORITY_KEEP });
+        carryShownIds = carry.shownIds;
+      }
+    } catch {
+      // never block session start on the carry ledger
+    }
+  }
+
   // Step 5: Focal zoom — thread state
   const allThreads = readActiveThreads();
   if (allThreads.length > 0 && projectSlug) {
@@ -590,16 +811,20 @@ function main() {
     }
   }
 
-  // Step 6: Inbox summary — one number, decomposed by category
-  const { total, urgent, byCategory } = countQueueItems();
+  // Step 6: Inbox summary — one number, then THIS project's oldest items with
+  // their age and one line for the rest of the portfolio (EP3: age is shown,
+  // never acted on — this is the surface that replaced expiry), then the
+  // category breakdown.
+  const { total, urgent, byCategory, items } = countQueueItems();
   if (total > 0) {
     const breakdown = renderCategoryBreakdown(byCategory);
     const headline = urgent > 0
       ? `⚡ ${total} pending (${urgent} urgent) — run /inbox`
       : `${total} pending — run /inbox when ready`;
+    const oldest = renderOldestLines(items, projectName, projectSlug);
     sections.push({
       key: 'queue',
-      content: `--- Inbox ---\n${headline}\n${breakdown}`,
+      content: ['--- Inbox ---', headline, ...oldest, breakdown].join('\n'),
       priority: PRIORITY_KEEP,
     });
   }
@@ -644,6 +869,17 @@ function main() {
   // Step 7: Assemble and truncate if needed
   let output = assembleSections(sections);
 
+  // Step 7b: stamp the advisor/recolor carry entries this block surfaced —
+  // only if the carry section survived assembly (a dropped section showed
+  // nothing). markCarryShown is fail-open and the builder's only write.
+  if (projectSlug && carryShownIds.length > 0 && output.includes(CARRY_HEADER)) {
+    try {
+      markCarryShown(projectSlug, carryShownIds, { session_id: sessionId });
+    } catch {
+      // fail-open: the entries simply show again next session
+    }
+  }
+
   process.stdout.write(output);
 }
 
@@ -686,7 +922,10 @@ function assembleSections(sections) {
 
 // Exports for hermetic tests (act:a136b362). Importing this module must NOT
 // run main() — gate the entry on an argv/url match (matches the ring scripts).
-export { reverifyGitAttention, verifyGitFact, renderMissedRoutineSection, renderSessionAckSection, renderRing3FailedSection, isMainCheckout };
+export {
+  reverifyGitAttention, verifyGitFact, renderMissedRoutineSection, renderSessionAckSection, renderRing3FailedSection, isMainCheckout,
+  renderOldestLines, renderCarrySection, categoryLabel,
+};
 
 const isMain = (() => {
   try {

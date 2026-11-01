@@ -29,7 +29,9 @@
 //      act:c0a878ec) — read from the cue's OWN log, state/recall-cue-log.jsonl,
 //      over the same window, and reported SEPARATELY so a cue fire can never
 //      inflate "a session chose to ask": cue_prompts (every line except
-//      `unregistered`), cue_fires (`fired`), cue_injected (`injected: true`),
+//      `unregistered` and a `skipped` line with `reason: machine-prompt` —
+//      a hand-back is not a prompt the cue could have helped, C4a),
+//      cue_fires (`fired`), cue_injected (`injected: true`),
 //      cue_followed (an injected line whose top path the SAME session Read
 //      AFTER the line's ts — joined by the hook payload's session_id only,
 //      never the timestamp fallback), cue_shadow_read (a would-fire line NOT
@@ -99,8 +101,10 @@ import {
   resolveProjectIdentity, resolveProjectFromTranscriptSlug,
   log as _log, logError as _logError,
 } from './watchtower-lib.mjs';
-// The cue log's name is the cue's to define — one constant, referenced.
-import { CUE_LOG_FILE } from './watchtower-recall-cue.mjs';
+// The cue log's name is the cue's to define — one constant, referenced. So is
+// "a machine prompt the cue skipped" (C4a): the one predicate the review
+// sheet uses, imported rather than re-derived.
+import { CUE_LOG_FILE, isMachinePromptLine } from './watchtower-recall-cue.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -399,7 +403,11 @@ export const CUE_BLIND_OUTCOMES = new Set(['busy', 'no-index', 'error']);
 // the named path (scanTranscript's read_last_ts).
 function cueNumbers(lines, projectName, projectSessions = []) {
   const slug = slugify(projectName);
+  // C4a (act:83592c63): a hand-back the cue skipped is not a prompt the cue
+  // could have helped — out of cue_prompts. Other skips (empty, /recall, and
+  // week-1 lines with no reason) stay: they were prompts.
   const mine = lines.filter((l) => l.outcome !== 'unregistered'
+    && !isMachinePromptLine(l)
     && (l.project === projectName || l.project === slug));
   const byId = new Map();
   for (const s of projectSessions) if (s.session_id) byId.set(String(s.session_id), s);

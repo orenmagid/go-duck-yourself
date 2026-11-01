@@ -31,6 +31,13 @@
 // than mistaken for "found nothing". It can never block or alter a prompt:
 // never exit 2, never `decision: block`.
 //
+// Since shadow week 2 (C4a, act:83592c63): a MACHINE prompt — one whose
+// trimmed text starts with a marker in CUE_MACHINE_PROMPT_RE — is `skipped`
+// with `reason: 'machine-prompt'` before any search (every skipped line now
+// carries a `reason`: empty | machine-prompt | recall-command), and the
+// candidate set excludes retained transcripts (CUE_EXCLUDE_SOURCES via
+// searchOpenIndex's `excludeSources`; `/recall` itself still searches them).
+//
 // The bar (fixed input from the 2026-10-03 measurement, retunable at the
 // review): fire when the top bm25 score ≤ CUE_SCORE_BAR AND the lead over
 // the runner-up ≥ CUE_LEAD_BAR. Scores are negative; more negative is
@@ -67,6 +74,35 @@ export const CUE_LOG_FILE = 'recall-cue-log.jsonl';
 export const CUE_MODES = ['shadow', 'on', 'off'];
 export const CUE_DEFAULT_MODE = 'shadow';
 export const CUE_HISTORY_DAYS = 7;
+
+// C4a (act:83592c63, operator ruling 2026-10-30). Machine prompts arrive on
+// UserPromptSubmit too — subagent hand-backs, system reminders, task
+// notifications, cross-session messages, interrupt notices — and in shadow
+// week 1 they were 82% of flow's and 87% of maginnis's would-fires. The cue
+// classifies the TRIMMED prompt before any search: a match ⇒ `skipped` with
+// `reason: 'machine-prompt'`, no index open, no search. ANCHORED at the start
+// on purpose — a human prompt that quotes a hand-back mid-text is a prompt.
+// ONE constant, exported, so the review sheet and the retrieval instrument
+// classify the same way the hook does.
+export const CUE_MACHINE_PROMPT_RE = /^(?:<agent-message|\[Subagent hand-back\]|<system-reminder|<task-notification|<cross-session-message|\[Request interrupted)/;
+// Why a `skipped` line was skipped. Present ONLY on skipped lines.
+export const CUE_SKIP_REASONS = ['empty', 'machine-prompt', 'recall-command'];
+// The day the C4a fix landed: a review window opening on or after it is
+// labelled post-fix (machine prompts skipped, transcripts out of the
+// candidates), so the two shadow weeks are never read as one population.
+export const CUE_FIX_DATE = '2026-10-30';
+// The cue's candidate set excludes retained transcripts (9 of 10 week-1
+// fires named a transcript titled by its first slash command). `/recall`
+// is unchanged — searchOpenIndex's default excludes nothing.
+export const CUE_EXCLUDE_SOURCES = ['transcripts'];
+
+// The one predicate the review and the instrument share: a log line the
+// cue skipped as a machine prompt. Reads the stored `reason`, never
+// re-classifies prompt_head — a week-1 line that was searched stays what
+// it was logged as.
+export function isMachinePromptLine(l) {
+  return l?.outcome === 'skipped' && l?.reason === 'machine-prompt';
+}
 
 // The rubric the review judges against — written before shadow started
 // (plan C4) and printed verbatim on every sheet.
@@ -176,8 +212,12 @@ export function runCue(payload, {
     ...extra,
   });
 
-  // 5. Skip: empty, or the session is already asking the record.
-  if (!trimmed || trimmed.startsWith('/recall')) return { entry: line('skipped'), stdout: null };
+  // 5. Skip — every skipped line says why: empty; a machine prompt (C4a,
+  // classified before any search); or the session is already asking the record.
+  const skipped = (reason) => ({ entry: line('skipped', { reason }), stdout: null });
+  if (!trimmed) return skipped('empty');
+  if (CUE_MACHINE_PROMPT_RE.test(trimmed)) return skipped('machine-prompt');
+  if (trimmed.startsWith('/recall')) return skipped('recall-command');
 
   // 6. The sqlite loader (ABI / FTS5 availability).
   const loaded = loadSqlite(id.path);
@@ -192,7 +232,7 @@ export function runCue(payload, {
   let db = null;
   try {
     db = openCueDb(loaded.Database, indexPath);
-    rows = searchOpenIndex(db, prompt, { k: CUE_K });
+    rows = searchOpenIndex(db, prompt, { k: CUE_K, excludeSources: CUE_EXCLUDE_SOURCES });
   } catch (e) {
     if (isBusyError(e)) return { entry: line('busy', { detail: errorDetail(e) }), stdout: null };
     return { entry: line('error', { detail: errorDetail(e) }), stdout: null };
@@ -440,10 +480,15 @@ export function nextTurnsFromTranscript(transcriptPath, entry, { maxChars = 300 
 export function buildReview(log, { since, project = null, sample = 30, seed = null, until = null } = {}) {
   const sinceTs = Date.parse(since);
   const untilTs = until ? Date.parse(until) : Infinity;
-  const inWindow = log.filter((l) => {
+  const allInWindow = log.filter((l) => {
     const t = Date.parse(l.ts);
     return Number.isFinite(t) && t >= sinceTs && t <= untilTs && (!project || l.project === project);
   });
+  // C4a: a machine prompt the cue skipped is not a prompt the cue could have
+  // helped — reported once, excluded from every count below.
+  const machine = allInWindow.filter(isMachinePromptLine);
+  const inWindow = allInWindow.filter((l) => !isMachinePromptLine(l));
+  const postFix = Number.isFinite(sinceTs) && sinceTs >= Date.parse(CUE_FIX_DATE);
   const theSeed = seed == null ? seedFromString(`${since}:${project || 'all'}`) : (Number.isFinite(Number(seed)) ? Number(seed) >>> 0 : seedFromString(String(seed)));
   const byOutcome = {};
   for (const l of inWindow) byOutcome[l.outcome] = (byOutcome[l.outcome] || 0) + 1;
@@ -467,11 +512,12 @@ export function buildReview(log, { since, project = null, sample = 30, seed = nu
   const out = [];
   out.push(`# Recall cue review — ${project || 'all projects'} since ${since}`);
   out.push('');
-  out.push(`Window: ${since} → ${until || 'now'}. Project(s): ${project || projectsSeen.join(', ') || '(none)'}. Seed: ${theSeed}. Mode(s) in force: ${modes.join(', ') || '(none)'}. Bar(s): ${bars.join(', ') || '(none)'}.`);
+  out.push(`Window: ${since} → ${until || 'now'}${postFix ? ` (post-fix: machine prompts skipped, transcripts out of the candidates — since ${CUE_FIX_DATE})` : ''}. Project(s): ${project || projectsSeen.join(', ') || '(none)'}. Seed: ${theSeed}. Mode(s) in force: ${modes.join(', ') || '(none)'}. Bar(s): ${bars.join(', ') || '(none)'}.`);
   out.push('');
   out.push('## Counts');
   out.push('');
   out.push(`Lines in window: ${inWindow.length}. By outcome: ${Object.entries(byOutcome).map(([k, v]) => `${k} ${v}`).join(', ') || '(none)'}.`);
+  out.push(`Machine prompts skipped (excluded from every count): ${machine.length}.`);
   const gf = group(fired); const gq = group(quiet);
   out.push(`Fired: SHORT (< ${CUE_LONG_WORDS} words) ${gf.short}, LONG (≥ ${CUE_LONG_WORDS}) ${gf.long}. Quiet: SHORT ${gq.short}, LONG ${gq.long}.`);
   const fs_ = fired.length + quiet.length;

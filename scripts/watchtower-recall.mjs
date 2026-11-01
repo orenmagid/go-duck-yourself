@@ -455,18 +455,29 @@ export function interleaveBySource(rows, { k = DEFAULT_K, perSourceCap = PER_SOU
   return kept.slice(0, k);
 }
 
-export function searchOpenIndex(db, query, { k = DEFAULT_K, source = null, perSourceCap = PER_SOURCE_CAP } = {}) {
+// `excludeSources` (recall-cue plan §C4a, act:83592c63) drops whole sources
+// from the CANDIDATE set — applied in the SQL, before CANDIDATE_LIMIT and the
+// per-source interleave, so an excluded source can never crowd the others
+// out of the capped candidate rows. Default none: `/recall` still searches
+// every source; the cue passes ['transcripts']. An unknown name is refused
+// rather than silently excluding nothing.
+export function searchOpenIndex(db, query, { k = DEFAULT_K, source = null, perSourceCap = PER_SOURCE_CAP, excludeSources = [] } = {}) {
   const match = buildMatchQuery(query);
   if (!match) return [];
+  const excluded = Array.isArray(excludeSources) ? excludeSources : [];
+  for (const s of excluded) {
+    if (!SOURCES.includes(s)) throw new Error(`excludeSources: unknown source "${s}" (one of ${SOURCES.join('|')})`);
+  }
+  const notIn = excluded.length ? ` AND c.source NOT IN (${excluded.map(() => '?').join(', ')})` : '';
   const sql = `
     SELECT c.path AS path, c.source AS source, c.heading AS heading, d.title AS title,
            snippet(chunks, 3, '', '', '…', 48) AS snippet,
            bm25(chunks, 0, 0, 2.0, 1.0) AS score
     FROM chunks c JOIN docs d ON d.path = c.path
-    WHERE chunks MATCH ?
+    WHERE chunks MATCH ?${notIn}
     ORDER BY score
     LIMIT ?`;
-  const rows = db.prepare(sql).all(match, CANDIDATE_LIMIT);
+  const rows = db.prepare(sql).all(match, ...excluded, CANDIDATE_LIMIT);
   const trimmed = rows.map((r) => ({
     path: r.path, source: r.source, title: r.title, heading: r.heading || '',
     snippet: String(r.snippet || '').replace(/\s+/g, ' ').trim().slice(0, SNIPPET_MAX_CHARS),

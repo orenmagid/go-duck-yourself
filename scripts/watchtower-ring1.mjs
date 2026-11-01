@@ -33,7 +33,7 @@ import {
   getWatchtowerDir, createItem, listPending, getItem, loadBetterSqlite3,
   writeProjectStatePreservingRing3, flushFeedbackOutbox, resolveCcSourceRepo,
   authoredClaudeDirs, claudeChurnIsDisposable,
-  autoReconcileItem,
+  autoReconcileItem, docDriftStatePath, readDocDrift,
 } from './watchtower-lib.mjs';
 // listItems for the dismissal-aware worktree dedup (act:6dcb8015) — the
 // pending-only corpus is what let a git-evidenced dismissal be re-litigated
@@ -1905,6 +1905,18 @@ function readRecallCanary() {
   } catch { return {}; }
 }
 
+// collectDocDrift — Ring 4's documentation-drift state for one project
+// (state/projects/<slug>/doc-drift.json; Simplification Project 2, plan A4,
+// act:dafa9afa). The recall-canary relationship again: the measurement is
+// Ring 4's, the render is Ring 1's because Ring 1 owns the per-project state
+// file. Returns { count, path }, or null when no file exists (never measured
+// is not "0 claims").
+export function collectDocDrift(projectName) {
+  const path = docDriftStatePath(projectName);
+  if (!existsSync(path)) return null;
+  return { count: readDocDrift(projectName).entries.length, path };
+}
+
 // readRosterMetrics — the Ring 2 cabinet-roster measurement sidecar
 // (act:ea23b3a5). Same shape of relationship as the recall canary: the
 // measurement is Ring 2's, the render is Ring 1's, because Ring 1 owns the
@@ -2184,6 +2196,13 @@ function assembleProjectState(ps) {
   // items: a count describes a condition, it doesn't ask the operator to
   // decide anything. Rendered on CHANGE only; see renderRosterEntries.
   for (const line of renderRosterEntries(ps.roster)) issues.push(line);
+  // Documentation drift (Simplification Project 2, plan A4) — Ring 4's claims
+  // that no longer match the tree, left the inbox for project state. One line,
+  // count + where to read them; nothing when there are none.
+  if (ps.docDrift && ps.docDrift.count > 0) {
+    issues.push(`${ps.docDrift.count} documentation claim${ps.docDrift.count === 1 ? '' : 's'} no longer match`
+      + `${ps.docDrift.count === 1 ? 'es' : ''} the tree — ${ps.docDrift.path}`);
+  }
   // Retrieval instrument (Simplification Project 1, plan B1) — ambient state:
   // the three memory-retrieval numbers for a measured project, plus the recall
   // cue's line when it saw prompts (act:c0a878ec), nothing for an unmeasured
@@ -2329,6 +2348,7 @@ function main() {
         recall: recallCanaryProjects[name] || null,
         roster: rosterMetrics[name] || null,
         retrieval: retrievalProjects[name] || null,
+        docDrift: collectDocDrift(name),
         divergedBranches: [],
         hookResults: [],
       };

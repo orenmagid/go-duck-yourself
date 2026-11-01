@@ -23,15 +23,21 @@
 //   2c: Work item closure — completion candidates to inbox
 //   2d: Knowledge extraction — lessons/decisions/constraints to inbox
 //   2e: Quality pattern capture — recurring patterns from any session
-//   2f: Methodology capture — detect new skills/conventions
+//   2f: (DELETED 2026-10-31, Simplification Project 2 plan A3 — the
+//       methodology detector; /close Step 6c asks the question in-session)
 //   2g: Upstream friction — CC friction detection
 //   2h: (removed 2026-06-12, act:6c3a4763 — feedback delivery is Ring 1's
 //       flushFeedbackOutbox in watchtower-lib.mjs; see tombstone below)
 //   2m: Session advisor pass — re-homed standing advisors, transcript-fed
 //   2n: Raised-but-unhandled lens — loose ends (promises/side-issues/
-//       open-questions) neither done nor filed → inbox (act:4ff2cfb3)
-//   2o: Skill-candidate lens — repeated manual procedure → "make a skill?"
-//       inbox item (act:4ff2cfb3)
+//       open-questions) neither done nor filed → the session record's
+//       `## Loose ends` (act:4ff2cfb3; re-pointed off the inbox by
+//       Simplification Project 2 plan A3 — runs only when the session never
+//       reached /close, see runResidueFallback)
+//   2o: Skill-candidate lens — repeated manual procedure → the record's
+//       `## Skill candidates` (same fallback rule)
+//   2q: Verify-coverage lens — UI shipped with no .feature edit → one
+//       `## Loose ends` line (same fallback rule)
 //   2p: Checklist-catch detection — a surfaced check that caught a real bug
 //       → checklist-stats.json (act:4ff2cfb3)
 //   2i: Session auto-naming — generate descriptive session name
@@ -60,6 +66,18 @@ import {
   buildLastSessionBlock, upsertLastSessionSection, recordSuppression, recordApiUsage,
   recentSlice,
   recordSignificanceEvent,
+  // Simplification Project 2, plan B3/A3 (act:73dd31d4): the session record
+  // path is computed ONCE in main(); the residue lenses append sections to
+  // it; the /close receipt decides whether they run at all.
+  sessionRecordPath, residueRecordPath, appendSessionRecordSection,
+  readResidueReceipt, receiptIsAnswered, appendFallbackLedger, recordAdvisorFindings,
+  // Plan B4 (act:ee9fbbc9): Phase 2g delivers friction by route through the
+  // queue-side writers lib re-exports — one definition of each shape.
+  appendFeedbackOutboxEntry, frictionOutboxEntry, appendCarryEntry, appendUnresolvedFriction,
+  // act:08aca7a9: duplicates are shortlisted by title, then judged by the model.
+  findFeedbackDuplicateCandidates,
+  // Plan A8 (act:b57df8e4): Reach 2 proposals are written onto the thread.
+  appendThreadProposal,
 } from './watchtower-lib.mjs';
 // Namespace view of the same module record — feature-detection seam for lib
 // exports that land in a different lane's merge (a static named import of a
@@ -68,9 +86,9 @@ import {
 // undefined until the export exists). Consumer: resolveSessionProject's
 // slug fallback (act:29001b07 — Lane A ships resolveProjectFromTranscriptSlug).
 import * as watchtowerLib from './watchtower-lib.mjs';
-// Direct queue import (precedent: ring2 imports expireItem this way) —
+// Direct queue import (precedent: ring2 imports supersedeItem this way) —
 // watchtower-lib deliberately not extended for this (lane separation).
-import { listItems, supersedeItem, annotateItemEvidence } from './watchtower-queue.mjs';
+import { listItems } from './watchtower-queue.mjs';
 import { runRoutinePass } from './watchtower-routines.mjs';
 
 const require = createRequire(import.meta.url);
@@ -639,7 +657,10 @@ export function writeTranscriptRetention(transcriptPath, projectSlug, sessionId,
   return outPath;
 }
 
-async function sessionSummary(compressed, projectSlug, sessionId) {
+// `recordPath` is the per-session record main() computed once through
+// sessionRecordPath (plan A3, T13) — the same path every residue lens appends
+// to, so the two spellings cannot drift. `date` is the day that path carries.
+async function sessionSummary(compressed, projectSlug, sessionId, { recordPath, date } = {}) {
   log('Phase 2b: Session summary');
 
   // Cache-group member (act:25b2c277): instruction AFTER the transcript, which
@@ -657,16 +678,15 @@ async function sessionSummary(compressed, projectSlug, sessionId) {
   const bullets = response.trim();
 
   // Write per-session file to state/projects/<slug>/sessions/<date>-<session-id>.md
-  const sessionsDir = join(WATCHTOWER_DIR, 'state', 'projects', projectSlug, 'sessions');
-  mkdirSync(sessionsDir, { recursive: true });
-
-  const date = new Date().toISOString().slice(0, 10);
-  const sessionFile = join(sessionsDir, `${date}-${sessionId}.md`);
+  // — the ONE spelling, sessionRecordPath (lib); main() passes it in.
+  const day = date || new Date().toISOString().slice(0, 10);
+  const sessionFile = recordPath || sessionRecordPath(projectSlug, day, sessionId);
+  mkdirSync(dirname(sessionFile), { recursive: true });
   // ONE shared body feeds BOTH surfaces, now carrying the pointer that names
   // the authoritative per-session record (appendRecordPointer above). The
   // ref is relative to state/projects/ — project.md's own directory — so a
   // consumer can resolve it mechanically, not just read it.
-  const body = appendRecordPointer(bullets, `${projectSlug}/sessions/${date}-${sessionId}.md`);
+  const body = appendRecordPointer(bullets, `${projectSlug}/sessions/${basename(sessionFile)}`);
   const content = `# Session ${sessionId}\n\nDate: ${new Date().toISOString()}\n\n${body}\n`;
   atomicWrite(sessionFile, content);
 
@@ -684,10 +704,10 @@ async function sessionSummary(compressed, projectSlug, sessionId) {
   const existingState = existsSync(projectStatePath)
     ? readFileSync(projectStatePath, 'utf8')
     : '';
-  const block = buildLastSessionBlock({ date, sessionId, bullets: body });
+  const block = buildLastSessionBlock({ date: day, sessionId, bullets: body });
   atomicWrite(projectStatePath, upsertLastSessionSection(existingState, block));
 
-  log(`Phase 2b: Summary written to ${projectSlug}/sessions/${date}-${sessionId}.md`);
+  log(`Phase 2b: Summary written to ${projectSlug}/sessions/${basename(sessionFile)}`);
   return bullets;
 }
 
@@ -777,17 +797,21 @@ export function selectEarnedThreads(threads, {
 //   Reach 1 rode extraction: the reach-back corpus (which threads matter) IS
 //   that call's output, and pre-loading every active thread's history would
 //   cost more than the second focused call.
-// - PROPOSE only, human-gated: the proposal never modifies the thread file;
-//   the apply step is /inbox's confirm follow-up (appendThreadRecolor), and
-//   the category is in GATED_CATEGORIES so it can never ride a batch.
+// - PROPOSE only, never apply: since Simplification Project 2 plan A8
+//   (act:b57df8e4, EP1) the proposal is written onto the thread file's
+//   additive `proposed_recolors` array — never the inbox — and never touches
+//   cursor_history or recolor_log; /threads shows it, and one `recolor`
+//   carry entry shows it once in the project's next start block. Nothing
+//   confirms or dismisses it before Project 3's contradiction gate (R2).
 // - Anchors are validated: a proposal must cite an ACTUAL prior entry
 //   (session_id + date checked against the on-disk history snapshot); a
 //   hallucinated anchor drops the proposal, logged, never filed.
-// - DURABLE filing exclusion: relation_key = thread|prior_session|verb,
-//   checked across ALL queue statuses with NO time window — a dismissed
-//   judgment about a static corpus must never re-nag (not even after
-//   RESOLUTION_CORPUS_DAYS), and a reprocess replay produces the same key
-//   and files nothing. The key deliberately does NOT include the noticing
+// - DURABLE exclusion: relation_key = thread|prior_session|verb, checked by
+//   appendThreadProposal against the thread's own proposals, its recolor_log
+//   (already applied) and the historical queue items in ALL statuses with NO
+//   time window — a decided judgment about a static corpus must never re-nag,
+//   and a reprocess replay produces the same key and writes nothing. The key
+//   deliberately does NOT include the noticing
 //   session: it identifies the ANCHOR being reinterpreted, not who noticed
 //   it, so a second session independently spotting the same anchor dedups
 //   against the first proposal instead of filing a new one (act:1be47d42
@@ -862,8 +886,10 @@ export function validateRecolorProposals(proposals, priorBySlug) {
   return { accepted, dropped };
 }
 
-// File one significance-change proposal. Durable relation_key exclusion:
-// ALL statuses, no time window (see the block comment above).
+// Write one re-reading proposal onto its thread (plan A8 / EP1). Durable
+// relation_key exclusion: the thread's own proposals, its recolor_log and the
+// historical queue items in ALL statuses, no time window — all inside
+// appendThreadProposal (the one writer; see the block comment above).
 //
 // The key is the ANCHOR being reinterpreted plus how (thread + prior entry +
 // verb) — never the noticing session. Including sessionId here made the key
@@ -871,61 +897,74 @@ export function validateRecolorProposals(proposals, priorBySlug) {
 // independently noticed the same earlier entry filed a fresh proposal
 // against it; measured live at 12 of 120 pending items were true duplicates
 // once sessionId was removed from the comparison (act:1be47d42 field
-// report, 2026-08-17). Returns the filed (or existing) item id.
-export function fileSignificanceProposal({ project, threadSlug, anchor, verb, explanation, sessionId }) {
+// report, 2026-08-17). A second noticing is corroboration — the helper
+// appends it to also_noticed_by (act:de0b090a), never a second entry.
+//
+// A NEW proposal also writes one `recolor` entry to the carry ledger of the
+// project this session ran in, in the structured `source` shape the start
+// block renders (- thread "<display name>": this session <verb> the <date>
+// entry — <explanation>), shown once. A corroboration or an excluded key
+// writes no carry entry. Returns appendThreadProposal's result, or null when
+// the thread file is missing/unreadable (logged, never thrown, never filed).
+// `deps` override the real writers and the logger (tests).
+export function fileSignificanceProposal({ project, threadSlug, anchor, verb, explanation, sessionId }, deps = {}) {
+  const {
+    threadsDir = join(WATCHTOWER_DIR, 'state', 'threads'),
+    appendThreadProposal: appendProposal = appendThreadProposal,
+    appendCarryEntry: appendCarry = appendCarryEntry,
+    logFn = logError,
+  } = deps;
   const key = `${threadSlug}|${anchor.session_id}|${verb}`;
-  const existing = listItems({ category: 'significance-change' })
-    .find((i) => i.evidence && i.evidence.relation_key === key);
-  if (existing) {
-    // A second noticing carries evidence too — the fact that an independent
-    // session reached the same conclusion strengthens the proposal, and
-    // silently discarding that (the pre-fix behavior) is why act:de0b090a's
-    // acceptance criteria asks for it explicitly. annotateItemEvidence is
-    // additive and PENDING-fenced, so this is a no-op once the item is
-    // dispositioned rather than reopening a decided question.
-    try {
-      const also = Array.isArray(existing.evidence?.also_noticed_by) ? existing.evidence.also_noticed_by : [];
-      if (sessionId && !also.includes(sessionId) && sessionId !== existing.evidence?.new_session_id) {
-        annotateItemEvidence(existing.id, { also_noticed_by: [...also, sessionId] });
-      }
-    } catch { /* additive corroboration only — never blocks returning the existing id */ }
-    return existing.id;
-  }
   const priorExcerpt = (anchor.cursor && typeof anchor.cursor.what === 'string')
     ? anchor.cursor.what.slice(0, 200) : '';
-  // The title must identify the ANCHOR, not just the thread + date — two
-  // different anchors on the same thread otherwise render as the same title
-  // and a reader dismisses distinct real proposals as one repeated item
-  // (the same field report measured this: 5 of 7 near-identical titles on
-  // one thread were genuinely distinct anchors). A short prior-session
-  // marker disambiguates without needing the full id.
-  const anchorMarker = typeof anchor.session_id === 'string' ? anchor.session_id.slice(0, 8) : 'unknown';
-  return createItem({
-    project: project.name,
-    project_path: project.path,
-    ...(project.unresolved ? { project_unresolved: true } : {}),
-    category: 'significance-change',
-    urgency: 'normal',
-    title: `Recolor: this session ${verb} the ${anchor.date} entry (${anchorMarker}) of "${threadSlug}"`,
-    summary: explanation,
-    context_anchor: `session ${sessionId}`,
-    evidence: {
-      relation_key: key,
-      thread: threadSlug,
-      verb,
-      prior_session_id: anchor.session_id,
-      prior_date: anchor.date,
-      prior_excerpt: priorExcerpt,
-      new_session_id: sessionId,
-      explanation,
-    },
-    options: [
-      { key: 'confirm', label: 'Confirm — apply the recolor to the thread record' },
-      { key: 'dismiss', label: 'The earlier entry stands as it was' },
-    ],
-    filed_by: 'ring3-close',
-    thread_ids: [threadSlug],
+  const result = appendProposal(threadsDir, threadSlug, {
+    relation_key: key,
+    verb,
+    prior_session_id: anchor.session_id,
+    prior_date: anchor.date,
+    prior_excerpt: priorExcerpt,
+    new_session_id: sessionId,
+    explanation,
   });
+  if (!result) {
+    logFn(`Phase 2b2: re-reading proposal not written — thread file for "${threadSlug}" is missing or unreadable (${key})`);
+    return null;
+  }
+  if (result.outcome !== 'appended') return result;
+
+  // The carry entry: keyed like every other carry writer in this file
+  // (routeFriction's precedent) — a session whose project could not be
+  // resolved at all has no ledger to carry into; the proposal is still on
+  // the thread, where /threads shows it.
+  if (project && project.unresolved && !project.path) {
+    logFn(`Phase 2b2: re-reading proposal on "${threadSlug}" not carried — the session's project is unresolved (the proposal is on the thread)`);
+    return result;
+  }
+  const slug = (project && project.slug) || slugify((project && project.name) || 'unresolved');
+  // A short prior-session marker identifies the ANCHOR, not just the thread +
+  // date — two anchors on one thread otherwise read as the same line (the
+  // act:1be47d42 field report: 5 of 7 near-identical titles were distinct).
+  const anchorMarker = typeof anchor.session_id === 'string' ? anchor.session_id.slice(0, 8) : 'unknown';
+  try {
+    appendCarry(slug, {
+      kind: 'recolor',
+      title: `thread "${result.display_name}": this session ${verb} the ${anchor.date} entry (${anchorMarker})`,
+      detail: explanation,
+      source_session: sessionId || null,
+      source: {
+        thread: result.display_name,
+        thread_slug: threadSlug,
+        verb,
+        prior_date: anchor.date,
+        prior_session_id: anchor.session_id,
+        explanation,
+        relation_key: key,
+      },
+    });
+  } catch (e) {
+    logFn(`Phase 2b2: recolor carry entry failed for "${threadSlug}" (${e.message}) — the proposal is on the thread`);
+  }
+  return result;
 }
 
 // The reach-back pass. Fail-open at every stage: a reach-back failure must
@@ -950,17 +989,17 @@ export async function significanceReachBack({
     }
     for (const p of accepted) {
       try {
-        fileSignificanceProposal({
+        const r = fileSignificanceProposal({
           project, threadSlug: p.thread, anchor: p.anchor,
           verb: p.verb, explanation: p.explanation, sessionId,
         });
-        filed++;
+        if (r) filed++;
       } catch (e) {
         logError(`Phase 2b2: reach-back filing failed for ${p.thread} (${e.message})`);
       }
     }
     if (filed > 0) {
-      log(`Phase 2b2: Reach 2 — ${filed} significance-change proposal(s) filed against ${withHistory.length} thread(s) with prior history`);
+      log(`Phase 2b2: Reach 2 — ${filed} re-reading proposal(s) written onto threads (proposed_recolors), ${withHistory.length} thread(s) with prior history`);
     }
   } catch (e) {
     logError(`Phase 2b2: significance reach-back failed (${e.message}) — thread capture is unaffected`);
@@ -2610,77 +2649,18 @@ async function qualityPatternCapture(compressed, projectPath) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2f: Methodology capture
+// Phase 2f: Methodology capture — DELETED (Simplification Project 2,
+// prj:4a433dac, plan A3 / Decision 3, 2026-10-31; act:73dd31d4). The detector
+// asked a model, after the session, whether a new methodology had been
+// established, and filed a `methodology-capture` inbox item when the named
+// artifact existed on disk (the act:3f3f9a31 verification gate — 11 of 11
+// unverified captures had been dismissed). The question now belongs to the
+// session that has the context: /close Step 6c proposes "write methodology
+// record" as one line of its residue check, and an accepted line runs the
+// debrief methodology-capture phase's write path in-session. One model call
+// per close fewer; the category is retired (INBOX_DETECTOR_REGISTRY) and a
+// stray filing is redirected to the project's carry ledger (plan A9).
 // ---------------------------------------------------------------------------
-
-async function methodologyCapture(compressed, project, threadIds = []) {
-  const projectPath = project.path;
-  log('Phase 2f: Methodology capture');
-
-  // Methodology only counts with a durable artifact verified against the
-  // project root — no path, nothing to verify against.
-  if (!projectPath) {
-    log('Phase 2f: no project path (unresolved identity), skipping');
-    return;
-  }
-
-  try {
-    // Cache-group member (act:25b2c277 follow-up) — same 30K leftover as 2e.
-    const response = await claudeCall(
-      SHARED_PREFACE,
-      `You are checking whether the Claude Code session above established a NEW reusable methodology — a new skill, convention, workflow pattern, or rule that should be codified for future sessions. Routine work, bug fixes, and using existing patterns do NOT count. Only report genuinely new methodology that was created or established in this session.
-
-VERIFICATION REQUIREMENT: a methodology only counts if the session produced a durable artifact for it — a file that was created or edited to encode the methodology (a SKILL.md, a rules file, a convention doc, a template, or a test/harness file whose header documents the procedure). Merely discussing or following a pattern does not count. Name the artifact path relative to the project root.
-
-If a new methodology was established, output JSON: {"found": true, "title": "short description", "content": "what the methodology is and how to apply it", "artifact_path": "relative/path/to/the/file"}
-If nothing new was established, output JSON: {"found": false}
-Output ONLY the JSON object.`,
-      { cachePrefix: cacheableTranscript(compressed) },
-    );
-
-    const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      log('Phase 2f: Could not parse methodology response');
-      return;
-    }
-
-    const result = JSON.parse(jsonMatch[0]);
-    if (!result.found) {
-      log('Phase 2f: No new methodology found');
-      return;
-    }
-
-    // Verification gate (act:3f3f9a31, per decision_methodology_capture_claude_verification):
-    // the claimed artifact must actually exist on disk. 11/11 unverified captures
-    // were dismissed over 3 weeks — without an artifact this category is pure noise.
-    if (!result.artifact_path || typeof result.artifact_path !== 'string') {
-      log('Phase 2f: Methodology claimed but no artifact named — skipping (verification gate)');
-      return;
-    }
-    const artifactAbs = join(projectPath, result.artifact_path);
-    if (!existsSync(artifactAbs)) {
-      log(`Phase 2f: Methodology artifact not found on disk (${result.artifact_path}) — skipping (verification gate)`);
-      return;
-    }
-
-    createItem({
-      project: project.name,
-      project_path: projectPath,
-      ...(project.unresolved ? { project_unresolved: true } : {}),
-      category: 'methodology-capture',
-      urgency: 'normal',
-      title: `methodology: ${result.title}`,
-      summary: result.content,
-      context_anchor: `ring3-close methodology scan — artifact: ${result.artifact_path}`,
-      evidence: { artifact_path: result.artifact_path },
-      filed_by: 'ring3-close',
-      thread_ids: threadIds,
-    });
-    log(`Phase 2f: Methodology captured: ${result.title} (artifact verified: ${result.artifact_path})`);
-  } catch (e) {
-    logError(`Phase 2f: Methodology capture failed: ${e.message}`);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Phase 2g: Upstream friction
@@ -2691,10 +2671,11 @@ Output ONLY the JSON object.`,
 // of the 2026-07-26 dismissals were observations like "Claude made iterative
 // browser tweaks without writing to file" — true, and addressed to nobody.
 //
-// This is Phase 2f's verification gate applied to a second lens. That gate
-// (act:3f3f9a31) files a methodology capture only when the claimed artifact
-// verifiably exists on disk, after 11 of 11 unverified captures were dismissed
-// over three weeks. Same shape here: file only when the finding names its route.
+// This is the shape of Phase 2f's verification gate (act:3f3f9a31 — a
+// methodology capture filed only when the claimed artifact verifiably existed
+// on disk, after 11 of 11 unverified captures were dismissed over three
+// weeks; 2f itself was deleted by Simplification Project 2 plan A3) applied to
+// a second lens: file only when the finding names its route.
 export const FRICTION_ROUTES = ['cc-feedback', 'project-tracker', 'config-change'];
 
 export function frictionRouteIsActionable(route) {
@@ -2704,9 +2685,164 @@ export function frictionRouteIsActionable(route) {
     && route.detail.trim().length > 0;
 }
 
-async function upstreamFriction(compressed, project, threadIds = [], { callFn = claudeCall } = {}) {
-  const projectPath = project.path;
+// routeFriction — deliver ONE actionable finding by its route (Simplification
+// Project 2, plan B4 + A5, Decision 2 / Q1 / EP2; act:ee9fbbc9). No route
+// ever creates a tracker action: Ring 3 writes nothing to any tracker (EP2;
+// a static census in friction-actionability.test.mjs pins the absence).
+//   cc-feedback     → T8 dedup (outbox, the CC repo's feedback/ and
+//                     feedback/resolved/), then ONE /cc-feedback-shaped outbox
+//                     entry, per report (Q1); Ring 1's flushFeedbackOutbox
+//                     delivers it. A duplicate appends nothing and is recorded
+//                     under the session record's ## Friction section.
+//   project-tracker → one ## Friction record line AND one `friction` carry
+//                     entry in that project's ledger, carried to every
+//                     following start block until a /close settles it (EP2).
+//                     A session whose project slug is unresolved has no ledger
+//                     key: the report goes to state/residue/unresolved-
+//                     friction.jsonl (counted, never silent — default 22).
+//   config-change   → createItem({category:'upstream-friction'}) — the one
+//                     route that stays in the inbox (A5), and the ONLY
+//                     createItem in this lens.
+// A failed write never drops the report: it is written to the record's
+// ## Friction section with the error, and logged (fail toward visibility).
+// `ctx` = { project, sessionId, recordPath, threadIds, slugUnresolved? };
+// `deps` override the real writers (tests inject a delegating spy, never a
+// stub). Returns { route, outcome, ... } — outcome is one of outbox |
+// duplicate | carry | unresolved | inbox | failed.
+export function routeFriction(finding, ctx = {}, deps = {}) {
+  const {
+    createItem: fileItem = createItem,
+    appendFeedbackOutboxEntry: appendOutbox = appendFeedbackOutboxEntry,
+    appendCarryEntry: appendCarry = appendCarryEntry,
+    appendSessionRecordSection: appendSection = appendSessionRecordSection,
+    appendUnresolvedFriction: appendUnresolved = appendUnresolvedFriction,
+    logFn = logError,
+  } = deps;
+  const { project = {}, sessionId = null, recordPath = null, threadIds = [] } = ctx;
+  const slugUnresolved = ctx.slugUnresolved ?? (!!project.unresolved && !project.path);
+  const route = finding.route;
+  const title = String(finding.title || '').trim();
+  const description = String(finding.description || '').trim();
+  const summary = `${description}\n\nRoute: ${route.type} — ${route.detail}`;
+  const oneLine = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const record = (line) => {
+    if (!recordPath) {
+      logFn(`Phase 2g: no session record path — friction line not recorded: ${line}`);
+      return;
+    }
+    appendSection(recordPath, '## Friction', [line], { sessionId, logFn });
+  };
+
+  if (route.type === 'config-change') {
+    fileItem({
+      project: project.name,
+      project_path: project.path,
+      ...(project.unresolved ? { project_unresolved: true } : {}),
+      filed_by: 'ring3-close',
+      thread_ids: threadIds,
+      category: 'upstream-friction',
+      urgency: finding.severity === 'high' ? 'urgent' : 'normal',
+      title,
+      summary,
+      context_anchor: 'ring3-close friction scan',
+      evidence: { severity: finding.severity, route },
+    });
+    return { route: route.type, outcome: 'inbox' };
+  }
+
+  if (route.type === 'cc-feedback') {
+    // A duplicate only when the model JUDGED it one (act:08aca7a9) — passed in
+    // by upstreamFriction, already validated against the shortlist it saw.
+    const judged = ctx.duplicateJudgment && ctx.duplicateJudgment.duplicate_of ? ctx.duplicateJudgment : null;
+    try {
+      const r = appendOutbox(frictionOutboxEntry({
+        project: project.name, title, summary, route, sessionId, filedBy: 'ring3-close',
+      }), judged ? { duplicateOf: judged.duplicate_of } : {});
+      if (!r.appended) {
+        const why = judged ? ` — judged the same problem: ${oneLine(judged.reason)}` : ' — identical title already pending';
+        record(`- duplicate-of: ${r.duplicate_of} — ${oneLine(title)} (cc-feedback: ${oneLine(route.detail)}; not re-sent${why})`);
+        return { route: route.type, outcome: 'duplicate', duplicate_of: r.duplicate_of };
+      }
+      return { route: route.type, outcome: 'outbox', path: r.path, index: r.index };
+    } catch (e) {
+      logFn(`Phase 2g: outbox write failed for "${title}": ${e.message}`);
+      record(`- ${oneLine(title)} — cc-feedback: ${oneLine(route.detail)}: ${oneLine(description)} (outbox write FAILED: ${oneLine(e.message)} — not delivered)`);
+      return { route: route.type, outcome: 'failed', error: e.message };
+    }
+  }
+
+  // project-tracker (EP2): the record line, then the carry entry.
+  const line = `- ${oneLine(title)} — ${oneLine(route.detail)}: ${oneLine(description)}`;
+  if (slugUnresolved) {
+    const p = appendUnresolved({
+      session_id: sessionId, project: project.name || null, project_path: project.path || null,
+      title, summary: description, route,
+    });
+    if (!p) logFn(`Phase 2g: unresolved-identity friction could not be counted — "${title}"`);
+    else logFn(`Phase 2g: project-tracker friction from an unresolved-identity session — not carried (no project key); counted in ${p}`);
+    record(`${line} (unresolved project — not carried; counted in state/residue/unresolved-friction.jsonl)`);
+    return { route: route.type, outcome: 'unresolved', path: p };
+  }
+  const slug = project.slug || slugify(project.name || 'unresolved');
+  try {
+    const entry = appendCarry(slug, {
+      kind: 'friction', title, detail: summary, source_session: sessionId,
+      source: {
+        category: 'upstream-friction', filed_by: 'ring3-close', project_path: project.path || null,
+        urgency: finding.severity === 'high' ? 'urgent' : 'normal', route,
+      },
+    });
+    record(line);
+    return { route: route.type, outcome: 'carry', carry_id: entry.id };
+  } catch (e) {
+    logFn(`Phase 2g: carry write failed for "${title}": ${e.message}`);
+    record(`${line} (carry write FAILED: ${oneLine(e.message)} — not carried)`);
+    return { route: route.type, outcome: 'failed', error: e.message };
+  }
+}
+
+/**
+ * Ask the model whether each new Claude Cabinet friction report is the SAME
+ * problem as one of the few past reports a title shortlist found
+ * (act:08aca7a9 — operator, 2026-10-31: "Shouldn't it be intelligent?").
+ * One call for the whole batch, on Ring 3's own model (Sonnet — the cheap
+ * tier the rings already use). Returns the model's answers verbatim; the
+ * caller accepts only an answer naming a file it was SHOWN. Throws on an API
+ * failure; the caller treats that as "deliver".
+ * @param {Array<{index:number,title:string,description:string,candidates:Array<{ref:string,title:string,excerpt:string}>}>} reports
+ */
+export async function judgeFeedbackDuplicates(reports, { callFn = claudeCall } = {}) {
+  if (!Array.isArray(reports) || reports.length === 0) return [];
+  const system = 'You decide whether a NEW feedback report describes the SAME problem as one of a few EARLIER reports. '
+    + 'Same problem means: the same component misbehaving in the same way, so fixing one fixes the other. '
+    + 'Sharing a topic, a tool name or vocabulary is NOT the same problem. When in doubt, answer null — a missed '
+    + 'duplicate costs one dismissal at triage; a false match silently loses a report.';
+  const blocks = reports.map((r) => [
+    `NEW REPORT ${r.index}: ${r.title}`,
+    `  ${String(r.description || '').replace(/\s+/g, ' ').slice(0, 500)}`,
+    '  EARLIER CANDIDATES:',
+    ...r.candidates.map((c) => `  - ref: ${c.ref}\n    title: ${c.title}\n    excerpt: ${c.excerpt}`),
+  ].join('\n'));
+  const user = `${blocks.join('\n\n')}\n\nAnswer ONLY a JSON array, one object per new report: `
+    + '[{"index": <n>, "duplicate_of": "<the exact ref of the SAME-problem candidate>" | null, "reason": "<one short sentence>"}]';
+  const text = await callFn(system, user);
+  const m = String(text || '').match(/\[[\s\S]*\]/);
+  if (!m) return [];
+  try {
+    const parsed = JSON.parse(m[0]);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+
+async function upstreamFriction(compressed, project, threadIds = [],
+  { callFn = claudeCall, sessionId = null, recordPath = null, deps = {}, judgeFn = null } = {}) {
   log('Phase 2g: Upstream friction');
+  const slugUnresolved = !!project.unresolved && !project.path;
+  const target = recordPath || (sessionId
+    ? (slugUnresolved
+      ? residueRecordPath(sessionId)
+      : sessionRecordPath(project.slug || slugify(project.name || 'unresolved'), new Date().toISOString().slice(0, 10), sessionId))
+    : null);
 
   const instruction = `You are analyzing the Claude Code session transcript above for friction with Claude Code itself (bugs, limitations, confusing behavior, missing features, workarounds). Only report genuine CC friction, not user errors or project-specific issues.
 
@@ -2732,38 +2868,68 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
     const jsonMatch = response.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
       log('Phase 2g: No upstream friction (parse failure)');
-      return { routed: 0, durable: 0, dropped: 0 };
+      return { routed: 0, duplicates: 0, durable: 0, dropped: 0 };
     }
 
     const frictionItems = JSON.parse(jsonMatch[0]);
 
     if (frictionItems.length === 0) {
       log('Phase 2g: No upstream friction detected');
-      return { routed: 0, durable: 0, dropped: 0 };
+      return { routed: 0, duplicates: 0, durable: 0, dropped: 0 };
     }
 
-    const tally = { routed: 0, durable: 0, dropped: 0 };
+    const tally = { routed: 0, duplicates: 0, durable: 0, dropped: 0 };
 
-    for (const item of frictionItems) {
-      const base = {
-        project: project.name,
-        project_path: projectPath,
-        ...(project.unresolved ? { project_unresolved: true } : {}),
-        filed_by: 'ring3-close',
-        thread_ids: threadIds,
-      };
+    // Duplicate judgment for Claude Cabinet reports (act:08aca7a9): a title
+    // shortlist proposes, the model decides, and only an answer naming a
+    // candidate it was SHOWN, with a reason, holds a report back. Any
+    // failure, "null", unparseable or out-of-list answer delivers.
+    const judgments = new Map();
+    const findCandidates = deps.findFeedbackDuplicateCandidates || findFeedbackDuplicateCandidates;
+    const toJudge = [];
+    frictionItems.forEach((item, index) => {
+      if (!frictionRouteIsActionable(item.route) || item.route.type !== 'cc-feedback') return;
+      let candidates = [];
+      try { candidates = findCandidates({ title: item.title, body: item.description }); } catch (e) {
+        logError(`Phase 2g: duplicate shortlist failed for "${item.title}": ${e.message}`);
+      }
+      if (candidates.length) toJudge.push({ index, title: String(item.title || ''), description: String(item.description || ''), candidates });
+    });
+    if (toJudge.length) {
+      let answers = [];
+      try {
+        answers = await (judgeFn || ((reports) => judgeFeedbackDuplicates(reports, { callFn })))(toJudge);
+      } catch (e) {
+        logError(`Phase 2g: duplicate judgment failed — delivering all ${toJudge.length} report(s): ${e.message}`);
+        answers = [];
+      }
+      for (const a of Array.isArray(answers) ? answers : []) {
+        const asked = toJudge.find((r) => r.index === a?.index);
+        if (!asked || !a.duplicate_of || typeof a.reason !== 'string' || !a.reason.trim()) continue;
+        if (!asked.candidates.some((c) => c.ref === a.duplicate_of)) {
+          log(`Phase 2g: judge named "${a.duplicate_of}", which it was not shown — delivering "${asked.title}"`);
+          continue;
+        }
+        judgments.set(a.index, { duplicate_of: a.duplicate_of, reason: a.reason.trim() });
+      }
+      log(`Phase 2g: duplicate judgment — ${toJudge.length} shortlisted, ${judgments.size} judged duplicate`);
+    }
 
+    for (const [index, item] of frictionItems.entries()) {
       if (frictionRouteIsActionable(item.route)) {
-        createItem({
-          ...base,
-          category: 'upstream-friction',
-          urgency: item.severity === 'high' ? 'urgent' : 'normal',
-          title: item.title,
-          summary: `${item.description}\n\nRoute: ${item.route.type} — ${item.route.detail}`,
-          context_anchor: 'ring3-close friction scan',
-          evidence: { severity: item.severity, route: item.route },
-        });
+        // Delivered by route (plan B4): outbox, carry ledger, or — for
+        // config-change only — the inbox. A per-finding failure is logged
+        // and recorded inside routeFriction; one bad report never stops the
+        // rest of the batch.
+        let r;
+        try {
+          r = routeFriction(item, { project, sessionId, recordPath: target, threadIds, slugUnresolved, duplicateJudgment: judgments.get(index) || null }, deps);
+        } catch (e) {
+          logError(`Phase 2g: routing "${item.title}" failed: ${e.message}`);
+          r = { outcome: 'failed' };
+        }
         tally.routed++;
+        if (r.outcome === 'duplicate') tally.duplicates++;
         continue;
       }
 
@@ -2791,8 +2957,8 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
     // All three counts, always. Silence here would be indistinguishable from
     // the lens never running — and the drop count is the number this change
     // exists to move, so it must be observable.
-    log(`Phase 2g: friction — ${tally.routed} routed, ${tally.durable} durable (counted, not filed), `
-      + `${tally.dropped} dropped (no route, nothing durable)`);
+    log(`Phase 2g: friction — ${tally.routed} routed (${tally.duplicates} duplicate, not re-sent), `
+      + `${tally.durable} durable (counted, not filed), ${tally.dropped} dropped (no route, nothing durable)`);
     return tally;
   } catch (e) {
     logError(`Phase 2g: Friction detection failed: ${e.message}`);
@@ -2812,9 +2978,11 @@ Be conservative. False positives waste time. Output ONLY the JSON array.`;
 // whose standing-mandate includes `session-close` AND declares a
 // `directives.session-close` runs here, so consumer projects can re-home or
 // extend the roster via directives-project.yaml without touching this
-// script. Findings file as `advisor-finding` inbox items; /briefing
-// re-surfaces fresh ones at the top of the owning project's chunk (a Step
-// 3b candidate class — never a permanent section). Cost control: reuses
+// script. Findings NEVER reach the inbox (Simplification Project 2, plan A4 /
+// Decision 4, act:dafa9afa): each one is written to the session record's
+// `## Advisor findings` section (member, directive key, finding) AND as one
+// `advisor` carry entry, shown once in the project's next start block; the
+// record is what /briefing and the weekly roundup read. Cost control: reuses
 // this run's pinned-sonnet claudeCall — no Claude Code spawn, no extra
 // process; silence is the expected common case.
 
@@ -2878,9 +3046,13 @@ function parseAdvisorFindings(text) {
 
 // callFn is injectable for hermetic tests — production callers omit it and
 // get this run's pinned-sonnet claudeCall.
+// `recordPath` is the per-session record main() computed once (plan A3, T13);
+// a direct caller without one gets sessionRecordPath's spelling for today.
 async function advisorPass(compressed, project, sessionId, threadIds = [],
-  { callFn = claudeCall, config = null, sessionWindow = null } = {}) {
+  { callFn = claudeCall, config = null, sessionWindow = null, recordPath = null, recordFn = recordAdvisorFindings } = {}) {
   log('Phase 2m: Session advisor pass');
+  const target = recordPath || sessionRecordPath(project.slug || slugify(project.name || 'unresolved'),
+    new Date().toISOString().slice(0, 10), sessionId);
 
   const { advisors, reason } = discoverSessionAdvisors(project.path);
   if (advisors.length === 0) {
@@ -2981,32 +3153,26 @@ Output ONLY the JSON array, no other text.`;
         });
         continue;
       }
+      // The record line + one advisor carry entry, through the ONE writer the
+      // receipt branches also use (lib recordAdvisorFindings) — never
+      // createItem. The carry entry follows lane 3's render contract:
+      // source.member + the finding text in detail.
       try {
-        createItem({
-          project: project.name,
-          project_path: project.path,
-          ...(project.unresolved ? { project_unresolved: true } : {}),
-          category: 'advisor-finding',
-          urgency: f.urgency,
-          title: fullTitle,
-          summary: f.summary,
-          context_anchor: `session ${sessionId} — ${advisor.name} close pass`,
-          evidence: {
-            member: advisor.name,
-            directive_key: 'session-close',
-            session_id: sessionId,
-          },
-          filed_by: 'ring3-close',
-          thread_ids: threadIds,
-        });
-        filed++;
+        const n = recordFn(target, project.slug || slugify(project.name || 'unresolved'), [{
+          member: shortName,
+          skill: advisor.name,
+          directive_key: 'session-close',
+          title: f.title,
+          finding: f.summary ? `${f.title} — ${f.summary}` : f.title,
+        }], { sessionId, logFn: logError, filedBy: 'ring3-close' });
+        filed += n || 0;
       } catch (e) {
-        logError(`Phase 2m: Failed to file finding from ${advisor.name}: ${e.message}`);
+        logError(`Phase 2m: Failed to record finding from ${advisor.name}: ${e.message}`);
       }
     }
   }
 
-  log(`Phase 2m: ${filed} advisor finding(s) filed${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
+  log(`Phase 2m: ${filed} advisor finding(s) written to ${target} + the carry ledger${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
   return { filed };
 }
 
@@ -3029,8 +3195,8 @@ Output ONLY the JSON array, no other text.`;
 //       the audit pruning loop).
 // ---------------------------------------------------------------------------
 
-const RAISED_UNHANDLED_MAX = 5;   // loose-end items filed per session
-const SKILL_CANDIDATE_MAX = 3;    // skill candidates filed per session
+const RAISED_UNHANDLED_MAX = 5;   // loose-end lines written per session
+const SKILL_CANDIDATE_MAX = 3;    // skill-candidate lines written per session
 const CHECKLIST_CATCH_MAX = 5;    // catches recorded per session
 
 // parseLensFindings — shared structured-output parser for the inbox lenses.
@@ -3071,13 +3237,21 @@ function parseLensFindings(text, { cap, extraKeys = [] } = {}) {
 // NOT just other-project strays. A promise made in passing ("I'll also wire
 // X"), a side-issue noticed and set down, a question asked and never answered
 // — if the session ends with it neither done nor filed, it evaporates. This
-// lens catches it as a low-ceremony inbox item the operator can promote to an
-// action or dismiss. It runs AFTER Phase 2c/2d/2m so its pending corpus
-// already contains this session's completion candidates, extractions, and
-// advisor findings — a loose end one of those already captured is suppressed.
+// lens catches it. Since Simplification Project 2 (plan A3 / Decision 3,
+// act:73dd31d4) it writes to the SESSION RECORD's `## Loose ends` section —
+// never the inbox — and runs ONLY when the session never reached /close
+// (runResidueFallback's no-receipt branch): the session at close can tell a
+// deliberate silence from a dropped commitment (act:9ed07d9d — 9 of 35 items
+// in one project were one operator's deliberate non-answer); a background
+// model reading the transcript afterwards cannot. Measured before the move:
+// 96 filed per 28 days, 1 human-closed. It runs AFTER Phase 2c/2m so its
+// pending corpus already contains this session's completion candidates and
+// advisor findings — a loose end one of those already captured is suppressed
+// (the dedup stack stays; Project 4 owns it).
 async function raisedUnhandledLens(compressed, project, sessionId, transcriptPath,
-  threadIds = [], { callFn = claudeCall, config = null, sessionWindow = null } = {}) {
+  threadIds = [], { callFn = claudeCall, config = null, sessionWindow = null, recordPath = null } = {}) {
   log('Phase 2n: Raised-but-unhandled lens');
+  const target = recordPath || sessionRecordPath(project.slug, new Date().toISOString().slice(0, 10), sessionId);
 
   // Cache-group member (act:25b2c277): instruction after the cached transcript.
   const instruction = `You are scanning the finished Claude Code session transcript above for loose ends: things that were RAISED during the session but were neither completed nor recorded anywhere before it ended. Three kinds:
@@ -3104,11 +3278,11 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
     findings = parseLensFindings(response, { cap: RAISED_UNHANDLED_MAX, extraKeys: ['kind'] });
   } catch (e) {
     logError(`Phase 2n: Claude scan failed: ${e.message}`);
-    return { queued: 0 };
+    return { written: 0, suppressed: 0 };
   }
   if (findings.length === 0) {
     log('Phase 2n: No unhandled items raised');
-    return { queued: 0 };
+    return { written: 0, suppressed: 0 };
   }
 
   // Phase 2n is the lens the session-actions corpus fits best: a loose end the
@@ -3117,7 +3291,7 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
     sessionActionEntries: sessionActionCorpus, ruleEntries } =
     buildExtractionCorpora(project, { phase: 'Phase 2n', config, sessionWindow });
 
-  let queued = 0;
+  const lines = [];
   let suppressed = 0;
   for (const f of findings) {
     const fullTitle = `unhandled: ${f.title}`;
@@ -3138,37 +3312,16 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
       });
       continue;
     }
-    try {
-      createItem({
-        project: project.name,
-        project_path: project.path,
-        ...(project.unresolved ? { project_unresolved: true } : {}),
-        category: 'raised-unhandled',
-        urgency: f.urgency,
-        title: fullTitle,
-        summary: f.summary,
-        context_anchor: `session ${sessionId}`,
-        evidence: {
-          kind: f.kind || 'side-issue',
-          session_id: sessionId,
-        },
-        options: [
-          { key: 'create-action', label: 'Create an action to handle it' },
-          { key: 'keep', label: 'Keep as a reminder' },
-          { key: 'dismiss', label: 'Dismiss (already handled or not worth it)' },
-        ],
-        filed_by: 'ring3-close',
-        transcript_ref: { path: transcriptPath, line_range: null },
-        thread_ids: threadIds,
-      });
-      queued++;
-    } catch (e) {
-      logError(`Phase 2n: Failed to queue loose end: ${e.message}`);
-    }
+    lines.push(`- ${fullTitle} — ${f.summary || ''} (${f.kind || 'side-issue'}, ${f.urgency}; session ${sessionId})`);
   }
 
-  log(`Phase 2n: ${queued} loose end(s) queued${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
-  return { queued };
+  // The record, never the inbox. appendSessionRecordSection never throws.
+  const r = lines.length
+    ? appendSessionRecordSection(target, '## Loose ends', lines, { sessionId, logFn: logError })
+    : { ok: true, written: 0 };
+  const written = r.ok ? r.written : 0;
+  log(`Phase 2n: ${written} loose end(s) written to ${target}${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
+  return { written, suppressed };
 }
 
 // ---------------------------------------------------------------------------
@@ -3178,11 +3331,15 @@ Urgency is value-decay speed, not importance: "urgent" only if the loose end los
 // The skill-discovery extension of the knowledge-extraction concern (the
 // retired Phase 2d's sibling): when the session shows the operator performing the SAME
 // multi-step manual procedure more than once by hand, a Claude Code skill or
-// slash-command would have automated it. Surface it as a "should this become
-// a skill?" inbox item. Same dedup discipline as every other lens.
+// slash-command would have automated it. Since Simplification Project 2 (plan
+// A3, act:73dd31d4) the candidate is written to the SESSION RECORD's
+// `## Skill candidates` — never the inbox — and only when the session never
+// reached /close (Step 6c asks "note as skill candidate" in-session). Same
+// dedup discipline as every other lens.
 async function skillCandidateLens(compressed, project, sessionId, transcriptPath,
-  threadIds = [], { callFn = claudeCall, config = null, sessionWindow = null } = {}) {
+  threadIds = [], { callFn = claudeCall, config = null, sessionWindow = null, recordPath = null } = {}) {
   log('Phase 2o: Skill-candidate lens');
+  const target = recordPath || sessionRecordPath(project.slug, new Date().toISOString().slice(0, 10), sessionId);
 
   // Cache-group member (act:25b2c277): instruction after the cached transcript.
   const instruction = `You are scanning the finished Claude Code session transcript above for REPEATED MANUAL PROCEDURES that should become a reusable Claude Code skill (slash-command). Look for a multi-step sequence the operator or assistant performed BY HAND two or more times, or an ad-hoc procedure clearly done routinely, where a skill would have automated it.
@@ -3209,18 +3366,18 @@ Skill candidates are durable — they are almost never urgent. Output ONLY the J
     findings = parseLensFindings(response, { cap: SKILL_CANDIDATE_MAX, extraKeys: ['repetition'] });
   } catch (e) {
     logError(`Phase 2o: Claude scan failed: ${e.message}`);
-    return { queued: 0 };
+    return { written: 0, suppressed: 0 };
   }
   if (findings.length === 0) {
     log('Phase 2o: No skill candidates detected');
-    return { queued: 0 };
+    return { written: 0, suppressed: 0 };
   }
 
   const { memoryEntries, threadCursorLines: cursorLines, pendingTitles, resolutionTitles,
     sessionActionEntries: sessionActionCorpus, ruleEntries } =
     buildExtractionCorpora(project, { phase: 'Phase 2o', config, sessionWindow });
 
-  let queued = 0;
+  const lines = [];
   let suppressed = 0;
   for (const f of findings) {
     const fullTitle = `skill-candidate: ${f.title}`;
@@ -3241,36 +3398,15 @@ Skill candidates are durable — they are almost never urgent. Output ONLY the J
       });
       continue;
     }
-    try {
-      createItem({
-        project: project.name,
-        project_path: project.path,
-        ...(project.unresolved ? { project_unresolved: true } : {}),
-        category: 'skill-candidate',
-        urgency: f.urgency,
-        title: fullTitle,
-        summary: f.repetition ? `${f.summary}\n\nObserved repetition: ${f.repetition}` : f.summary,
-        context_anchor: `session ${sessionId}`,
-        evidence: {
-          repetition: f.repetition || '',
-          session_id: sessionId,
-        },
-        options: [
-          { key: 'draft-skill', label: 'Draft a skill for it' },
-          { key: 'dismiss', label: 'Dismiss (not worth a skill)' },
-        ],
-        filed_by: 'ring3-close',
-        transcript_ref: { path: transcriptPath, line_range: null },
-        thread_ids: threadIds,
-      });
-      queued++;
-    } catch (e) {
-      logError(`Phase 2o: Failed to queue skill candidate: ${e.message}`);
-    }
+    lines.push(`- ${fullTitle} — ${f.summary || ''}${f.repetition ? ` (observed repetition: ${f.repetition})` : ''} (session ${sessionId})`);
   }
 
-  log(`Phase 2o: ${queued} skill candidate(s) queued${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
-  return { queued };
+  const r = lines.length
+    ? appendSessionRecordSection(target, '## Skill candidates', lines, { sessionId, logFn: logError })
+    : { ok: true, written: 0 };
+  const written = r.ok ? r.written : 0;
+  log(`Phase 2o: ${written} skill candidate(s) written to ${target}${suppressed ? ` (${suppressed} suppressed as duplicates)` : ''}`);
+  return { written, suppressed };
 }
 
 // ---------------------------------------------------------------------------
@@ -3755,11 +3891,13 @@ export function resolveSessionProject({ cwd, transcriptPath }, config, deps = {}
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2q: verify-coverage lens — warns when the session shipped UI changes
+// Phase 2q: verify-coverage lens — notes when the session shipped UI changes
 // with no matching .feature edit (drift: the product changed, the walkthrough
 // scenarios didn't). Diff-based (no API call); ports debrief's verify-coverage
 // phase to session close so coverage pressure survives debrief's retirement.
-// /verify update stays the executor; the lens is only the trigger. (act:1be47d42)
+// /verify update stays the executor; the lens is only the trigger (act:1be47d42)
+// — and since Simplification Project 2 plan A3 only the FALLBACK trigger: the
+// session is asked at /close first (runResidueFallback below).
 // ---------------------------------------------------------------------------
 
 // Pure: from the session's changed paths, is it UI-touching but scenario-silent?
@@ -3818,273 +3956,170 @@ function sessionEndFromTranscript(transcriptPath) {
   return null;
 }
 
-// --- Standing-debt aggregation (act:e888dd63) -------------------------------
-// A coverage warning is a STANDING condition, not an event: the same debt
-// recurs every session while the scenarios lag the UI. Filing one item per
-// session buried the signal — the 2026-07-12 drain held 49 identical items
-// for ONE month-old debt. The detector now keeps ONE pending item per
-// (project, debt-class) and APPENDS evidence to it: session-id union (a
-// reprocess replay cannot inflate counts), per-path counts, first_seen =
-// oldest evidence (Lane C's backlog-rot ages the item by this, per the
-// program's amended ACs), filed_at bumped on each append — so runExpiry's
-// 30-day clock measures the LAST recurrence: an actively-recurring debt
-// never silently expires, a debt that stopped recurring ages out normally.
-// Resolution semantics unchanged: any disposition (resolve, dismiss, expire)
-// closes the accumulated view, and post-disposition recurrence files FRESH
-// with fresh counters — a new signal, not a resurrected pile.
-export const COVERAGE_DEBT_CLASS = 'verify-coverage-drift';
-// Urgency escalates with the debt's session count so a 90-session debt never
-// sorts like a 5-session one (named thresholds per the amended AC).
-export const COVERAGE_DEBT_NORMAL_SESSIONS = 5;
-export const COVERAGE_DEBT_URGENT_SESSIONS = 15;
-
-export function coverageDebtUrgency(sessions) {
-  if (sessions >= COVERAGE_DEBT_URGENT_SESSIONS) return 'urgent';
-  if (sessions >= COVERAGE_DEBT_NORMAL_SESSIONS) return 'normal';
-  return 'low';
-}
-
-// Normalize any coverage-warning evidence — a single-session observation, a
-// legacy per-session item, or an aggregated blob — into the foldable form.
-export function coverageContribution(e, fallbackDate = null) {
-  const ids = Array.isArray(e?.session_ids)
-    ? e.session_ids.filter(Boolean)
-    : (e?.session_id ? [e.session_id] : []);
-  let counts = {};
-  if (e?.path_counts && typeof e.path_counts === 'object') {
-    counts = { ...e.path_counts };
-  } else if (Array.isArray(e?.ui_paths)) {
-    for (const p of e.ui_paths) if (typeof p === 'string' && p) counts[p] = 1;
-  }
-  const seen = e?.first_seen || e?.session_start || fallbackDate || null;
-  const last = e?.last_seen || e?.session_start || fallbackDate || null;
-  return { session_ids: ids, path_counts: counts, first_seen: seen, last_seen: last };
-}
-
-export function foldCoverageEvidence(base, add) {
-  const a = base || { session_ids: [], path_counts: {}, first_seen: null, last_seen: null };
-  const ids = [...new Set([...(a.session_ids || []), ...(add.session_ids || [])])];
-  const counts = { ...(a.path_counts || {}) };
-  for (const [p, n] of Object.entries(add.path_counts || {})) {
-    counts[p] = (counts[p] || 0) + (Number(n) || 0);
-  }
-  const firsts = [a.first_seen, add.first_seen].filter(Boolean).sort();
-  const lasts = [a.last_seen, add.last_seen].filter(Boolean).sort();
-  return {
-    session_ids: ids,
-    path_counts: counts,
-    first_seen: firsts[0] || null,
-    last_seen: lasts[lasts.length - 1] || null,
-  };
-}
-
-export function coverageDebtTitle(evidence) {
-  const n = evidence.sessions || (evidence.session_ids || []).length || 1;
-  if (n <= 1) return 'UI shipped this session without a scenario update';
-  const since = (evidence.first_seen || '').slice(0, 10);
-  return `UI drift debt: ${n} sessions without scenario updates${since ? ` since ${since}` : ''}`;
-}
-
-export function coverageDebtSummary(evidence, { topN = 3 } = {}) {
-  const counts = evidence.path_counts || {};
-  const ranked = Object.entries(counts).sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]));
-  const n = evidence.sessions || (evidence.session_ids || []).length || 1;
-  if (n <= 1) {
-    const paths = ranked.map(([p]) => p);
-    const shown = paths.slice(0, topN).join(', ')
-      + (paths.length > topN ? `, +${paths.length - topN} more` : '');
-    return `This session changed UI (${shown}) but touched no .feature file — `
-      + `drift risk: the product changed, the walkthrough scenarios didn't. Run `
-      + `/verify update to propose the matching scenario edits, or accept the drift `
-      + `if the change isn't user-visible.`;
-  }
-  const since = (evidence.first_seen || '').slice(0, 10);
-  const top = ranked.slice(0, topN).map(([p, c]) => `${p} (${c})`).join(', ')
-    + (ranked.length > topN ? `, +${ranked.length - topN} more paths` : '');
-  return `Standing scenario-coverage debt: ${n} sessions${since ? ` since ${since}` : ''} `
-    + `shipped UI changes with no .feature edit. Most-hit: ${top}. Run /verify update `
-    + `to propose the matching scenario edits, or accept the drift if it isn't `
-    + `user-visible. Resolving this item closes the accumulated view; if the debt `
-    + `persists, the next session files fresh.`;
-}
-
-// Direct item-file write for the append. The queue CRUD library exports no
-// update/append verb (and is another lane's file in this program), so the
-// standing-debt append writes the item file in place — the same direct-write
-// precedent Ring 2's enrichment uses. ONE helper owns the mechanics and the
-// byte format matches the queue's own writer (JSON, 2-space, trailing
-// newline); the primitive's proper home is a watchtower-queue verb at next
-// touch — the detector-registry follow-up (act:4d11fd53) documents the
-// aggregation pattern including this seam.
-function queueItemPath(id) {
-  return join(WATCHTOWER_DIR, 'queue', 'items', `${id}.json`);
-}
-function defaultReloadQueueItem(id) {
-  try {
-    const item = JSON.parse(readFileSync(queueItemPath(id), 'utf8'));
-    // Mirror the queue reader's schema boundary: an unknown schema_version is
-    // never appended-to blind — the caller takes the fresh-filing path.
-    return item?.schema_version === 1 ? item : null;
-  } catch {
-    return null; // missing OR corrupt — caller files fresh, never throws
-  }
-}
-function defaultSaveQueueItem(item) {
-  atomicWrite(queueItemPath(item.id), JSON.stringify(item, null, 2) + '\n');
-}
-
-// Deps injectable for hermetic tests; production callers omit them. Runs against
-// the RESOLVED project path (a worktree resolves to its main repo), so "shipped"
-// means landed on the integration branch — un-merged worktree work isn't warned
-// on until it merges, which is the correct moment.
+// --- The residue line (Simplification Project 2, plan A3; act:73dd31d4) -----
+// The standing-debt aggregation (act:e888dd63 — ONE accumulating
+// coverage-warning inbox item per project, evidence folded per session,
+// urgency by session count, absorbed legacy piles superseded) is GONE with
+// its filing site; `coverage-warning` is a retired category. The question
+// "did this session's UI change get a scenario?" is asked at /close by the
+// session that made the change (Step 6c, "write verify plan" on the touched
+// action); this lens is what Ring 3 writes for a session that never reached
+// /close — one `## Loose ends` line naming the UI paths, in the session
+// record, never the inbox. `/verify update` stays the executor.
+//
+// Deps injectable for hermetic tests; production callers omit them. Runs
+// against the RESOLVED project path (a worktree resolves to its main repo), so
+// "shipped" means landed on the integration branch — un-merged worktree work
+// isn't warned on until it merges, which is the correct moment.
 export function verifyCoverageLens(project, sessionStartIso, sessionId, deps = {}) {
   const runGit = deps.runGit || ((cmd) => safeExec(cmd, { cwd: project.path }));
-  const file = deps.file || createItem;
-  const listPendingItems = deps.listPendingItems || listPending;
+  const appendSection = deps.appendSection || appendSessionRecordSection;
   const hasFeatures = deps.hasFeatures
     || ((p) => existsSync(join(p, 'e2e', 'features')));
 
-  if (!project?.path || !hasFeatures(project.path)) return { filed: 0 };
-  if (!sessionStartIso) return { filed: 0 };
+  if (!project?.path || !hasFeatures(project.path)) return { written: 0 };
+  if (!sessionStartIso) return { written: 0 };
 
   const out = runGit(
     `git log --since=${JSON.stringify(sessionStartIso)} --name-only --pretty=format: --no-renames`) || '';
   const changed = [...new Set(out.split('\n').map((s) => s.trim()).filter(Boolean))];
   const { paths: resolvedUiPaths, exclude: resolvedExcludePaths } = resolveUiPaths(deps.config);
   const { uncovered, uiPaths } = detectUncoveredUi(changed, resolvedUiPaths, resolvedExcludePaths);
-  if (!uncovered) return { filed: 0 };
+  if (!uncovered) return { written: 0 };
 
-  const reloadItem = deps.reloadItem || defaultReloadQueueItem;
-  const saveItem = deps.saveItem || defaultSaveQueueItem;
-  const supersede = deps.supersede || supersedeItem;
+  const target = deps.recordPath
+    || sessionRecordPath(project.slug, new Date().toISOString().slice(0, 10), sessionId);
+  const line = `- UI paths changed with no .feature edit: ${uiPaths.join(', ')} — run /verify update, `
+    + `or accept the drift if the change is not user-visible (session ${sessionId})`;
+  const r = appendSection(target, '## Loose ends', [line], { sessionId, logFn: logError });
+  const written = r && r.ok ? 1 : 0;
+  log(`Phase 2q: ${written ? 'coverage line written to ' + target : 'coverage line NOT written'}`);
+  return { written };
+}
 
-  const listDispositioned = deps.listDispositioned
-    || (() => listItems({
-      project: project.name, category: 'coverage-warning',
-      statuses: ['resolved', 'dismissed', 'superseded', 'expired'],
-    }));
+// ---------------------------------------------------------------------------
+// The receipt-driven residue fallback (Simplification Project 2, plan B3 /
+// decision default 15; act:73dd31d4)
+// ---------------------------------------------------------------------------
+//
+// /close Step 6c asks the session-residue question IN-SESSION and writes a
+// receipt — state/residue/<session-id>.json — BEFORE it asks (so walking away
+// leaves the proposals, unanswered). Ring 3 reads that receipt here, before
+// the residue lenses would run:
+//
+//   answered (incl. findings: [])  → skip 2n/2o/2q; write the accepted
+//                                    "note as skill candidate" lines under
+//                                    ## Skill candidates and the receipt's
+//                                    advisor_findings under ## Advisor
+//                                    findings + the carry ledger.
+//   present, not answered          → write the proposals VERBATIM under
+//                                    ## Loose ends (proposed at /close, not
+//                                    answered); advisor_findings as above;
+//                                    skip the lenses (Q4 constraint 6: no
+//                                    reply is not consent, and the record —
+//                                    never the inbox — is where they wait;
+//                                    carried friction stays unresolved).
+//   no receipt (never reached /close) → run 2n/2o/2q as re-pointed, into the
+//                                    record.
+//   advisor-only receipt            → the by-hand filers (/debrief, /orient;
+//     (no findings array)             plan A4 / A9's table) wrote advisor
+//                                    findings but /close never asked: write
+//                                    the advisor_findings as above AND take
+//                                    the no-receipt branch for the lenses —
+//                                    an advisor write is not "/close ran".
+//
+// Never the inbox in any branch. One line per close goes to
+// state/residue/fallback-ledger.jsonl — the D5 kill-trigger measurement: if
+// no-receipt fallback lines get no /recall hit and no start-block resolution
+// in 60 days, Project 4 deletes the lenses. Exported, deps-injected, because
+// main() has no phase seam a test could stub around.
+export const UNANSWERED_HEADING = '## Loose ends (proposed at /close, not answered)';
 
-  const pendingCoverage = listPendingItems(
-    { project: project.name, category: 'coverage-warning' });
+export async function runResidueFallback({
+  sessionId, project, recordPath, compressed, transcriptPath, threadIds = [],
+  sessionStartIso = null, sessionWindow = null, config = null,
+}, deps = {}) {
+  const readReceipt = deps.readReceipt || readResidueReceipt;
+  const appendSection = deps.appendSection || appendSessionRecordSection;
+  const ledger = deps.appendLedger || appendFallbackLedger;
+  const advisors = deps.recordAdvisorFindings || recordAdvisorFindings;
+  const lens2n = deps.raisedUnhandled || raisedUnhandledLens;
+  const lens2o = deps.skillCandidate || skillCandidateLens;
+  const lens2q = deps.verifyCoverage || verifyCoverageLens;
+  const defaults = (config && config.defaults) || {};
+  const slug = project.slug || slugify(project.name || 'unresolved');
 
-  // Replay guard: a reprocess of an already-counted session must not double
-  // a debt's counters — legacy per-session shape (session_id) and the
-  // aggregated shape (session_ids union) both count. The DISPOSITIONED
-  // corpus counts too: marker-cleared bulk reprocess is a lived workflow
-  // here (52 sessions in the Jul-2026 backfill), and a replayed session
-  // whose contribution the operator already resolved/dismissed must be a
-  // no-op — resurrection is not recurrence. A genuinely NEW session after a
-  // disposition still files fresh (its id is in no corpus).
-  const carriesSession = (i) =>
-    i.evidence?.session_id === sessionId
-    || (Array.isArray(i.evidence?.session_ids)
-        && i.evidence.session_ids.includes(sessionId));
-  let alreadyCounted = pendingCoverage.some(carriesSession);
-  if (!alreadyCounted) {
-    try {
-      alreadyCounted = listDispositioned().some(carriesSession);
-    } catch (e) {
-      logError(`coverage-debt dispositioned-corpus check failed (${e.message}) — continuing on the pending corpus alone`);
-    }
+  let receipt = null;
+  try { receipt = readReceipt(sessionId); } catch (e) { logError(`residue: receipt read failed: ${e.message}`); }
+
+  let branch;
+  let linesWritten = 0;
+  // An advisor-only receipt (no findings array): /close never asked. Record
+  // its advisor findings here, then treat the session as receipt-less.
+  if (receipt && !Array.isArray(receipt.findings)) {
+    linesWritten += advisors(recordPath, slug, receipt.advisor_findings, { sessionId, logFn: logError }) || 0;
+    log(`residue: receipt for ${sessionId} carries advisor findings only — /close did not ask`);
+    receipt = null;
   }
-  if (alreadyCounted) return { filed: 0, appended: 0 };
-
-  // ONE standing item per (project, debt-class). Oldest wins as the append
-  // target (deterministic under the multiple-pending race); every other
-  // pending coverage item — legacy per-session filings and race residue —
-  // is absorbed: its evidence folds in and the item is superseded, so
-  // pre-aggregation piles collapse on the first post-upgrade session.
-  const standing = pendingCoverage
-    .filter((i) => i.evidence?.debt_class === COVERAGE_DEBT_CLASS)
-    .sort((a, b) => String(a.filed_at).localeCompare(String(b.filed_at)));
-  const target = standing[0] || null;
-  const absorbed = pendingCoverage.filter((i) => i !== target);
-
-  const nowIso = new Date().toISOString();
-  const sessionContrib = coverageContribution(
-    { session_id: sessionId, ui_paths: uiPaths, session_start: sessionStartIso }, nowIso);
-  let absorbedAgg = null;
-  for (const it of absorbed) {
-    absorbedAgg = foldCoverageEvidence(absorbedAgg, coverageContribution(it.evidence, it.filed_at));
-  }
-
-  const buildEvidence = (agg) => ({
-    debt_class: COVERAGE_DEBT_CLASS,
-    // Latest-session fields keep the legacy single-session reader shape.
-    session_id: sessionId,
-    session_start: sessionStartIso,
-    ...agg,
-    sessions: agg.session_ids.length,
-    ui_paths: Object.keys(agg.path_counts).sort(),
-  });
-
-  let appended = 0;
-  if (target) {
-    // Write-time re-check: the item can resolve between the pending read and
-    // this write. A non-pending (or unreadable) target takes the
-    // fresh-after-disposition path — fresh counters, per the contract above.
-    const fresh = reloadItem(target.id);
-    if (fresh && fresh.status === 'pending') {
-      const agg = foldCoverageEvidence(
-        foldCoverageEvidence(coverageContribution(fresh.evidence, fresh.filed_at), absorbedAgg || {}),
-        sessionContrib);
-      const evidence = buildEvidence(agg);
-      fresh.evidence = evidence;
-      fresh.title = coverageDebtTitle(evidence);
-      fresh.summary = coverageDebtSummary(evidence);
-      fresh.urgency = coverageDebtUrgency(evidence.sessions);
-      fresh.filed_at = nowIso; // expiry clock = last recurrence (header comment)
-      fresh.context_anchor = `standing debt ${COVERAGE_DEBT_CLASS} — git log --since session start (${sessionId})`;
-      try {
-        saveItem(fresh);
-        appended = 1;
-      } catch (e) {
-        logError(`coverage-debt append to ${target.id} failed (${e.message}) — filing fresh instead`);
-      }
-    } else {
-      log(`coverage-debt item ${target.id} no longer pending at write time — filing fresh`);
-    }
-  }
-
-  let filed = 0;
-  let newId = null;
-  if (!appended) {
-    const agg = foldCoverageEvidence(absorbedAgg || { session_ids: [], path_counts: {} }, sessionContrib);
-    const evidence = buildEvidence(agg);
-    const created = file({
-      project: project.name,
-      project_path: project.path,
-      ...(project.unresolved ? { project_unresolved: true } : {}),
-      filed_by: 'ring3-close',
-      category: 'coverage-warning',
-      urgency: coverageDebtUrgency(evidence.sessions),
-      title: coverageDebtTitle(evidence),
-      summary: coverageDebtSummary(evidence),
-      context_anchor: `standing debt ${COVERAGE_DEBT_CLASS} — git log --since session start (${sessionId})`,
-      evidence,
-      options: [
-        { value: 'update', label: 'Update scenarios', description: '/verify update' },
-        { value: 'accept-drift', label: 'Accept drift', description: 'Not user-visible' },
-        { value: 'dismiss', label: 'Dismiss', description: 'Not worth capturing' },
-      ],
+  if (receipt && receiptIsAnswered(receipt)) {
+    branch = 'answered';
+    const findings = Array.isArray(receipt.findings) ? receipt.findings : [];
+    const dispositions = receipt.dispositions && typeof receipt.dispositions === 'object' ? receipt.dispositions : {};
+    const accepted = findings.filter((f) => {
+      if (!f || f.kind !== 'skill-candidate') return false;
+      const d = dispositions[String(f.n)] ?? dispositions[f.n];
+      if (d === undefined || d === null) return findings.length === 0 ? false : true;
+      return !/^\s*drop/i.test(String(d));
     });
-    // createItem returns the new item's id STRING; test doubles may return
-    // an item object — accept both, never lose the successor reference.
-    newId = typeof created === 'string' ? created : (created?.id || null);
-    filed = 1;
-  }
-
-  // Absorbed items exit through the sanctioned verb, naming their successor.
-  const successor = appended ? target.id : (newId || 'the standing coverage-debt item');
-  for (const it of absorbed) {
-    try {
-      supersede(it.id, { reason: `absorbed into standing coverage-debt item ${successor} (${COVERAGE_DEBT_CLASS})` });
-    } catch (e) {
-      logError(`could not supersede absorbed coverage item ${it.id} (${e.message}) — its evidence is folded regardless`);
+    if (accepted.length) {
+      const r = appendSection(recordPath, '## Skill candidates',
+        accepted.map((f) => `- ${f.text}${f.proposed ? ` (${f.proposed})` : ''} (accepted at /close, session ${sessionId})`),
+        { sessionId, logFn: logError });
+      linesWritten += r && r.ok ? r.written : 0;
+    }
+    linesWritten += advisors(recordPath, slug, receipt.advisor_findings, { sessionId, logFn: logError }) || 0;
+    log(`residue: /close answered the residue question for ${sessionId} — lenses 2n/2o/2q skipped`);
+  } else if (receipt) {
+    branch = 'unanswered';
+    const findings = Array.isArray(receipt.findings) ? receipt.findings : [];
+    const r = appendSection(recordPath, UNANSWERED_HEADING,
+      findings.map((f) => `${f.n}. [${f.kind}] ${f.text} → ${f.proposed || 'no proposal'}${f.carry_id ? ` (carry ${f.carry_id}, still carried)` : ''}`),
+      { sessionId, logFn: logError });
+    linesWritten += r && r.ok ? r.written : 0;
+    linesWritten += advisors(recordPath, slug, receipt.advisor_findings, { sessionId, logFn: logError }) || 0;
+    log(`residue: /close asked but was not answered for ${sessionId} — ${findings.length} proposal(s) recorded, lenses skipped, carried friction stays carried`);
+  } else {
+    branch = 'no-receipt';
+    log(`residue: no /close receipt for ${sessionId} — running the fallback lenses into ${recordPath}`);
+    if (defaults.raised_unhandled_lens !== false) {
+      try {
+        const r = await lens2n(compressed, project, sessionId, transcriptPath, threadIds,
+          { config, sessionWindow, recordPath });
+        linesWritten += (r && r.written) || 0;
+      } catch (e) {
+        logError(`Phase 2n failed: ${e.message}`);
+      }
+    }
+    if (defaults.skill_candidate_lens !== false) {
+      try {
+        const r = await lens2o(compressed, project, sessionId, transcriptPath, threadIds,
+          { config, sessionWindow, recordPath });
+        linesWritten += (r && r.written) || 0;
+      } catch (e) {
+        logError(`Phase 2o failed: ${e.message}`);
+      }
+    }
+    if (defaults.verify_coverage !== false) {
+      try {
+        const r = lens2q(project, sessionStartIso, sessionId, { config, recordPath });
+        linesWritten += (r && r.written) || 0;
+      } catch (e) {
+        logError(`Phase 2q failed: ${e.message}`);
+      }
     }
   }
-
-  return { filed, appended };
+  ledger({ session_id: sessionId, project: project.name, branch, lines_written: linesWritten });
+  return { branch, lines_written: linesWritten };
 }
 
 // ---------------------------------------------------------------------------
@@ -4193,6 +4228,18 @@ async function main() {
 
   // --- Invariant phases: structurally unskippable ---
 
+  // The per-session record path, computed ONCE (plan A3, T13): Phase 2b writes
+  // it, every residue lens appends to it. An unresolved slug gets a
+  // session-id-keyed file under state/residue/ instead — never a state-file
+  // key minted from a transcript-slug name, never a silent drop (T5).
+  const recordDate = new Date().toISOString().slice(0, 10);
+  const recordPath = slugUnresolved
+    ? residueRecordPath(args.sessionId)
+    : sessionRecordPath(project.slug, recordDate, args.sessionId);
+  if (slugUnresolved) {
+    logError(`Residue for ${args.sessionId} will be written to ${recordPath} (unresolved project slug — not /recall-indexed)`);
+  }
+
   // Phase 2b: Session summary
   let summary = '';
   if (slugUnresolved) {
@@ -4208,7 +4255,7 @@ async function main() {
       logError(`Phase 2b: transcript retention failed: ${e.message}`);
     }
     try {
-      summary = await sessionSummary(compressed, project.slug, args.sessionId);
+      summary = await sessionSummary(compressed, project.slug, args.sessionId, { recordPath, date: recordDate });
     } catch (e) {
       logError(`Phase 2b failed: ${e.message}`);
     }
@@ -4253,19 +4300,14 @@ async function main() {
     logError(`Phase 2e failed: ${e.message}`);
   }
 
-  // Phase 2f: Methodology capture (feature-flagged)
-  if (config.defaults?.methodology_capture !== false) {
-    try {
-      await methodologyCapture(compressed, project, threadIds);
-    } catch (e) {
-      logError(`Phase 2f failed: ${e.message}`);
-    }
-  }
+  // Phase 2f (methodology capture) ran here until Simplification Project 2
+  // plan A3 deleted it — see the tombstone above Phase 2g. A stale
+  // `methodology_capture` key in a consumer's config.json is simply ignored.
 
   // Phase 2g: Upstream friction (feature-flagged)
   if (config.defaults?.upstream_friction_detection !== false) {
     try {
-      await upstreamFriction(compressed, project, threadIds);
+      await upstreamFriction(compressed, project, threadIds, { sessionId: args.sessionId, recordPath });
     } catch (e) {
       logError(`Phase 2g failed: ${e.message}`);
     }
@@ -4275,44 +4317,34 @@ async function main() {
   // (flushFeedbackOutbox in watchtower-lib.mjs; act:6c3a4763).
 
   // Phase 2m: Session advisor pass (feature-flagged) — the re-homed standing
-  // advisors' close-side seat (act:aded4fc9). Runs after the extraction
-  // phases so threadIds tag the findings; reuses this run's pinned-sonnet
-  // claudeCall for cost control.
+  // advisors' close-side seat (act:aded4fc9). Reuses this run's pinned-sonnet
+  // claudeCall for cost control. Writes the session record's ## Advisor
+  // findings + the carry ledger, never the inbox (plan A4) — so it no longer
+  // counts toward itemsFiled.
   if (config.defaults?.session_advisors !== false) {
     try {
-      const result = await advisorPass(compressed, project, args.sessionId, threadIds, { config, sessionWindow });
+      const result = await advisorPass(compressed, project, args.sessionId, threadIds, { config, sessionWindow, recordPath });
       stats.advisorFindings = result.filed;
-      stats.itemsFiled += result.filed;
     } catch (e) {
       logError(`Phase 2m failed: ${e.message}`);
     }
   }
 
-  // Phase 2n: Raised-but-unhandled lens (feature-flagged). Runs after the
-  // filing phases (2c/2d/2m) so its pending corpus already holds this
-  // session's completion candidates, extractions, and advisor findings — a
-  // loose end one of those already captured is suppressed.
-  if (config.defaults?.raised_unhandled_lens !== false) {
-    try {
-      const result = await raisedUnhandledLens(
-        compressed, project, args.sessionId, args.transcriptPath, threadIds,
-        { config, sessionWindow });
-      stats.itemsFiled += result.queued;
-    } catch (e) {
-      logError(`Phase 2n failed: ${e.message}`);
-    }
-  }
-
-  // Phase 2o: Skill-candidate lens (feature-flagged).
-  if (config.defaults?.skill_candidate_lens !== false) {
-    try {
-      const result = await skillCandidateLens(
-        compressed, project, args.sessionId, args.transcriptPath, threadIds,
-        { config, sessionWindow });
-      stats.itemsFiled += result.queued;
-    } catch (e) {
-      logError(`Phase 2o failed: ${e.message}`);
-    }
+  // Phases 2n / 2o / 2q — the session-residue lenses — are receipt-driven
+  // (Simplification Project 2, plan B3): /close Step 6c asked the session
+  // in-session and left a receipt; Ring 3 only fills in what the session did
+  // not answer, and writes to the session record, never the inbox. Runs after
+  // the filing phases (2c/2m) so the lenses' pending corpus already holds this
+  // session's completion candidates and advisor findings.
+  try {
+    const residue = await runResidueFallback({
+      sessionId: args.sessionId, project, recordPath, compressed,
+      transcriptPath: args.transcriptPath, threadIds, sessionStartIso, sessionWindow, config,
+    });
+    stats.residueBranch = residue.branch;
+    stats.residueLines = residue.lines_written;
+  } catch (e) {
+    logError(`Residue fallback failed: ${e.message}`);
   }
 
   // Phase 2p: Checklist-catch detection (feature-flagged). Records to the
@@ -4326,17 +4358,7 @@ async function main() {
     }
   }
 
-  // Phase 2q: verify-coverage lens (feature-flagged; per-project verify gate).
-  // Diff-based — warns when the session shipped UI with no .feature edit.
-  if (config.defaults?.verify_coverage !== false) {
-    try {
-      const r = verifyCoverageLens(
-        project, sessionStartIso, args.sessionId, { config });
-      stats.itemsFiled += r.filed;
-    } catch (e) {
-      logError(`Phase 2q failed: ${e.message}`);
-    }
-  }
+  // (Phase 2q, the verify-coverage lens, runs inside runResidueFallback above.)
 
   // Phase 2i: Session auto-naming (feature-flagged)
   if (config.defaults?.session_auto_naming !== false) {
@@ -4603,7 +4625,9 @@ export {
   // transcriptSlugFromPath, and resolveSessionProject are exported inline;
   // these two are exported for the null-path guard tests.
   workItemClosure,
-  methodologyCapture,
+  // (methodologyCapture — Phase 2f — was DELETED by Simplification Project 2,
+  // plan A3, 2026-10-31. runResidueFallback and verifyCoverageLens are
+  // exported inline at their declarations.)
   // Outage-robustness recovery (act:6fb2b7d1)
   failedMarkerPath,
   writeFailedMarker,

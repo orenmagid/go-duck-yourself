@@ -4,8 +4,8 @@
 // All writes use atomic temp+rename per watchtower-contracts.md.
 // Queue uses directory listing, not index files (no-index convention).
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, renameSync, unlinkSync, realpathSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, renameSync, unlinkSync, realpathSync, appendFileSync, statSync } from 'fs';
+import { join, dirname } from 'path';
 import { randomBytes } from 'crypto';
 import { pathToFileURL } from 'url';
 import { execFileSync } from 'child_process';
@@ -14,6 +14,7 @@ const WATCHTOWER_DIR = process.env.WATCHTOWER_DIR
   || join(process.env.HOME, '.claude-cabinet', 'watchtower');
 
 const QUEUE_DIR = join(WATCHTOWER_DIR, 'queue', 'items');
+const STATE_DIR = join(WATCHTOWER_DIR, 'state');
 
 // mux's dispatch queue (bin/mux `qa` verbs — the single desk-dispatch path,
 // carrying qa-handoffs AND routine dispatches). Descriptors are routing
@@ -25,7 +26,7 @@ const MUX_QA_DIR = process.env.MUX_QA_DIR
   || join(process.env.HOME, '.local', 'share', 'mux', 'qa-handoff');
 
 // Categories whose items are pushed to a desk via the mux dispatch queue.
-// Every terminal exit (resolve / dismiss / supersede / expire) on an item in
+// Every terminal exit (resolve / dismiss / supersede) on an item in
 // one of these categories clears its dispatch descriptor(s). Exported so
 // consumers (e.g. the /session-handoff epilogue drain) exclude dispatched
 // items by importing this set rather than re-listing categories in prose —
@@ -113,7 +114,7 @@ const URGENCY_ORDER = { urgent: 0, normal: 1, low: 2 };
 //
 // A qa-handoff item cannot leave the queue silently: resolution requires a
 // structured, field-validated qa_verdict; dismissal/supersession require a
-// typed reason; expiry never applies. The gate's playbook, tiers, and the
+// typed reason; no expiry exists (nothing in the queue ages out). The gate's playbook, tiers, and the
 // verdict shape are defined ONCE in the qa-handoff skill (SKILL.md, "The
 // recipient gate") — this section validates the SHAPE at the API so the one
 // sin, a silent stamp with no coverage look, is impossible rather than
@@ -171,9 +172,87 @@ export const KNOWLEDGE_EXTRACTION_HOMES = ['memory', 'claude-md', 'pib-db-trigge
 // how two pieces of knowledge relate — rubber-stamping a batch of them is
 // re-meaning without a real human gate, which is how a system gaslights its
 // operator (MANIFESTO principle 4). Unlike qa-handoff they have no verdict
-// shape and MAY auto-expire; the durable relation_key filing exclusion
-// guarantees an expired proposal never refiles.
+// shape; the durable relation_key filing exclusion guarantees a closed
+// proposal (any status, including the historical `expired`) never refiles.
 export const GATED_CATEGORIES = new Set([QA_CATEGORY, 'pending-relation', 'significance-change']);
+
+// --- Retired and narrowed categories (Simplification Project 2, plan A9 as
+// narrowed by EP4; act:73dd31d4) -------------------------------------------
+//
+// The operator's ruling (EP4): "no feedback line closes." A producer that
+// still files a category the inbox no longer carries — a consumer's hook, a
+// by-hand skill step, a runtime that has not been refreshed — must neither
+// lose its finding nor refill a queue nobody reads. So createItem REDIRECTS
+// a stray filing to the channel that is actually read, and REFUSES only a
+// category with no live home at all.
+//
+// RETIRED_CATEGORIES: category → live home | null. The keys are pinned to
+// INBOX_DETECTOR_REGISTRY's retired entries by queue-retired-categories.test
+// (a category retired in one place and not the other is the drift that pin
+// exists to catch); each later tear-out lane adds its categories in the same
+// commit that retires them. Homes:
+//   'carry' — the project's carry ledger (state/projects/<slug>/carry.json),
+//             rendered in the next start block (plan B2) and settled by the
+//             /close residue question (plan B3);
+//   'doc-drift-state' — the project's documentation-drift state
+//             (state/projects/<slug>/doc-drift.json), upserted by drift_key
+//             and rendered by Ring 1 into Standing Issues (plan A4);
+//   'thread' — the thread file's `proposed_recolors` (state/threads/<slug>.json,
+//             appendThreadProposal), shown by /threads (plan A8 / EP1);
+//   null    — no live home: the filing throws, loudly, and is logged.
+export const RETIRED_CATEGORIES = new Map([
+  ['knowledge-extraction', null],
+  ['pending-relation', null],
+  ['watchtower-health', null],
+  ['routing-decision', null],
+  ['raised-unhandled', 'carry'],
+  ['skill-candidate', 'carry'],
+  ['coverage-warning', 'carry'],
+  ['methodology-capture', 'carry'],
+  ['verify-backfill', 'carry'],
+  ['doc-drift', 'doc-drift-state'],
+  ['significance-change', 'thread'],
+]);
+
+// NARROWED_CATEGORIES: the two LIVE categories whose meaning this project
+// narrows. Each predicate returns the live home for the slice that LEAVES the
+// inbox, or null for the slice that stays:
+//   advisor-finding   — a seat proposal (evidence.roster_kind, Ring 2's roster
+//                       review) is a decision and stays; every other advisor
+//                       finding → 'carry' (shown once in the next start block,
+//                       Decision 4);
+//   upstream-friction — route project-tracker → 'carry' (EP2: carried to the
+//                       next session in that project until settled); route
+//                       cc-feedback → 'outbox' (Q1: the /cc-feedback outbox,
+//                       delivered by Ring 1, deduplicated per T8); config-change
+//                       (or no route) stays in the inbox.
+export const NARROWED_CATEGORIES = new Map([
+  ['advisor-finding', (evidence) => (evidence && evidence.roster_kind ? null : 'carry')],
+  ['upstream-friction', (evidence) => {
+    const type = evidence && evidence.route && evidence.route.type;
+    if (type === 'project-tracker') return 'carry';
+    if (type === 'cc-feedback') return 'outbox';
+    return null;
+  }],
+]);
+
+/**
+ * Where a filing of this category goes instead of the queue: a home string,
+ * or null when it files as usual. Throws for a retired category with no home.
+ */
+export function redirectHomeFor(category, evidence) {
+  if (RETIRED_CATEGORIES.has(category)) {
+    const home = RETIRED_CATEGORIES.get(category);
+    if (home === null) {
+      const err = new Error(`createItem: '${category}' is retired and has no live home — nothing reads it any more; see INBOX_DETECTOR_REGISTRY (watchtower-lib.mjs) for where that kind of finding went`);
+      err.code = 'RETIRED_NO_HOME';
+      throw err;
+    }
+    return home;
+  }
+  const narrow = NARROWED_CATEGORIES.get(category);
+  return narrow ? narrow(evidence) : null;
+}
 
 const QA_TERMINAL_VERDICTS = ['runtime-verified', 'blocked'];
 // The parameterized token. Canonical form uses U+00B7 (·); input tolerates
@@ -1234,12 +1313,620 @@ export function markHandoffMerged(id, { merged_commit } = {}) {
   return { item, dispatch };
 }
 
+// ---------------------------------------------------------------------------
+// Shared identity helpers — defined HERE because watchtower-lib imports the
+// queue and never the reverse (plan A9's placement rule), and the redirect
+// writers below need both. watchtower-lib re-exports them unchanged, so every
+// existing `import { slugify, resolveCcSourceRepo } from './watchtower-lib.mjs'`
+// keeps working and the definition stays single.
+// ---------------------------------------------------------------------------
+
+// slugify — lowercase, replace non-alphanum with dash, trim dashes. The ONE
+// slug algorithm: state/projects/<slug> keys, carry-ledger paths and the
+// identity resolver all derive from it.
+export function slugify(text) {
+  return String(text).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+}
+
+const CC_PACKAGE_NAME = 'create-claude-cabinet';
+
+// resolveCcSourceRepo — the registered project whose package.json name is
+// create-claude-cabinet. The one place "which checkout is the CC source?" is
+// answered, so callers (feedback delivery, the Ring 1 runtime-drift check,
+// the outbox dedup below) never re-derive it.
+export function resolveCcSourceRepo(registryPath) {
+  if (!registryPath || !existsSync(registryPath)) return null;
+  let registry;
+  try {
+    registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+  } catch {
+    return null;
+  }
+  for (const proj of registry.projects || []) {
+    const root = proj.path || '';
+    const pkgPath = join(root, 'package.json');
+    if (!existsSync(pkgPath)) continue;
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+      if (pkg.name === CC_PACKAGE_NAME) return root;
+    } catch { /* unreadable package.json — not the CC repo */ }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// The carry ledger — state/projects/<slug>/carry.json (Simplification
+// Project 2, plan B3 / decision default 20; act:73dd31d4)
+// ---------------------------------------------------------------------------
+//
+// ONE per-project carrier for what rides from one session to the next session
+// of the same project: project friction (`kind: 'friction'`, shown every start
+// block until resolved — EP2), loose ends (`'loose-end'` — a residue finding
+// caught by createItem's redirect: unfinished work, not a tool complaint, with
+// friction's shown-every-start-block-until-settled semantics and its own
+// start-block label; operator ruling 2026-10-31, act:dafa9afa), advisor
+// findings (`'advisor'`, shown once) and thread re-reading proposals
+// (`'recolor'`, shown once; written by plan A8).
+// The session record is the history; this file can say "settled" and
+// "already shown", which a record cannot. Shape:
+//   { entries: [{ id, kind, title, detail, source_session, created_at,
+//                 shown: [{ session_id, at }],
+//                 resolved: null | { outcome: 'fixed'|'filed'|'dropped', ref, reason, session_id, at } }] }
+// fs-only writers (the markHandoffMerged precedent: a queue-side write into
+// another component's directory), read-modify-atomicWrite with one retry on a
+// changed mtime, never throw from the readers; the appender throws so
+// createItem's redirect can fail toward the queue (visibility, never loss).
+
+export function carryLedgerPath(slug) {
+  return join(STATE_DIR, 'projects', slugify(slug), 'carry.json');
+}
+
+function readCarryFile(path) {
+  try {
+    if (!existsSync(path)) return { entries: [] };
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    if (!parsed || !Array.isArray(parsed.entries)) return { entries: [] };
+    return parsed;
+  } catch {
+    return { entries: [] };
+  }
+}
+
+function mtimeOf(path) {
+  try { return statSync(path).mtimeMs; } catch { return null; }
+}
+
+// Read-modify-write with one retry when the file changed under us — the
+// ledger is shared between Ring 3, the start-block builder, /close and a
+// redirecting createItem in another process.
+function updateCarryFile(path, mutate) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const before = mtimeOf(path);
+    const ledger = readCarryFile(path);
+    const result = mutate(ledger);
+    if (mtimeOf(path) !== before && attempt === 0) continue;
+    const dir = dirname(path);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    atomicWrite(path, ledger);
+    return result;
+  }
+  // Second attempt also raced — write anyway; the loser's entry is at worst
+  // re-read by the next writer (the shape is append-mostly).
+  const ledger = readCarryFile(path);
+  const result = mutate(ledger);
+  atomicWrite(path, ledger);
+  return result;
+}
+
+/**
+ * Append one entry to a project's carry ledger. Returns the entry written.
+ * @param {string} slug - the project slug (or name; slugified)
+ * @param {{kind: 'friction'|'loose-end'|'advisor'|'recolor', title: string, detail?: string, source_session?: string|null, source?: object}} entry
+ */
+export const CARRY_KINDS = ['friction', 'loose-end', 'advisor', 'recolor'];
+// The kinds that ride every start block until a /close settles them (fixed /
+// filed / dropped) — the others render once and are stamped `shown`.
+export const CARRY_PERSISTENT_KINDS = ['friction', 'loose-end'];
+
+export function appendCarryEntry(slug, { kind, title, detail = '', source_session = null, source = null, created_at = null } = {}) {
+  if (!CARRY_KINDS.includes(kind)) {
+    throw new Error(`appendCarryEntry: kind must be ${CARRY_KINDS.join(' | ')} (got ${JSON.stringify(kind)})`);
+  }
+  if (typeof title !== 'string' || !title.trim()) {
+    throw new Error('appendCarryEntry: a non-empty title is required');
+  }
+  const entry = {
+    id: 'carry-' + randomBytes(4).toString('hex'),
+    kind,
+    title: title.trim(),
+    detail: typeof detail === 'string' ? detail : '',
+    source_session: source_session || null,
+    created_at: created_at || new Date().toISOString(),
+    shown: [],
+    resolved: null,
+    ...(source ? { source } : {}),
+  };
+  updateCarryFile(carryLedgerPath(slug), (ledger) => { ledger.entries.push(entry); });
+  return entry;
+}
+
+/** Read a project's carry ledger. A missing or corrupt file reads as empty. */
+export function readCarry(slug) {
+  return readCarryFile(carryLedgerPath(slug));
+}
+
+/**
+ * Stamp `shown` on the given entries (advisor/recolor render-once bookkeeping;
+ * the start block's one write). Fail-open: a failed stamp means the entry
+ * shows again — duplication, never loss.
+ * @returns {number} entries stamped
+ */
+export function markCarryShown(slug, ids, { session_id = null, at = null } = {}) {
+  const want = new Set(Array.isArray(ids) ? ids : [ids]);
+  try {
+    return updateCarryFile(carryLedgerPath(slug), (ledger) => {
+      let n = 0;
+      for (const e of ledger.entries) {
+        if (!want.has(e.id)) continue;
+        if (!Array.isArray(e.shown)) e.shown = [];
+        e.shown.push({ session_id, at: at || new Date().toISOString() });
+        n++;
+      }
+      return n;
+    });
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Resolve a carry entry. Resolving an already-resolved entry is a no-op that
+ * REPORTS it ({ ok: false, reason: 'already-resolved', entry }); an unknown id
+ * reports 'not-found'. Never throws.
+ * @param {{outcome: 'fixed'|'filed'|'dropped', ref?: string|null, reason?: string|null, session_id?: string|null}} resolution
+ */
+export function resolveCarryEntry(slug, id, { outcome, ref = null, reason = null, session_id = null, at = null } = {}) {
+  if (!['fixed', 'filed', 'dropped'].includes(outcome)) {
+    return { ok: false, reason: 'bad-outcome', entry: null };
+  }
+  try {
+    return updateCarryFile(carryLedgerPath(slug), (ledger) => {
+      const entry = ledger.entries.find((e) => e.id === id);
+      if (!entry) return { ok: false, reason: 'not-found', entry: null };
+      if (entry.resolved) return { ok: false, reason: 'already-resolved', entry };
+      entry.resolved = { outcome, ref, reason, session_id, at: at || new Date().toISOString() };
+      return { ok: true, entry };
+    });
+  } catch (e) {
+    return { ok: false, reason: `write-failed: ${e.message}`, entry: null };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Thread re-reading proposals — state/threads/<slug>.json `proposed_recolors`
+// (Simplification Project 2, plan A8 / EP1; act:b57df8e4)
+// ---------------------------------------------------------------------------
+//
+// A significance proposal ("this session reframes / answers / contradicts the
+// <date> entry of thread X") is written ONTO the thread it reinterprets, in
+// the additive array `proposed_recolors`, instead of the inbox — shown by
+// /threads and once in the next start block of the project (a `recolor`
+// carry entry, written by the caller), until Project 3's contradiction gate
+// decides which kind returns to the inbox. Old thread readers are unaffected
+// (additive field); cursor_history and recolor_log are never touched.
+//
+// The durable relation_key exclusion moved here with the proposal. The key
+// is thread|prior_session|verb — the ANCHOR being reinterpreted and how,
+// never the noticing session (act:1be47d42). A key is refused when it is
+// already APPLIED (in recolor_log — appendThreadRecolor's entries carry the
+// anchor and verb), already a HISTORICAL queue item in any status (a
+// decided or walked proposal never re-files), or already proposed — in
+// which case a different noticing session is appended to also_noticed_by
+// (corroboration strengthens the proposal; it is never a second entry).
+// NOTE for the backlog walk (plan C1 route-thread): the queue check matches
+// the pending item being walked; the walk must account for that.
+//
+// Queue-side and fs-only for the same reason as the carry ledger: createItem's
+// 'thread' redirect needs it, and lib imports the queue, never the reverse;
+// lib re-exports it, so Ring 3 and the walk call this one definition.
+
+function threadKeyOf(slug, e) {
+  return e && e.prior_session_id && e.verb ? `${slug}|${e.prior_session_id}|${e.verb}` : null;
+}
+
+/**
+ * Append a re-reading proposal to a thread file's `proposed_recolors`.
+ * Returns null when the thread file is missing, unreadable or the slug is not
+ * a plain file name (never thrown — the caller logs); otherwise
+ * `{ outcome, path, entry, display_name }` where outcome is
+ *   'appended'     — a new proposal was written;
+ *   'corroborated' — the key was already proposed; a new noticing session
+ *                    was appended to also_noticed_by;
+ *   'duplicate'    — already proposed and already noticed by this session;
+ *   'excluded'     — the key is applied (recolor_log) or a historical queue
+ *                    item (`reason` says which); nothing written.
+ * Throws only on a proposal with no key, or a failed write (createItem's
+ * redirect then falls back to the queue — visibility, never loss).
+ */
+export function appendThreadProposal(threadsDir, slug, proposal = {}) {
+  if (typeof slug !== 'string' || !slug || slug.startsWith('.') || /[/\\]/.test(slug)) return null;
+  const path = join(threadsDir, `${slug}.json`);
+  if (!existsSync(path)) return null;
+  let thread;
+  try {
+    thread = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!thread || typeof thread !== 'object' || Array.isArray(thread)) return null;
+  const key = (typeof proposal.relation_key === 'string' && proposal.relation_key)
+    || threadKeyOf(slug, proposal);
+  if (!key) throw new Error('appendThreadProposal: a relation_key (or prior_session_id + verb) is required');
+  const display_name = thread.display_name || slug;
+
+  if ((Array.isArray(thread.recolor_log) ? thread.recolor_log : []).some((e) => threadKeyOf(slug, e) === key)) {
+    return { outcome: 'excluded', reason: 'applied', path, entry: null, display_name };
+  }
+  const legacy = listItems({ category: 'significance-change' })
+    .find((i) => i.evidence && i.evidence.relation_key === key);
+  if (legacy) {
+    return { outcome: 'excluded', reason: 'queue', item_id: legacy.id, path, entry: null, display_name };
+  }
+
+  const list = Array.isArray(thread.proposed_recolors) ? thread.proposed_recolors : [];
+  const existing = list.find((e) => e && e.relation_key === key);
+  const sid = proposal.new_session_id || null;
+  if (existing) {
+    const also = Array.isArray(existing.also_noticed_by) ? existing.also_noticed_by : [];
+    if (!sid || sid === existing.new_session_id || also.includes(sid)) {
+      return { outcome: 'duplicate', path, entry: existing, display_name };
+    }
+    existing.also_noticed_by = [...also, sid];
+    thread.proposed_recolors = list;
+    atomicWrite(path, thread);
+    return { outcome: 'corroborated', path, entry: existing, display_name };
+  }
+
+  const entry = {
+    relation_key: key,
+    verb: proposal.verb ?? null,
+    prior_session_id: proposal.prior_session_id ?? null,
+    prior_date: proposal.prior_date ?? null,
+    prior_excerpt: typeof proposal.prior_excerpt === 'string' ? proposal.prior_excerpt : '',
+    new_session_id: sid,
+    explanation: typeof proposal.explanation === 'string' ? proposal.explanation : '',
+    proposed_at: proposal.proposed_at || new Date().toISOString(),
+    also_noticed_by: [],
+  };
+  thread.proposed_recolors = [...list, entry];
+  atomicWrite(path, thread);
+  return { outcome: 'appended', path, entry, display_name };
+}
+
+// ---------------------------------------------------------------------------
+// Documentation-drift state — state/projects/<slug>/doc-drift.json
+// (Simplification Project 2, plan A4 / decision default 18; act:dafa9afa)
+// ---------------------------------------------------------------------------
+//
+// Ring 4 has no session, so its findings are PROJECT facts, not inbox items:
+// one entry per claim, keyed by drift_key. Shape:
+//   { entries: [{ drift_key, kind, doc, title, summary, filed_by,
+//                 first_seen, last_seen, ...finding fields }] }
+// Writers: Ring 4 (upsert each finding, then retract the claims it actually
+// re-checked and no longer found) and createItem's 'doc-drift-state' redirect
+// (a stray doc-drift filing from a consumer hook). Reader: Ring 1, one
+// Standing Issues line naming the count and this path. Queue-side and
+// fs-only for the same reason as the carry ledger (createItem needs it, and
+// lib imports the queue, never the reverse); lib re-exports.
+
+export function docDriftStatePath(slug) {
+  return join(STATE_DIR, 'projects', slugify(slug), 'doc-drift.json');
+}
+
+/** Read a project's drift state. A missing or corrupt file reads as empty. */
+export function readDocDrift(slug) {
+  return readCarryFile(docDriftStatePath(slug));
+}
+
+/**
+ * Upsert one drift claim by drift_key. A new key is appended with
+ * first_seen = last_seen = now; a known key keeps first_seen and takes the
+ * fresh fields. Throws on a failed write (createItem's redirect falls back to
+ * the queue on a throw — visibility, never loss).
+ * @returns {{added: boolean, entry: object}}
+ */
+export function upsertDocDriftEntry(slug, finding, { now = null } = {}) {
+  if (!finding || typeof finding.drift_key !== 'string' || !finding.drift_key) {
+    throw new Error('upsertDocDriftEntry: a drift_key is required');
+  }
+  const at = now ? new Date(now).toISOString() : new Date().toISOString();
+  return updateCarryFile(docDriftStatePath(slug), (state) => {
+    const i = state.entries.findIndex((e) => e && e.drift_key === finding.drift_key);
+    if (i === -1) {
+      const entry = { ...finding, first_seen: at, last_seen: at };
+      state.entries.push(entry);
+      return { added: true, entry };
+    }
+    const entry = { ...state.entries[i], ...finding, first_seen: state.entries[i].first_seen || at, last_seen: at };
+    state.entries[i] = entry;
+    return { added: false, entry };
+  });
+}
+
+/**
+ * Remove the claims a pass actually RE-CHECKED and no longer found: every
+ * entry whose drift_key is in `checkedKeys` and not in `foundKeys`. An entry
+ * the pass never checked (its document was not collected, its project was not
+ * selected, or a consumer hook wrote it under a key Ring 4 does not mint)
+ * stays — absence of evidence is not evidence a claim cleared.
+ * @returns {number} entries removed
+ */
+export function retractDocDriftEntries(slug, { checkedKeys, foundKeys } = {}) {
+  const checked = checkedKeys instanceof Set ? checkedKeys : new Set(checkedKeys || []);
+  const found = foundKeys instanceof Set ? foundKeys : new Set(foundKeys || []);
+  const path = docDriftStatePath(slug);
+  if (!existsSync(path)) return 0;
+  return updateCarryFile(path, (state) => {
+    const before = state.entries.length;
+    state.entries = state.entries.filter((e) => !(e && checked.has(e.drift_key) && !found.has(e.drift_key)));
+    return before - state.entries.length;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The feedback outbox writer — ~/.claude/cc-feedback-outbox.json (plan A9/B4,
+// Q1, T8). The shape is /cc-feedback's (templates/skills/cc-feedback/SKILL.md
+// §3): { source, date, component, title, body, status: 'pending',
+// delivered: false }. Ring 1's flushFeedbackOutbox (watchtower-lib) delivers
+// it to the CC source repo's feedback/ root unchanged; its slug check stays
+// as a second guard. B4's routeFriction calls this — one definition.
+// ---------------------------------------------------------------------------
+
+export function feedbackOutboxPath() {
+  return join(process.env.HOME || '', '.claude', 'cc-feedback-outbox.json');
+}
+function ccRegistryPath() {
+  return join(process.env.HOME || '', '.claude', 'cc-registry.json');
+}
+
+// Duplicates are JUDGED, never guessed (act:08aca7a9). Lane 5 shipped a
+// lexical suppressor here: overlapCoefficient over foldTokens of the report
+// against the WHOLE text of every pending outbox entry and every feedback/ and
+// feedback/resolved/ file, at the fold threshold 0.22. min() puts the short
+// report in the denominator, and a long feedback file holds most ordinary
+// words, so on its first live run (2026-10-31) it held back 4 of 4 real
+// reports as "duplicates" of unrelated April files — a nonsense sentence
+// "matched" 2 of 285. That is the landmine this repo already names for the
+// fold threshold: calibrated for ADVISORY retrieval; a lexical matcher may
+// propose, never silently suppress. So the writer below suppresses only an
+// IDENTICAL pending title (reprocess idempotence), and similarity is a
+// SHORTLIST for a model to judge (Ring 3's judgeFeedbackDuplicates). A caller
+// with no model — createItem's redirect — delivers, and triage-at-arrival
+// judges.
+
+const normTitle = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+function titleOfFeedbackFile(name, content) {
+  const h = /^#\s+(.+)$/m.exec(content || '');
+  if (h) return h[1].trim();
+  return name.replace(/\.md$/, '').replace(/^\d{4}-\d{2}-\d{2}-/, '').replace(/[-_]+/g, ' ').trim();
+}
+
+function jaccard(a, b) {
+  if (!a.size || !b.size) return { score: 0, shared: 0 };
+  let shared = 0;
+  for (const t of a) if (b.has(t)) shared++;
+  return { score: shared / (a.size + b.size - shared), shared };
+}
+
+export const FEEDBACK_SHORTLIST_MIN_JACCARD = 0.2;
+export const FEEDBACK_SHORTLIST_MIN_SHARED = 2;
+
+/**
+ * The SHORTLIST for a duplicate judgment: pending outbox entries and the CC
+ * source repo's feedback/ + feedback/resolved/ files whose TITLE overlaps the
+ * report's title (symmetric Jaccard over foldTokens, at least two shared
+ * tokens). Bodies are never compared — a long file sharing ordinary words is
+ * exactly the false match this replaced. Proposes only; never suppresses.
+ * @returns {Array<{ref: string, title: string, excerpt: string, score: number}>}
+ */
+export function findFeedbackDuplicateCandidates({ title } = {},
+  { limit = 5, outboxPath = feedbackOutboxPath(), registryPath = ccRegistryPath() } = {}) {
+  const want = foldTokens(String(title || ''));
+  if (want.size < 2) return [];
+  const out = [];
+  const consider = (ref, candTitle, excerpt) => {
+    const { score, shared } = jaccard(want, foldTokens(candTitle));
+    if (score >= FEEDBACK_SHORTLIST_MIN_JACCARD && shared >= FEEDBACK_SHORTLIST_MIN_SHARED) {
+      out.push({ ref, title: candTitle, excerpt: String(excerpt || '').replace(/\s+/g, ' ').trim().slice(0, 300), score });
+    }
+  };
+  try {
+    if (existsSync(outboxPath)) {
+      const parsed = JSON.parse(readFileSync(outboxPath, 'utf8'));
+      if (Array.isArray(parsed)) parsed.forEach((o, i) => {
+        if (o && o.delivered !== true && o.title) consider(`outbox[${i}] ${o.title}`, o.title, o.body);
+      });
+    }
+  } catch { /* an unreadable outbox shortlists nothing; the writer reports it */ }
+  const ccRepo = resolveCcSourceRepo(registryPath);
+  if (ccRepo) {
+    for (const dir of [join(ccRepo, 'feedback'), join(ccRepo, 'feedback', 'resolved')]) {
+      if (!existsSync(dir)) continue;
+      let names = [];
+      try { names = readdirSync(dir).filter((n) => n.endsWith('.md')); } catch { continue; }
+      for (const name of names) {
+        let content = '';
+        try { content = readFileSync(join(dir, name), 'utf8'); } catch { continue; }
+        const t = titleOfFeedbackFile(name, content);
+        consider(join(dir, name), t, content.replace(/^#.*$/m, ''));
+      }
+    }
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, limit);
+}
+
+/**
+ * Append one entry to the feedback outbox. Never suppresses on similarity
+ * (act:08aca7a9): it skips only when a PENDING entry carries the identical
+ * title (a reprocessed close must not send twice), or when the caller passes
+ * `duplicateOf` — a duplicate a model already judged. Read-modify-atomicWrite
+ * with one retry on a changed mtime — the outbox is shared with /cc-feedback.
+ * @returns {{appended: boolean, path: string, index?: number, duplicate_of?: string}}
+ */
+export function appendFeedbackOutboxEntry({ source, date = null, component = '', title, body = '' } = {},
+  { outboxPath = feedbackOutboxPath(), duplicateOf = null } = {}) {
+  if (typeof title !== 'string' || !title.trim()) {
+    throw new Error('appendFeedbackOutboxEntry: a non-empty title is required');
+  }
+  if (duplicateOf) return { appended: false, path: outboxPath, duplicate_of: String(duplicateOf) };
+  const entry = {
+    source: source || 'unknown',
+    date: date || new Date().toISOString().slice(0, 10),
+    component: component || '',
+    title: title.trim(),
+    body: String(body || ''),
+    status: 'pending',
+    delivered: false,
+  };
+  const want = normTitle(entry.title);
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const before = mtimeOf(outboxPath);
+    let outbox = [];
+    try {
+      if (existsSync(outboxPath)) {
+        const parsed = JSON.parse(readFileSync(outboxPath, 'utf8'));
+        if (Array.isArray(parsed)) outbox = parsed;
+      }
+    } catch { outbox = []; }
+    for (let i = 0; i < outbox.length; i++) {
+      const o = outbox[i];
+      if (!o || o.delivered === true) continue;
+      if (normTitle(o.title) === want) {
+        return { appended: false, path: outboxPath, duplicate_of: `outbox[${i}] ${o.title || ''}`.trim() };
+      }
+    }
+    if (mtimeOf(outboxPath) !== before && attempt === 0) continue;
+    outbox.push(entry);
+    const dir = dirname(outboxPath);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    atomicWrite(outboxPath, outbox);
+    return { appended: true, path: outboxPath, index: outbox.length - 1 };
+  }
+  throw new Error('appendFeedbackOutboxEntry: the outbox changed twice during the write');
+}
+
+/**
+ * The outbox entry for a cc-feedback FRICTION report (plan B4): `body` = the
+ * summary + the route detail + the session id (+ who filed it). The one
+ * composition, shared by Ring 3's routeFriction and createItem's 'outbox'
+ * redirect, so a report reads the same whichever door it came through. Pass
+ * the result to appendFeedbackOutboxEntry, which owns the seven-field shape.
+ */
+export function frictionOutboxEntry({ project, title, summary = '', route = {}, sessionId = null, filedBy = 'ring3-close', component = null } = {}) {
+  const r = route || {};
+  const lines = [String(summary || '').trim()];
+  if (!/^Route:/m.test(lines[0])) lines.push('', `Route: ${r.type || 'cc-feedback'} — ${r.detail || ''}`.trim());
+  lines.push(`Session: ${sessionId || 'unknown'}`, `Filed by: ${filedBy}`);
+  return { source: project, component: component || r.detail || '', title, body: lines.join('\n') };
+}
+
+// ---------------------------------------------------------------------------
+// The redirect ledger — state/inbox-redirects.jsonl. Every redirect and every
+// refusal appends { ts, category, project, filed_by, to | refused } so the
+// PRODUCER gets fixed (B6's standing line counts redirects per producer over
+// 28 days; the C1 walk's --assert-quiet refuses on any since the reinstall).
+// Fail-open: a dropped ledger line never blocks the redirect itself.
+// ---------------------------------------------------------------------------
+
+export function redirectLedgerPath() {
+  return join(STATE_DIR, 'inbox-redirects.jsonl');
+}
+
+function appendRedirectLedger(record) {
+  try {
+    const p = redirectLedgerPath();
+    if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
+    appendFileSync(p, JSON.stringify({ ts: new Date().toISOString(), ...record }) + '\n');
+  } catch { /* observability only */ }
+}
+
+// Write a would-be inbox item into its live home. Returns { to, path, ... }.
+// Throws on a failed write so createItem can fall back to the queue.
+function writeToHome(home, { project, project_path, category, title, summary, evidence, filed_by, urgency }) {
+  const sessionId = evidence && typeof evidence.session_id === 'string' ? evidence.session_id : null;
+  if (home === 'carry') {
+    // A non-seat advisor finding rides as 'advisor' (shown once, Decision 4);
+    // project friction (EP2) rides as 'friction'; a residue finding filed the
+    // old way (the five retired residue categories) rides as 'loose-end' —
+    // unfinished work, not a tool complaint (operator ruling 2026-10-31,
+    // act:dafa9afa). friction and loose-end are the two kinds the /close
+    // residue question reads and settles (fixed / file as action / drop).
+    // The origin is kept on `source` so nothing is lost in the relabel.
+    const kind = category === 'advisor-finding' ? 'advisor'
+      : category === 'upstream-friction' ? 'friction'
+        : 'loose-end';
+    const entry = appendCarryEntry(project, {
+      kind, title, detail: summary, source_session: sessionId,
+      source: {
+        category, filed_by, project_path: project_path || null, urgency: urgency || null,
+        ...(evidence && evidence.member ? { member: evidence.member } : {}),
+        ...(evidence && evidence.directive_key ? { directive_key: evidence.directive_key } : {}),
+      },
+    });
+    return { to: 'carry', path: carryLedgerPath(project), carry_id: entry.id };
+  }
+  if (home === 'doc-drift-state') {
+    // A stray doc-drift filing (a consumer hook — flow's pulse hook files with
+    // no drift_key at all). Ring 4 mints `path:<doc>` / `count:<doc>:<label>`;
+    // a key derived from the title can never collide with those, so Ring 4's
+    // retract-on-rescan never removes an entry it did not write.
+    const driftKey = (evidence && typeof evidence.drift_key === 'string' && evidence.drift_key)
+      || `filed:${String(title || '').trim()}`;
+    const { entry } = upsertDocDriftEntry(project, {
+      ...(evidence || {}), drift_key: driftKey, title, summary: summary || '', filed_by,
+      project_path: project_path || null,
+    });
+    return { to: 'doc-drift-state', path: docDriftStatePath(project), drift_key: entry.drift_key };
+  }
+  if (home === 'outbox') {
+    const r = appendFeedbackOutboxEntry(frictionOutboxEntry({
+      project, title, summary, route: (evidence && evidence.route) || {}, sessionId, filedBy: filed_by,
+      component: (evidence && evidence.route && evidence.route.detail) || category,
+    }));
+    return { to: 'outbox', path: r.path, ...(r.appended ? { index: r.index } : { duplicate_of: r.duplicate_of }) };
+  }
+  if (home === 'thread') {
+    // A stray significance-change filing (an un-refreshed runtime's Ring 3)
+    // carries the proposal in its evidence; it lands on the thread it
+    // reinterprets. A missing thread throws, so the filing falls back to the
+    // queue marked redirect_failed rather than vanishing.
+    const slug = (evidence && evidence.thread) || null;
+    const r = appendThreadProposal(join(STATE_DIR, 'threads'), slug, {
+      ...(evidence || {}), explanation: (evidence && evidence.explanation) || summary || '',
+    });
+    if (!r) throw new Error(`thread file for ${JSON.stringify(slug)} is missing or unreadable`);
+    return { to: 'thread', path: r.path, outcome: r.outcome };
+  }
+  throw new Error(`createItem: unknown redirect home '${home}'`);
+}
+
 // --- Exports ---
 
 /**
  * Create a new inbox item.
+ *
+ * A category that LEFT the inbox is not stored here (plan A9/EP4): a retired
+ * category with a live home, and the narrowed slices of advisor-finding and
+ * upstream-friction, are written to that home and the call returns
+ * `{ redirected: true, to, path }` — never an id, never a throw. A retired
+ * category with no live home throws. Every redirect and refusal is logged to
+ * state/inbox-redirects.jsonl. If the redirect write itself fails, the item
+ * is filed into the queue as before with evidence.redirect_failed — fail
+ * toward visibility, never loss.
  * @param {object} params
- * @returns {string} The generated item id
+ * @returns {string|{redirected: true, to: string, path: string}} The generated item id, or the redirect record
  */
 export function createItem({
   project,
@@ -1260,6 +1947,30 @@ export function createItem({
   project_unresolved = false,
   desk = null,
 }) {
+  // Retired / narrowed categories: redirect to the live home, or refuse a
+  // category with no home (plan A9 / EP4). Before any other boundary check —
+  // a filing that will not enter the queue is not validated as a queue item.
+  let home;
+  try {
+    home = redirectHomeFor(category, evidence);
+  } catch (e) {
+    appendRedirectLedger({ category, project, filed_by, title, refused: true, reason: e.message });
+    throw e;
+  }
+  if (home) {
+    try {
+      const r = writeToHome(home, { project, project_path, category, title, summary, evidence, filed_by, urgency });
+      // The title rides on every line (act:08aca7a9): a report held back as a
+      // duplicate leaves no queue item and no record line, so this line is the
+      // only trace of what it said.
+      appendRedirectLedger({ category, project, filed_by, title, to: home, ...(r.duplicate_of ? { duplicate: true, duplicate_of: r.duplicate_of } : {}) });
+      return { redirected: true, ...r };
+    } catch (e) {
+      // Fail toward visibility: the finding lands in the queue, marked.
+      evidence = { ...(evidence || {}), redirect_failed: `${home}: ${e.message}` };
+      appendRedirectLedger({ category, project, filed_by, title, to: home, failed: e.message });
+    }
+  }
   ensureDir(QUEUE_DIR);
   // qa-handoff merge_state is structural: a present-but-illegal token is
   // rejected at the boundary (it can't silently read as 'merged'), and a legal
@@ -1590,59 +2301,15 @@ export function releaseHold(id) {
   return item;
 }
 
-/**
- * Mark an inbox item as expired.
- * @param {string} id
- * @returns {object} The updated item
- */
-// ---------------------------------------------------------------------------
-// Category expiry — the ONE age policy (act:ea23b3a5)
-// ---------------------------------------------------------------------------
-//
-// There are TWO expiry engines: Ring 2's `escalateQueueItems` (the 5-minute
-// cron) and `runExpiry` below (called by /inbox and /briefing). Before this,
-// each hardcoded 30 days and each inlined its own qa-handoff carve-out — so a
-// per-category policy set in one would be silently violated by whichever engine
-// reached the item first. Both now delegate here.
-//
-// `categoryNeverExpires` lives beside `expireItem`'s throw deliberately: the
-// carve-out is STRUCTURAL, not a preference. `expireItem` throws on a
-// qa-handoff, so returning anything but null for it would crash the caller's
-// loop. One fact, one place, no drift.
-export const DEFAULT_EXPIRE_DAYS = 30;
-
-// Per-category overrides. completion-review at 14d: the category's whole value
-// is time-bound — a completion candidate nobody confirmed in two weeks is not
-// going to be confirmed, and a real completion re-detects when the action is
-// next touched. NOTE the coupling to COMPLETION_REVIEW_DEDUP_DAYS (also 14) in
-// ring3-close: because the two are equal, that phase's dedup corpus MUST
-// include `expired` and `superseded`, or a fid leaves every corpus at exactly
-// the moment its item expires and refiles forever.
-export const CATEGORY_EXPIRE_DAYS = { 'completion-review': 14 };
-
-export function categoryNeverExpires(category) {
-  return category === QA_CATEGORY;
-}
-
-/** Days before an item of this category expires; null = never. */
-export function expiryDaysFor(category) {
-  if (categoryNeverExpires(category)) return null;
-  return CATEGORY_EXPIRE_DAYS[category] ?? DEFAULT_EXPIRE_DAYS;
-}
-
-export function expireItem(id) {
-  const fp = itemPath(id);
-  const item = readItem(fp);
-  if (item.status !== 'pending') return null;
-  if (categoryNeverExpires(item.category)) {
-    throw gateError(item, 'qa-handoff items never expire — QA debt stays surfaced until a stamped verdict resolves it (or a typed dismissal waives it)');
-  }
-  item.status = 'expired';
-  item.resolution_notes = 'Auto-expired by age policy';
-  atomicWrite(fp, item);
-  if (DISPATCHED_CATEGORIES.has(item.category)) clearDispatchEntries(item);
-  return item;
-}
+// No expiry lives here any more. Simplification Project 2 (plan A1,
+// act:15aeeafb, 2026-10-30) deleted both age engines — the per-category table
+// and single-item expirer that stood here, and the /inbox + /briefing sweep
+// that stood just above the CLI section (Ring 2's cron branch went with them). An
+// item leaves the queue only when a mechanical check retracts it or the
+// operator closes it; age is shown ([AGING], urgent decay in ring2) and never
+// acted on. The `expired` STATUS stays a legal value: ~1,200 historical items
+// carry it, and every reader (archiveItem, the dedup corpora, the snapshot
+// tallies) keeps reading it — they simply see no new ones.
 
 /**
  * Apply ONE disposition to a batch of ungated items — the single bulk path,
@@ -1824,48 +2491,6 @@ export function getEnrichment(id) {
     }
   }
   return result;
-}
-
-/**
- * Run expiry check on pending items.
- * Items older than expireDays are marked expired with conservative defaults.
- * Items older than warnDays (but not yet expireDays) are flagged for warning.
- * @param {object} params
- * @returns {object} { warned: [], expired: [] }
- */
-// `expireDays` is the DEFAULT, not a blanket: per-category overrides come from
-// expiryDaysFor (act:ea23b3a5), so this engine and Ring 2's cron cannot give
-// two different answers for the same item.
-export function runExpiry({ warnDays = 14, expireDays = DEFAULT_EXPIRE_DAYS } = {}) {
-  const now = Date.now();
-  const warnMs = warnDays * 24 * 60 * 60 * 1000;
-  const pending = listPending();
-  const warned = [];
-  const expired = [];
-
-  for (const item of pending) {
-    const age = now - new Date(item.filed_at).getTime();
-    // qa-handoff items never auto-expire: an expired handoff is exactly the
-    // silent QA gap the recipient gate forbids. They warn (by item) instead.
-    const days = categoryNeverExpires(item.category)
-      ? null
-      : (CATEGORY_EXPIRE_DAYS[item.category] ?? expireDays);
-    if (days === null) {
-      if (age >= warnMs) warned.push(item);
-      continue;
-    }
-    if (age >= days * 24 * 60 * 60 * 1000) {
-      item.status = 'expired';
-      item.resolution_notes = `Auto-expired after ${days} days. If still relevant, re-file with updated context.`;
-      atomicWrite(itemPath(item.id), item);
-      if (DISPATCHED_CATEGORIES.has(item.category)) clearDispatchEntries(item);
-      expired.push(item);
-    } else if (age >= warnMs) {
-      warned.push(item);
-    }
-  }
-
-  return { warned, expired };
 }
 
 // --- CLI ---

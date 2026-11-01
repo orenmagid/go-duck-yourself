@@ -7,7 +7,8 @@
 // Fast tier (--fast):
 //   - Deferred trigger evaluation (cap 5 items/run)
 //   - Queue enrichment for bare items >10min old (cap 2/run)
-//   - Queue escalation (14d [AGING], 30d expire)
+//   - Queue escalation (14d [AGING] prefix, urgent→normal decay; nothing expires —
+//     Simplification Project 2 A1 deleted expiry; age is shown, never acted on)
 //   - Event-driven: checks lock/ring2-fast-trigger file
 //
 // Slow tier (--slow):
@@ -41,12 +42,12 @@ import {
   atomicWrite, loadConfig, slugify,
   log as _log, logError as _logError,
   getWatchtowerDir, createItem, listPending, loadBetterSqlite3,
-  currentCursor, VERIFY_UI_PATHS,
+  currentCursor,
   loadActiveThreads, threadsForItem, suppressionLedgerPath,
   recordApiUsage, computeActivitySignature, shouldRunIdlePass, markIdlePassRan,
 } from './watchtower-lib.mjs';
 import {
-  expireItem, listItems, expiryDaysFor,
+  listItems,
   proposeFolds, buildFoldClusters, annotateItemEvidence, supersedeItem,
 } from './watchtower-queue.mjs';
 // The rules-corpus reader lives in ring3 (act:a6bb5603). Reused, not forked —
@@ -74,9 +75,6 @@ const FAST_TRIGGER_EVAL_CAP = 5;
 const FAST_ENRICHMENT_CAP = 2;
 const FAST_ENRICHMENT_MIN_AGE_MS = 10 * 60 * 1000; // 10 minutes
 const ESCALATION_WARN_DAYS = 14;
-// The expire threshold moved to watchtower-queue's expiryDaysFor (act:ea23b3a5)
-// — it is per-category now, and two engines read it. Do not reintroduce a local
-// copy here; that divergence is the bug the consolidation removed.
 // Urgency = value decay, not importance (decision_ring3_urgency_value_based).
 // An urgent item whose decay window has passed is by definition no longer
 // urgent — de-escalate so the SessionStart urgent count stays trustworthy.
@@ -892,33 +890,24 @@ function findMemoryDir(projectPath) {
 // 3. Queue escalation
 // ---------------------------------------------------------------------------
 
-async function escalateQueueItems() {
+// Exported so the no-expiry contract can be exercised directly over a fixture
+// queue (Simplification Project 2 A1, inbox-no-expiry.test.mjs) instead of
+// read off the source; `main()` still calls it as before.
+export async function escalateQueueItems() {
   const now = Date.now();
   const items = listPending();
 
   let escalated = 0;
-  let expired = 0;
-
   let deescalated = 0;
 
   for (const item of items) {
     const ageMs = now - new Date(item.filed_at).getTime();
     const ageDays = ageMs / (24 * 60 * 60 * 1000);
 
-    // Per-category age policy, single-sourced in watchtower-queue
-    // (act:ea23b3a5). A null means never — today only qa-handoff, whose
-    // exemption is structural (expireItem THROWS on it, per the recipient-gate
-    // contract); those fall through to the [AGING] path below and stay
-    // surfaced as QA debt. The other engine (runExpiry, called by /inbox and
-    // /briefing) reads the same table, so the two cannot disagree.
-    const expireDays = expiryDaysFor(item.category);
-    if (expireDays !== null && ageDays >= expireDays) {
-      expireItem(item.id);
-      expired++;
-      log(`Fast: expired queue item ${item.id} (${Math.floor(ageDays)}d old, ${item.category} policy ${expireDays}d)`);
-      continue;
-    }
-
+    // Age is SHOWN here, never acted on. The expire branch that stood at the
+    // top of this loop was deleted by Simplification Project 2 (plan A1,
+    // act:15aeeafb): an item leaves the queue only when a mechanical check
+    // retracts it or the operator closes it.
     if (ageDays >= ESCALATION_WARN_DAYS) {
       // 14+ days: add [AGING] prefix if not already there
       if (!item.title.startsWith('[AGING]')) {
@@ -948,8 +937,8 @@ async function escalateQueueItems() {
     }
   }
 
-  if (escalated > 0 || expired > 0 || deescalated > 0) {
-    log(`Fast: escalation — ${escalated} aged, ${expired} expired, ${deescalated} de-escalated`);
+  if (escalated > 0 || deescalated > 0) {
+    log(`Fast: escalation — ${escalated} aged, ${deescalated} de-escalated`);
   }
 }
 
@@ -2782,116 +2771,20 @@ export async function reviewCabinetRoster(config, deps = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Verify-plan backfill scan (feature-flagged; gated per-project on verify
-//    being installed = an e2e/features/ dir). Ports orient's verify-backfill
-//    phase to the background: pending plans that touch UI but carry no
-//    `## Verify Plan` section are surfaced as inbox items, so coverage-growth
-//    pressure survives orient's retirement. `/verify backfill` stays the
-//    executor — the ring is only the trigger orient used to be. (act:1be47d42)
+// 7. (Verify-plan backfill scan ran here — act:1be47d42, flag verify_backfill —
+//    until Simplification Project 2, prj:4a433dac, plan A3 (act:73dd31d4,
+//    2026-10-31) DELETED it. It filed a `verify-backfill` inbox item per
+//    pending UI-touching action without a `## Verify Plan`: 10 per 28 days,
+//    0 human-closed. The question is asked by the session that touched the
+//    action — watchtower-commitments.mjs --residue reads the touched fids
+//    from the transcript's own pib_* tool calls and /close Step 6c proposes
+//    "write verify plan". The category is retired; a stray filing is
+//    redirected to the project's carry ledger. A stale `verify_backfill` key
+//    in a consumer's config.json is simply ignored.)
 // ---------------------------------------------------------------------------
 
-const VERIFY_BACKFILL_CAP = 5;
-
-// A notes blob is UI-touching when it mentions any UI path. Over-matches by
-// design (a passing comment counts); the operator dispositions false hits.
-export function isUiTouchingNotes(notes, uiPaths = VERIFY_UI_PATHS) {
-  if (typeof notes !== 'string') return false;
-  return uiPaths.some((p) => notes.includes(p));
-}
-
-export function hasVerifyPlan(notes) {
-  return typeof notes === 'string' && notes.includes('## Verify Plan');
-}
-
-// Per-act opt-out: a "## Verify Coverage" section whose first content line is
-// "Skip:" marks the act deliberately backend-only (same convention the orient
-// and debrief phases read).
-export function isVerifyOptedOut(notes) {
-  if (typeof notes !== 'string') return false;
-  return /##\s*Verify Coverage\s*\n\s*Skip:/i.test(notes);
-}
-
-// Pure selector: pending UI-touching rows lacking a Verify Plan and not opted
-// out, oldest-first (rows arrive ORDER BY created ASC), capped.
-export function selectBackfillCandidates(rows, { cap = VERIFY_BACKFILL_CAP, uiPaths } = {}) {
-  return (rows || [])
-    .filter((r) => isUiTouchingNotes(r.notes, uiPaths)
-      && !hasVerifyPlan(r.notes)
-      && !isVerifyOptedOut(r.notes))
-    .slice(0, cap);
-}
-
-const BACKFILL_SQL = `SELECT fid, text, notes FROM actions
-  WHERE completed = 0 AND deleted_at IS NULL
-    AND (notes LIKE '%webapp/frontend/%' OR notes LIKE '%components/%'
-         OR notes LIKE '%pages/%' OR notes LIKE '%app/%')
-    AND notes NOT LIKE '%## Verify Plan%'
-  ORDER BY created ASC`;
-
-// Deps injectable for hermetic tests; production callers omit them.
-export function verifyBackfillScan(config, deps = {}) {
-  const openDb = deps.openDb || openPibDb;
-  const file = deps.file || createItem;
-  const listPendingItems = deps.listPendingItems || listPending;
-  const hasFeatures = deps.hasFeatures
-    || ((p) => existsSync(join(p, 'e2e', 'features')));
-
-  const projects = config.projects || {};
-  let filed = 0;
-  for (const name of Object.keys(projects)) {
-    const projectPath = projects[name].path || projects[name];
-    if (!projectPath || typeof projectPath !== 'string') continue;
-    // Gate: verify installed in this project — nothing to be out of sync with
-    // otherwise. Mirrors the orient phase's first no-op guard.
-    if (!hasFeatures(projectPath)) continue;
-
-    const db = openDb(projectPath);
-    if (!db) continue;
-    let candidates;
-    try {
-      candidates = selectBackfillCandidates(db.prepare(BACKFILL_SQL).all());
-    } catch (e) {
-      logError(`Verify-backfill: query failed for ${name} (${e.message})`);
-      try { db.close(); } catch { /* ignore */ }
-      continue;
-    }
-    try { db.close(); } catch { /* ignore */ }
-    if (candidates.length === 0) continue;
-
-    // Dedup: one pending verify-backfill item per action fid per project.
-    const pendingFids = new Set(
-      listPendingItems({ project: name, category: 'verify-backfill' })
-        .map((i) => i.evidence?.action_fid)
-        .filter(Boolean));
-
-    for (const c of candidates) {
-      if (pendingFids.has(c.fid)) continue;
-      file({
-        project: name,
-        project_path: projectPath,
-        filed_by: 'ring2-slow',
-        category: 'verify-backfill',
-        urgency: 'low',
-        title: `Verify-plan backfill: ${(c.text || c.fid).slice(0, 56)}`,
-        summary: `Pending plan ${c.fid} touches UI but has no "## Verify Plan" section. `
-          + `Run /verify backfill ${c.fid} to draft it interactively, or accept the drift.`,
-        context_anchor: `pib-db action ${c.fid}`,
-        evidence: { action_fid: c.fid, action_text: c.text, project_path: projectPath },
-        options: [
-          { value: 'backfill', label: 'Backfill', description: `/verify backfill ${c.fid}` },
-          { value: 'accept-drift', label: 'Accept drift', description: 'Backend-only / not user-visible' },
-          { value: 'dismiss', label: 'Dismiss', description: 'Not worth capturing' },
-        ],
-      });
-      filed += 1;
-    }
-  }
-  if (filed > 0) log(`Slow: verify-backfill filed ${filed} candidate(s)`);
-  return { filed };
-}
-
 // ---------------------------------------------------------------------------
-// 8. Consumer hooks (renumbered: roster review at 6, verify-backfill at 7)
+// 8. Consumer hooks (renumbered: roster review at 6; 7 is retired)
 // ---------------------------------------------------------------------------
 
 function runSlowConsumerHooks(config, slowState) {
@@ -3384,8 +3277,9 @@ export const SLOW_STEPS = [
   // weekly gate keeps it from firing every slow run; gating here only lets the
   // operator disable it entirely.
   { name: 'roster-review', label: 'Cabinet-roster review', flag: 'roster_review', run: (config) => reviewCabinetRoster(config) },
-  // 7. Verify-plan backfill scan (feature-flagged; per-project verify gate).
-  { name: 'verify-backfill', label: 'Verify-backfill scan', flag: 'verify_backfill', run: (config) => { verifyBackfillScan(config); } },
+  // 7. (Verify-plan backfill scan ran here until Simplification Project 2,
+  // plan A3, deleted it — see the retirement note above runSlowConsumerHooks.
+  // The session that touched the action is asked at /close instead.)
   // 8. Recall over-suppression canary (M5, feature-flagged)
   { name: 'recall-canary', label: 'Recall canary', flag: 'recall_canary', run: (config) => { recallCanary(config); } },
   // 8b. Retrieval instrument (Simplification Project 1, plan B1, act:8b206268).

@@ -18,6 +18,20 @@ const require = createRequire(import.meta.url);
 
 // Re-export queue operations so ring scripts have a single import source.
 export { createItem, listPending, getItem, resolveItem } from './watchtower-queue.mjs';
+// Simplification Project 2, plan A9 (act:73dd31d4): the identity helpers and
+// the redirect writers are DEFINED in the queue (lib imports the queue, never
+// the reverse) and re-exported here so every importer keeps one name.
+export {
+  slugify, resolveCcSourceRepo,
+  RETIRED_CATEGORIES, NARROWED_CATEGORIES, redirectHomeFor,
+  carryLedgerPath, appendCarryEntry, readCarry, markCarryShown, resolveCarryEntry,
+  CARRY_KINDS, CARRY_PERSISTENT_KINDS,
+  feedbackOutboxPath, appendFeedbackOutboxEntry, frictionOutboxEntry, redirectLedgerPath,
+  findFeedbackDuplicateCandidates,
+  docDriftStatePath, readDocDrift, upsertDocDriftEntry, retractDocDriftEntries,
+  appendThreadProposal,
+} from './watchtower-queue.mjs';
+import { slugify, resolveCcSourceRepo, appendCarryEntry } from './watchtower-queue.mjs';
 // The knowledge-extraction four-axis vocabulary (act:471dd701) — defined in
 // watchtower-queue.mjs (createItem's boundary check needs it with zero
 // imports; this file already imports FROM queue.mjs, so the reverse would
@@ -87,10 +101,20 @@ export function autoReconcileItem(id, { resolution, notes, actor = 'ring1', evid
 //
 // "candidate future reconciler" notes inside exempt rationales are honest
 // markers, not commitments — promoting one moves the entry to `reconciler`.
+//
+// Every entry ALSO carries `label` — the plain-English name an operator-facing
+// surface uses for the category (Simplification Project 2, plan B2 / T16;
+// act:faf91294). The registry is the one place every category is already
+// listed, so it is the one place the name lives; the session-start block's
+// "oldest here: <label>, <N> days" line reads it (fallback: the raw key).
+// The snapshot's own CATEGORY_LABEL map in watchtower-snapshot.mjs is older
+// and incomplete; folding it onto this field is Project 4's vocabulary
+// cleanup, not this lane's.
 
 export const INBOX_DETECTOR_REGISTRY = {
   // ring1-filed
   'branch-diverged': {
+    label: 'diverged branch',
     reconciler: 'autoResolveBranchDivergedItems (ring1): retracts on verified-gone '
       + '(membership in a successful branch listing), squash-aware no-unmerged-content, '
       + 'or excluded name; filing exclusion: defaults.long_lived_branches '
@@ -98,6 +122,7 @@ export const INBOX_DETECTOR_REGISTRY = {
       + 'dismissal cannot reopen the loop (act:98649971)',
   },
   'worktree-unmerged': {
+    label: 'unmerged worktree',
     reconciler: 'autoResolveWorktreeItems (ring1): retracts on verified-gone branch or '
       + 'no-unmerged-content + no-real-uncommitted; fileOrphanedWorktreeItem supersedes '
       + 'on register change (unmerged ↔ uncommitted-only); filing exclusion: '
@@ -105,6 +130,7 @@ export const INBOX_DETECTOR_REGISTRY = {
   },
   // ring3-filed, ring1-reconciled
   'completion-review': {
+    label: 'finished action to confirm',
     reconciler: 'autoReconcileCompletionReviews (ring1): resolves when the referenced '
       + 'action (plan_fid || evidence.fid) is verifiably closed in its OWN project db; '
       + 'fid-not-found keeps (flow vestigial-db + misattribution protection). Filing '
@@ -114,26 +140,43 @@ export const INBOX_DETECTOR_REGISTRY = {
       + 'filter is DELETED — it exempted \'high\' from the born-this-session skip, so it '
       + 'suppressed the best cohort (same-day + medium/low, 74%) and passed the worst, '
       + 'and the category filed 0 true positives in the 23 items after it shipped; (c) '
-      + 'per-fid dedup across pending + resolved/dismissed/EXPIRED/SUPERSEDED. Category '
-      + 'expiry is 14d (expiryDaysFor), which is why the last two statuses are '
-      + 'load-bearing: the expiry equals COMPLETION_REVIEW_DEDUP_DAYS, so without them a '
-      + 'fid leaves every corpus exactly when its item expires and refiles forever. A '
+      + 'per-fid dedup across pending + resolved/dismissed/EXPIRED/SUPERSEDED. The last '
+      + 'two statuses are load-bearing HISTORY: until Simplification Project 2 (A1, '
+      + '2026-10-30) deleted expiry, this category expired at 14d — equal to '
+      + 'COMPLETION_REVIEW_DEDUP_DAYS — so without them a fid left every corpus exactly '
+      + 'when its item expired and refiled forever; the items already stamped expired or '
+      + 'superseded still exist, so the corpus keeps reading both. A '
       + 'quoted-completion-evidence check runs as INSTRUMENTATION ONLY (evidence.'
       + 'quote_verified) and gates nothing — the transcript haystack is JSON-serialized, '
       + 'so a substring gate rejects real prose and accepts serialized tool arguments.',
   },
-  // ring3-filed
+  // ring3-filed until Simplification Project 2 (prj:4a433dac), lane B3-residue
+  // (act:73dd31d4, plan A3, 2026-10-31): the five RESIDUE categories left the
+  // inbox. The question each one asked — "did this session leave a loose
+  // end / a repeated manual procedure / a UI change with no scenario / a new
+  // methodology / an action with no verify plan?" — is asked at /close
+  // (Step 6c, one plain-text message) by the session that has the context;
+  // Ring 3 keeps 2n/2o/2q only as the fallback for a session that never
+  // reached /close and writes them to the SESSION RECORD, never the queue.
+  // A stray filing into any of them is REDIRECTED by createItem to the
+  // project's carry ledger (watchtower-queue RETIRED_CATEGORIES → 'carry').
   'coverage-warning': {
-    exempt: 'standing-debt aggregation, not per-event filing — the DECLARED semantics '
-      + 'this registry binds, shipping as act:e888dd63 (Lane B of the same program; '
-      + 'the merge tail verifies it landed): ONE pending item per (project, '
-      + 'debt-class); Ring 3 APPENDS evidence (path union + per-path counts + session '
-      + 'count, evidence.first_seen = oldest) and escalates urgency at a session-count '
-      + 'threshold; human resolution closes the accumulated view and a persisting debt '
-      + 'refiles FRESH next tick. No mechanical retraction condition exists for "the '
-      + 'coverage debt cleared".',
+    label: 'UI change with no scenario',
+    retired: {
+      date: '2026-10-31',
+      reason: 'Project 2 (prj:4a433dac), plan A3: Phase 2q\'s filing site deleted with the '
+        + 'standing-debt aggregation (act:e888dd63 — ONE accumulating item per project, '
+        + 'evidence.first_seen = oldest, urgency by session count) that was its declared '
+        + 'exempt semantics. The lens now appends one "UI paths changed with no .feature '
+        + 'edit" line to the session record\'s ## Loose ends on the no-receipt branch; '
+        + '/close Step 6c asks the session itself. See '
+        + '.claude/plans/simplification-2-inbox.md.',
+      moved_to: 'session record ## Loose ends (Ring 3 fallback) / the /close residue '
+        + 'question; a stray filing → the project\'s carry ledger',
+    },
   },
   'knowledge-extraction': {
+    label: 'knowledge to review',
     retired: {
       date: '2026-09-29',
       reason: 'Project 1 (prj:a4c6052b): producers deleted (Ring 3 Phase 2d, the Phase 2g '
@@ -145,37 +188,85 @@ export const INBOX_DETECTOR_REGISTRY = {
     },
   },
   'methodology-capture': {
-    exempt: 'pure extraction (session methodology) — nothing mechanical to re-verify.',
+    label: 'methodology record proposal',
+    retired: {
+      date: '2026-10-31',
+      reason: 'Project 2 (prj:4a433dac), plan A3: Phase 2f (the methodology detector, '
+        + 'verification-gated since act:3f3f9a31 — 11 of 11 unverified captures were '
+        + 'dismissed) is DELETED outright; one less model call per close. The methodology '
+        + 'question is one line of the /close Step 6c residue check, and an accepted line '
+        + 'runs the debrief methodology-capture phase\'s write path in-session. Was exempt: '
+        + 'pure extraction. See .claude/plans/simplification-2-inbox.md.',
+      moved_to: '/close Step 6c (write methodology record); a stray filing → the '
+        + 'project\'s carry ledger',
+    },
   },
   'upstream-friction': {
-    exempt: 'a report routed to the CC repo; disposal is the human triage-at-arrival '
-      + 'duty, not a truth condition.',
+    label: 'friction report',
+    exempt: 'NARROWED to config-change friction (Project 2, prj:4a433dac, plan A5 / '
+      + 'Decision 2, 2026-10-31): a setting, hook or doc only the operator controls — a '
+      + 'decision with no mechanical truth condition. Ring 3 Phase 2g (routeFriction) '
+      + 'files only this route. The other two routes are DELIVERED, never queued: '
+      + 'cc-feedback → one /cc-feedback-shaped entry in ~/.claude/cc-feedback-outbox.json '
+      + '(deduplicated against the outbox, feedback/ and feedback/resolved/; Ring 1 '
+      + 'delivers it, triage-at-arrival in the CC repo is the human duty); '
+      + 'project-tracker → the session record\'s ## Friction section + one friction carry '
+      + 'entry, shown every start block in that project until a /close settles it (EP2). '
+      + 'A stray non-config-change filing is redirected by createItem '
+      + '(NARROWED_CATEGORIES, EP4).',
   },
   'advisor-finding': {
-    exempt: 'advisory observation from the session advisor pass (ring2 briefing panel + '
-      + 'ring3 Phase 2m); capped per member per session and deduped vs pending + '
-      + 'resolution corpora at filing; no mechanical truth condition. The ring2 '
-      + 'cabinet-roster review files only ONE kind here now (act:ea23b3a5): '
-      + 'uncovered-tech, which proposes a cabinet seat and is therefore a decision. Its '
-      + 'siblings dormant-skill and stale-briefing were pure measurements and moved to '
-      + 'ambient state (state/roster-review.json → Ring 1 Standing Issues, rendered on '
-      + 'change); retireRosterFindingItems supersedes any that were still pending.',
+    label: 'advisor finding',
+    exempt: 'NARROWED to cabinet-seat proposals (Project 2, prj:4a433dac, plan A4 / '
+      + 'Decision 4, 2026-10-31): the ONE filer is ring2\'s cabinet-roster review '
+      + '(fileRosterFinding, kind uncovered-tech, evidence.roster_kind), which proposes '
+      + 'a cabinet seat and is therefore a decision — no mechanical truth condition, '
+      + 'one pending per (project, roster kind). Its siblings dormant-skill and '
+      + 'stale-briefing were pure measurements and moved to ambient state (act:ea23b3a5; '
+      + 'state/roster-review.json → Ring 1 Standing Issues); retireRosterFindingItems '
+      + 'supersedes any still pending. Every OTHER advisor finding left the inbox: ring3 '
+      + 'Phase 2m and the by-hand /debrief + /orient filers write the session record\'s '
+      + '## Advisor findings and one advisor carry entry (shown once in the next start '
+      + 'block, read by /briefing and the weekly roundup); a stray non-seat filing is '
+      + 'redirected to the carry ledger by createItem (NARROWED_CATEGORIES, EP4). '
+      + 'Measured before: 49 filed per 28 days by Ring 3, 0 human-closed.',
   },
   'raised-unhandled': {
-    exempt: 'session-historical fact — a loose end the session raised but neither did '
-      + 'nor filed; cannot be mechanically re-checked. Candidate future reconciler: the '
-      + 'referenced work later filed/closed.',
+    label: 'loose end',
+    retired: {
+      date: '2026-10-31',
+      reason: 'Project 2 (prj:4a433dac), plan A3 / Decision 3: Phase 2n\'s filing site is '
+        + 're-pointed at the session record (## Loose ends) and runs only when the session '
+        + 'never reached /close (the receipt-driven fallback, decision default 15, with a '
+        + 'D5 kill trigger). Measured yield that moved it: 96 filed per 28 days, 1 human-'
+        + 'closed; a background model cannot tell a deliberate silence from a dropped '
+        + 'commitment (act:9ed07d9d) — the session at /close can. Was exempt: session-'
+        + 'historical fact. See .claude/plans/simplification-2-inbox.md.',
+      moved_to: '/close Step 6c (file as action / drop); session record ## Loose ends on '
+        + 'the Ring 3 no-receipt branch; a stray filing → the project\'s carry ledger',
+    },
   },
   'skill-candidate': {
-    exempt: 'judgment item (a repeated manual procedure worth a skill); no mechanical '
-      + 'condition.',
+    label: 'skill candidate',
+    retired: {
+      date: '2026-10-31',
+      reason: 'Project 2 (prj:4a433dac), plan A3 / Decision 3: Phase 2o\'s filing site is '
+        + 're-pointed at the session record (## Skill candidates), fallback-only like 2n. '
+        + '18 filed per 28 days, 0 human-closed. Was exempt: judgment item. See '
+        + '.claude/plans/simplification-2-inbox.md.',
+      moved_to: '/close Step 6c (note as skill candidate); session record ## Skill '
+        + 'candidates on the Ring 3 no-receipt branch; a stray filing → the project\'s '
+        + 'carry ledger',
+    },
   },
   // ring2-filed
   'deferred-trigger': {
+    label: 'fired trigger',
     exempt: 'one-time trigger event; dedup-vs-pending blocks refiring. Candidate future '
       + 'reconciler: the referenced deferred action closed.',
   },
   'watchtower-health': {
+    label: 'watchtower health note',
     retired: {
       date: '2026-09-29',
       reason: 'Project 1 (prj:a4c6052b), plan A5 / decision default 20: memory-budget '
@@ -191,22 +282,30 @@ export const INBOX_DETECTOR_REGISTRY = {
         + '.claude/plans/simplification-1-memory-retrieval.md.',
     },
   },
-  // ring4-filed (in the census since act:ea23b3a5; ring4 was outside it before)
+  // ring4 (in the census since act:ea23b3a5; ring4 was outside it before)
   'doc-drift': {
-    exempt: 'a documentary claim that no longer matches the tree, filed one item per '
-      + '(project, drift_key). Deliberately NOT aggregated into a per-project standing '
-      + 'debt: each item carries its own mutually-exclusive fix-doc / fix-code decision, '
-      + 'so one accumulated item would pose a question the operator cannot answer. No '
-      + 'mechanical retraction yet either — the weekly pass covers only 3 of 7 projects '
-      + 'per run, so "not reproduced this run" is not evidence a claim cleared, and a '
-      + 'reconciler built on it would mass-retract every item in the unscanned projects. '
-      + 'Candidate future reconciler: re-verify on the next pass that ACTUALLY scanned '
-      + 'that project, scoped to items with filed_by ring4. NOTE a second producer '
-      + 'exists outside the census — a consumer Plan-9 hook files doc-drift with no '
-      + 'drift_key at all (live: flow ring2-slow-post/10-pulse-mechanical.mjs).',
+    label: 'documentation drift',
+    retired: {
+      date: '2026-10-31',
+      reason: 'Project 2 (prj:4a433dac), plan A4 / Decision 4 / decision default 18: Ring '
+        + '4 has no session, so a drift claim is a PROJECT fact, not a decision to queue. '
+        + 'Ring 4 upserts each finding into state/projects/<slug>/doc-drift.json (one '
+        + 'entry per drift_key) and REMOVES an entry when a later pass that actually '
+        + 're-checked that claim no longer finds it — the reconciler this entry used to '
+        + 'name as a candidate; a claim the pass did not re-check (document not '
+        + 'collected, project not selected this week) stays. Measured before: 17 filed '
+        + 'per 28 days, 0 human-closed. Project 4 moves the check into /close. Was '
+        + 'exempt: documentary claim with no mechanical retraction. See '
+        + '.claude/plans/simplification-2-inbox.md.',
+      moved_to: 'state/projects/<slug>/doc-drift.json, rendered by Ring 1 as one Standing '
+        + 'Issues line (count + path) in the project state the start block injects; a '
+        + 'stray filing (flow\'s ring2-slow-post/10-pulse-mechanical.mjs hook) → the same '
+        + 'file via createItem\'s redirect',
+    },
   },
   // routines-filed (in the census since act:ea23b3a5)
   'routine': {
+    label: 'scheduled routine',
     exempt: 'a declared interactive routine that fired. The dispatch engine owns the '
       + 'whole lifecycle, so there is nothing for a Ring 1 reconciler to re-check: a '
       + 'pending item blocks refiring, a stale one is superseded at the next due firing, '
@@ -215,22 +314,49 @@ export const INBOX_DETECTOR_REGISTRY = {
       + 'dispatch descriptor via DISPATCHED_CATEGORIES, so the desk badge follows.',
   },
   'stale-project': {
+    label: 'stale project',
     exempt: 'staleness notification. Candidate future reconciler: project activity '
       + 'resumed ⇒ retract.',
   },
   'project-completion': {
+    label: 'project nearing completion',
     exempt: 'human judgment (close a project?); never mechanically resolvable.',
   },
   'pattern-promotion': {
+    label: 'recurring pattern',
     exempt: 'threshold event (≥3 sweep instances of a failure class), deduped at '
       + 'filing; promotion up the compliance stack is a human decision.',
   },
   'verify-backfill': {
-    exempt: 'backfill nudge for actions without a Verify Plan. Candidate future '
-      + 'reconciler: the action gains a Verify Plan section ⇒ retract.',
+    label: 'missing verify plan',
+    retired: {
+      date: '2026-10-31',
+      reason: 'Project 2 (prj:4a433dac), plan A3: Ring 2\'s verifyBackfillScan (slow step 7, '
+        + 'flag verify_backfill) is DELETED. "This action you touched has no Verify Plan" '
+        + 'is asked by the session that touched it: watchtower-commitments.mjs --residue '
+        + 'reads the touched fids from the transcript\'s own pib_* tool calls and /close '
+        + 'Step 6c proposes "write verify plan". 10 filed per 28 days, 0 human-closed. Was '
+        + 'exempt: backfill nudge. See .claude/plans/simplification-2-inbox.md.',
+      moved_to: '/close Step 6c (write verify plan) via watchtower-commitments.mjs '
+        + '--residue; a stray filing → the project\'s carry ledger',
+    },
+  },
+  // Never ring-filed after 2026-06-10 — survived only as vocabulary
+  // (watchtower-validate, item.json.schema, the snapshot label) until
+  // Simplification Project 2 accounted for it here.
+  'routing-decision': {
+    label: 'routing decision',
+    retired: {
+      date: '2026-10-31',
+      reason: 'Project 2 (prj:4a433dac), plan A3: no producer anywhere — last filed '
+        + '2026-06-10; the dead `decision_routing` config key is removed by the console in '
+        + 'C4. No live home: createItem refuses it (watchtower-queue RETIRED_CATEGORIES → '
+        + 'null). VALID_CATEGORIES and the snapshot label stay for history.',
+    },
   },
   // ring3-filed, ring1-reconciled (act:5182beda, N3/Reach 1 of grp:retro-remeaning)
   'pending-relation': {
+    label: 'proposed thread relation',
     retired: {
       date: '2026-09-29',
       reason: 'Project 1 (prj:a4c6052b), plan A1: its ONLY producer was Reach 1 '
@@ -243,17 +369,29 @@ export const INBOX_DETECTOR_REGISTRY = {
   },
   // ring3-filed, ring1-reconciled (act:bcb7edd4, Reach 2 of grp:retro-remeaning)
   'significance-change': {
-    reconciler: 'autoReconcileSignificanceItems (ring1): a proposal that a session\'s '
-      + 'new understanding recolors an EARLIER cursor entry of a thread it touched '
-      + '(reframes/answers/contradicts) retracts when the cited thread file is POSITIVELY '
-      + 'gone from state/threads/ (dir readable, file absent) — a recolor of deleted '
-      + 'history is moot. Fails toward KEEPING on any read error. Filing exclusion: dedup '
-      + 'by evidence.relation_key (thread|prior_session|new_session|verb) across ALL '
-      + 'statuses, UNWINDOWED — a dismissed/expired judgment about a static corpus never '
-      + 're-nags, and a reprocess replay of the same session produces the same key and '
-      + 'files nothing. Event-driven (fires on session close only), never a periodic '
-      + 'sweep. Relational category: in GATED_CATEGORIES, so applyBatch structurally '
-      + 'refuses to bulk it — each proposal is confirmed or dismissed individually.',
+    label: 'thread re-reading proposal',
+    retired: {
+      date: '2026-10-31',
+      reason: 'Project 2 (prj:4a433dac), plan A8 / EP1: a proposal that a session\'s new '
+        + 'understanding recolors an EARLIER cursor entry of a thread it touched '
+        + '(reframes/answers/contradicts) is written ONTO that thread — the additive '
+        + 'proposed_recolors array, through the queue-side appendThreadProposal — plus one '
+        + 'recolor entry in the project\'s carry ledger, never the inbox. The durable '
+        + 'relation_key exclusion (thread|prior_session|verb, the anchor and never the '
+        + 'noticer) moved with it: a key already proposed, applied (recolor_log) or a '
+        + 'historical queue item in any status writes nothing; another noticing session '
+        + 'appends to also_noticed_by. Measured before (live queue, 2026-10-31): 45 filed in '
+        + '28 days; lifetime 519 — 252 confirmed and 21 declined by the operator, all on or '
+        + 'before 2026-08-27, none since; 198 expired; 48 pending; 0 retracted by the '
+        + 'reconciler. autoReconcileSignificanceItems (ring1) keeps '
+        + 'running over the historical items until Project 4 (it retracts when the cited '
+        + 'thread file is positively gone; the on-thread proposals vanish with their '
+        + 'thread). GATED_CATEGORIES keeps the category, so the walk moves the pending '
+        + 'items one at a time. No confirm/dismiss verb before Project 3 (R2). See '
+        + '.claude/plans/simplification-2-inbox.md.',
+      moved_to: 'thread file proposed_recolors + /threads + next start block; Project 3\'s '
+        + 'contradiction gate decides what returns to the inbox',
+    },
   },
 };
 
@@ -363,9 +501,10 @@ export function recordSuppression(record = {}, { watchtowerDir, ts } = {}) {
 // metric that gates Reach 3 (L2) per the plan (replacing the wrong
 // contradiction-density gate: significance change leaves no contradiction
 // to detect, so only observed proposal/keep rates can measure it). The
-// NUMERATOR (proposals filed / kept / dismissed) lives in the queue itself
-// under category 'significance-change'; readSignificanceRate combines the
-// two. Named reader: the L2 pickup gate (its action notes point here) plus
+// NUMERATOR (proposals filed) lives on the thread files' `proposed_recolors`
+// since plan A8 (act:b57df8e4), plus the historical queue items under
+// category 'significance-change', which also hold the kept / dismissed
+// dispositions; readSignificanceRate combines them. Named reader: the L2 pickup gate (its action notes point here) plus
 // the close run's own log line — never write-only telemetry.
 //
 // Same fail-open discipline as recordSuppression: observability, never the
@@ -409,7 +548,11 @@ export function recordSignificanceEvent(record = {}, { watchtowerDir, ts } = {})
  * @returns {{sessions: number, sessions_with_history: number,
  *   proposals_filed_ledger: number, queue: {pending: number, kept: number,
  *   dismissed: number, expired: number, superseded: number, retracted: number},
+ *   thread_proposals: number, proposals_total: number,
  *   proposals_per_session: number|null, keep_ratio: number|null}}
+ *   `thread_proposals` counts every proposed_recolors entry on the thread
+ *   files; `proposals_total` is the number of distinct relation_keys across
+ *   the thread files and the historical queue items.
  */
 export function readSignificanceRate({ watchtowerDir, listItemsFn = queueListItems } = {}) {
   const sessions = new Map(); // session_id -> latest record
@@ -440,6 +583,34 @@ export function readSignificanceRate({ watchtowerDir, listItemsFn = queueListIte
     }
   } catch { /* fail-open: an unreadable queue reads as zero dispositions */ }
 
+  // Since plan A8 (act:b57df8e4) a proposal lives on its thread file
+  // (`proposed_recolors`), so the numerator reads the thread files too; a key
+  // present on both sides (a historical item the walk moved onto its thread)
+  // is one proposal, so the total is the union of relation_keys.
+  const keys = new Set();
+  try {
+    for (const item of listItemsFn({ category: 'significance-change' })) {
+      const k = item && item.evidence && item.evidence.relation_key;
+      if (k) keys.add(k);
+    }
+  } catch { /* fail-open, as above */ }
+  let threadProposals = 0;
+  try {
+    const threadsDir = join(watchtowerDir || getWatchtowerDir(), 'state', 'threads');
+    if (existsSync(threadsDir)) {
+      for (const f of readdirSync(threadsDir)) {
+        if (!f.endsWith('.json')) continue;
+        try {
+          const t = JSON.parse(readFileSync(join(threadsDir, f), 'utf8'));
+          for (const p of Array.isArray(t && t.proposed_recolors) ? t.proposed_recolors : []) {
+            threadProposals++;
+            if (p && p.relation_key) keys.add(p.relation_key);
+          }
+        } catch { /* skip an unreadable thread file */ }
+      }
+    }
+  } catch { /* fail-open: an unreadable threads dir reads as zero proposals */ }
+
   const records = [...sessions.values()];
   const sessionsWithHistory = records.filter((r) => (r.threads_with_history ?? 0) > 0).length;
   const proposalsFiledLedger = records.reduce((s, r) => s + (r.proposals_filed ?? 0), 0);
@@ -449,6 +620,8 @@ export function readSignificanceRate({ watchtowerDir, listItemsFn = queueListIte
     sessions_with_history: sessionsWithHistory,
     proposals_filed_ledger: proposalsFiledLedger,
     queue,
+    thread_proposals: threadProposals,
+    proposals_total: keys.size,
     proposals_per_session: sessionsWithHistory > 0
       ? proposalsFiledLedger / sessionsWithHistory : null,
     keep_ratio: decided > 0 ? queue.kept / decided : null,
@@ -679,12 +852,10 @@ export function loadConfig(watchtowerDir) {
 }
 
 // ---------------------------------------------------------------------------
-// slugify — lowercase, replace non-alphanum with dash, trim dashes
+// slugify — lowercase, replace non-alphanum with dash, trim dashes. Defined in
+// watchtower-queue.mjs since plan A9 (the queue's carry-ledger writer keys on
+// it and the queue cannot import this module); re-exported at the top.
 // ---------------------------------------------------------------------------
-
-export function slugify(text) {
-  return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-}
 
 // ---------------------------------------------------------------------------
 // Authored-.claude re-inclusion for worktree dirty detection (act:e91fdfcf)
@@ -777,31 +948,12 @@ export function claudeChurnIsDisposable(porcelainLine, authoredDirs) {
 // duplicate flush (incompatible {date}-{slug}-{seq}.md scheme) was retired
 // (act:d53ff509) once this duty was verified in the live runtime.
 
-const CC_PACKAGE_NAME = 'create-claude-cabinet';
-
 // Resolve the CC source repo ROOT via cc-registry — the single registered
 // project whose package.json name is create-claude-cabinet. The one place
 // "which checkout is the CC source?" is answered, so callers (feedback
 // delivery, the Ring 1 runtime-drift check) never re-derive it.
-export function resolveCcSourceRepo(registryPath) {
-  if (!existsSync(registryPath)) return null;
-  let registry;
-  try {
-    registry = JSON.parse(readFileSync(registryPath, 'utf8'));
-  } catch {
-    return null;
-  }
-  for (const proj of registry.projects || []) {
-    const root = proj.path || '';
-    const pkgPath = join(root, 'package.json');
-    if (!existsSync(pkgPath)) continue;
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
-      if (pkg.name === CC_PACKAGE_NAME) return root;
-    } catch { /* unreadable package.json — not the CC repo */ }
-  }
-  return null;
-}
+// (resolveCcSourceRepo is defined in watchtower-queue.mjs since plan A9 — the
+// outbox writer's T8 dedup needs it there — and re-exported at the top.)
 
 function resolveCcFeedbackDir(registryPath) {
   const repo = resolveCcSourceRepo(registryPath);
@@ -1247,6 +1399,176 @@ export function upsertLastSessionSection(existingContent, block) {
   return base.slice(0, idx) + block;
 }
 
+// ---------------------------------------------------------------------------
+// Session records, residue receipts, the fallback ledger (Simplification
+// Project 2, plan B3 / A3 — act:73dd31d4)
+// ---------------------------------------------------------------------------
+
+// sessionRecordPath — THE spelling of a per-session record:
+// state/projects/<slug>/sessions/<date>-<sessionId>.md. Ring 3's main()
+// computes it ONCE and hands it to Phase 2b (sessionSummary) and to every
+// lens that appends a section, so the two cannot drift (T13).
+export function sessionRecordPath(slug, date, sessionId, { watchtowerDir = getWatchtowerDir() } = {}) {
+  return join(watchtowerDir, 'state', 'projects', slug, 'sessions', `${date}-${sessionId}.md`);
+}
+
+// residueRecordPath — where a session whose project slug is UNRESOLVED gets
+// its residue written: state/residue/<sessionId>.record.md. Not /recall-
+// indexed (stated limitation, plan §Edge Cases); logged by the caller so it
+// is never a silent drop (T5).
+export function residueRecordPath(sessionId, { watchtowerDir = getWatchtowerDir() } = {}) {
+  return join(watchtowerDir, 'state', 'residue', `${sessionId}.record.md`);
+}
+
+// appendSessionRecordSection — re-read the record, append or EXTEND the named
+// `## ` section with the given lines, atomicWrite. Never throws: returns
+// { ok, written, error? } and logs. When the record does not exist (Phase 2b
+// failed, T5) a stub is written first — `# Session <id>`, `Date:` and the
+// "(summary unavailable — Phase 2b did not complete)" line — so the section
+// is still indexed by /recall (watchtower-recall indexes sessions/*.md).
+export function appendSessionRecordSection(recordPath, heading, lines, { sessionId = null, date = null, logFn = null } = {}) {
+  const say = typeof logFn === 'function' ? logFn : (m) => logError('watchtower-lib', m);
+  const body = (Array.isArray(lines) ? lines : [lines])
+    .map((l) => String(l ?? '').replace(/\r?\n/g, ' ').trim())
+    .filter(Boolean);
+  if (!/^## /.test(String(heading || ''))) {
+    say(`appendSessionRecordSection: heading must start with "## " (got ${JSON.stringify(heading)})`);
+    return { ok: false, written: 0, error: 'bad-heading' };
+  }
+  if (body.length === 0) return { ok: true, written: 0 };
+  try {
+    let content;
+    if (existsSync(recordPath)) {
+      content = readFileSync(recordPath, 'utf8');
+    } else {
+      const sid = sessionId || basename(String(recordPath)).replace(/\.md$/, '').replace(/^\d{4}-\d{2}-\d{2}-/, '');
+      content = `# Session ${sid}\n\nDate: ${date || new Date().toISOString()}\n\n(summary unavailable — Phase 2b did not complete)\n`;
+    }
+    const idx = headerLineIndex(content, heading);
+    if (idx < 0) {
+      content = `${content.trimEnd()}\n\n${heading}\n${body.join('\n')}\n`;
+    } else {
+      const next = content.indexOf('\n## ', idx + heading.length);
+      const sectionEnd = next > 0 ? next : content.length;
+      const section = content.slice(idx, sectionEnd).trimEnd();
+      const rest = next > 0 ? content.slice(next) : '\n';
+      content = `${content.slice(0, idx)}${section}\n${body.join('\n')}\n${rest.startsWith('\n## ') ? rest : rest.replace(/^\n+/, '\n')}`;
+    }
+    atomicWrite(recordPath, content);
+    return { ok: true, written: body.length };
+  } catch (e) {
+    say(`appendSessionRecordSection: could not append ${heading} to ${recordPath}: ${e.message}`);
+    return { ok: false, written: 0, error: e.message };
+  }
+}
+
+// Residue receipts — state/residue/<sessionId>.json, keyed GLOBALLY by session
+// id (T4: the session's resolver and Ring 3's can disagree for worktree or
+// unresolved sessions; one key both sides can compute). Shape:
+//   { session_id, project_path, asked_at, findings: [{ n, kind, text, proposed, carry_id? }],
+//     advisor_findings: [], answered, dispositions }
+// /close Step 6c writes it BEFORE it asks (answered: false), --record-answer
+// stamps the reply; a receipt with findings: [] counts as answered.
+export function residueReceiptPath(sessionId, { watchtowerDir = getWatchtowerDir() } = {}) {
+  return join(watchtowerDir, 'state', 'residue', `${sessionId}.json`);
+}
+
+export function readResidueReceipt(sessionId, opts = {}) {
+  const p = residueReceiptPath(sessionId, opts);
+  try {
+    if (!existsSync(p)) return null;
+    const r = JSON.parse(readFileSync(p, 'utf8'));
+    return r && typeof r === 'object' ? r : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeResidueReceipt(receipt, opts = {}) {
+  if (!receipt || typeof receipt.session_id !== 'string' || !receipt.session_id) {
+    throw new Error('writeResidueReceipt: receipt.session_id is required');
+  }
+  const p = residueReceiptPath(receipt.session_id, opts);
+  atomicWrite(p, JSON.stringify(receipt, null, 2) + '\n');
+  return p;
+}
+
+export function receiptIsAnswered(receipt) {
+  if (!receipt) return false;
+  if (Array.isArray(receipt.findings) && receipt.findings.length === 0) return true;
+  return receipt.answered === true;
+}
+
+// The D5 kill-trigger ledger — one line per Ring 3 close:
+// { ts, session_id, project, branch: 'answered' | 'unanswered' | 'no-receipt', lines_written }.
+// Fail-open: observability only.
+export function appendFallbackLedger(record, { watchtowerDir = getWatchtowerDir() } = {}) {
+  try {
+    const dir = join(watchtowerDir, 'state', 'residue');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, 'fallback-ledger.jsonl'), JSON.stringify({ ts: new Date().toISOString(), ...record }) + '\n');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Project-tracker friction from a session whose project slug is UNRESOLVED
+// has no carry ledger to ride (no project key — plan §Edge Cases, decision
+// default 22): one line per report here, { ts, session_id, project,
+// project_path, title, summary, route }, so it is COUNTED, never dropped
+// silently. Ring 1 renders the count in summary.md's ## Inbox section (plan
+// B6). Returns the path written, or null on a failed write (the caller logs).
+export function unresolvedFrictionPath({ watchtowerDir = getWatchtowerDir() } = {}) {
+  return join(watchtowerDir, 'state', 'residue', 'unresolved-friction.jsonl');
+}
+
+export function appendUnresolvedFriction(record, { watchtowerDir = getWatchtowerDir() } = {}) {
+  try {
+    const p = unresolvedFrictionPath({ watchtowerDir });
+    const dir = dirname(p);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    appendFileSync(p, JSON.stringify({ ts: new Date().toISOString(), ...record }) + '\n');
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+// Advisor findings land in the record's ## Advisor findings AND one 'advisor'
+// carry entry each (shown once in the next start block, B2). The ONE writer
+// for both Ring 3's Phase 2m (advisorPass, plan A4) and the receipt branches
+// (the by-hand filers in /debrief and /orient, A9's table), so the two writes
+// cannot disagree. A finding is { member, directive_key?, finding, title?,
+// skill? }: the record line is `- <member> (<directive_key>): <finding>`, the
+// carry entry follows lane 3's render contract — `source.member` plus the
+// finding text in `detail` (the start block prints `- <member>: <detail>`).
+export function recordAdvisorFindings(recordPath, projectSlug, findings, { sessionId = null, logFn = null, filedBy = 'residue-receipt' } = {}) {
+  const list = Array.isArray(findings) ? findings.filter((f) => f && (f.finding || f.text || f.title)) : [];
+  if (list.length === 0) return 0;
+  const textOf = (f) => String(f.finding || f.text || f.title);
+  const lines = list.map((f) => `- ${f.member || 'advisor'}${f.directive_key ? ` (${f.directive_key})` : ''}: ${textOf(f)}`);
+  appendSessionRecordSection(recordPath, '## Advisor findings', lines, { sessionId, logFn });
+  let n = 0;
+  for (const f of list) {
+    try {
+      appendCarryEntry(projectSlug, {
+        kind: 'advisor', title: `${f.member || 'advisor'}: ${String(f.title || textOf(f)).slice(0, 120)}`,
+        detail: textOf(f), source_session: sessionId,
+        source: {
+          member: f.member || null, filed_by: filedBy,
+          ...(f.directive_key ? { directive_key: f.directive_key } : {}),
+          ...(f.skill ? { skill: f.skill } : {}),
+        },
+      });
+      n++;
+    } catch (e) {
+      (typeof logFn === 'function' ? logFn : (m) => logError('watchtower-lib', m))(`recordAdvisorFindings: carry append failed: ${e.message}`);
+    }
+  }
+  return n;
+}
+
 export function preserveRing3LastSession(freshContent, existingContent) {
   if (!existingContent) return freshContent;
   const existing = extractSection(existingContent, PROJECT_STATE_LAST_SESSION_HEADER);
@@ -1570,7 +1892,9 @@ export function loadBetterSqlite3(projectPath) {
   const candidates = [() => require('better-sqlite3')];
   if (projectPath) {
     candidates.push(
-      () => createRequire(join(projectPath, 'package.json'))('better-sqlite3')
+      () => createRequire(join(projectPath, 'package.json'))('better-sqlite3'),
+      // A yarn/pnpm/bun project keeps the driver in scripts/ (act:4d571240).
+      () => createRequire(join(projectPath, 'scripts', 'package.json'))('better-sqlite3')
     );
   }
   for (const entry of (process.env.NODE_PATH || '').split(':').filter(Boolean)) {

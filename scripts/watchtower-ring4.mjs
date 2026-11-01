@@ -2,10 +2,13 @@
 
 // Watchtower Ring 4 — Periodic truth reconciliation.
 // Weekly cadence. Compares documentary CLAIMS (CLAUDE.md sections, briefing
-// files, plan files, memory entries) against codebase REALITY and files drift
-// as inbox items. Reconciliation is COMPARISON, not generation — Ring 4 never
-// rewrites a document; it flags drift with enough context to fix and the
-// operator triages it.
+// files, plan files, memory entries) against codebase REALITY and records drift
+// as project state — state/projects/<slug>/doc-drift.json, one entry per claim,
+// cleared when a later pass re-checks the claim and no longer finds it; Ring 1
+// renders the count into the project's Standing Issues (Simplification
+// Project 2, plan A4: drift left the inbox). Reconciliation is COMPARISON, not
+// generation — Ring 4 never rewrites a document; it flags drift with enough
+// context to fix.
 //
 // Where it sits among the rings (the nervous-system principle, not a stack):
 //   - R1 catches individual files; R2 individual patterns; R3 individual
@@ -42,7 +45,7 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 import {
   atomicWrite, loadConfig, log as _log, logError as _logError,
-  getWatchtowerDir, createItem, listPending,
+  getWatchtowerDir, upsertDocDriftEntry, retractDocDriftEntries,
 } from './watchtower-lib.mjs';
 
 const WATCHTOWER_DIR = getWatchtowerDir();
@@ -54,7 +57,7 @@ export const RECONCILE_INTERVAL_DAYS = 7;
 // Bounded cost: at most this many projects reconciled per run (rotation +
 // git-recency priority pick the set).
 export const RING4_PROJECT_CAP = 3;
-// Bounded noise: at most this many drift items filed per run across all
+// Bounded churn: at most this many NEW drift claims recorded per run across all
 // reconciled projects.
 export const RING4_ITEM_CAP = 8;
 // Bound the document set scanned per project so a plans/ dir with hundreds of
@@ -344,17 +347,35 @@ function countRecursive(dir, ext, dirsOnly, depth) {
  * be taken — a count rule never invents drift from a thing it couldn't measure.
  */
 export function reconcileCountRule(projectRoot, rule, readFile = readFileSync) {
-  if (!rule || !rule.doc || !rule.pattern || !rule.glob) return null;
+  return evaluateCountRule(projectRoot, rule, readFile).mismatch;
+}
+
+/**
+ * The same evaluation, also saying whether the claim was actually CHECKED
+ * (plan A4: a doc-drift entry is removed only by a pass that re-checked it).
+ * Checked = the doc was read and either states no count any more or the
+ * count was taken; an unreadable doc or an unmeasurable glob is NOT checked.
+ * @returns {{checked: boolean, mismatch: object|null}}
+ */
+export function evaluateCountRule(projectRoot, rule, readFile = readFileSync) {
+  const no = { checked: false, mismatch: null };
+  if (!rule || !rule.doc || !rule.pattern || !rule.glob) return no;
   const docPath = join(projectRoot, rule.doc);
-  if (!existsSync(docPath)) return null;
+  if (!existsSync(docPath)) return no;
   let text;
-  try { text = readFile(docPath, 'utf8'); } catch { return null; }
+  try { text = readFile(docPath, 'utf8'); } catch { return no; }
   const claimed = parseClaimedCount(text, rule.pattern);
-  if (claimed === null) return null;
+  if (claimed === null) return { checked: true, mismatch: null }; // the claim is gone
   const actual = countGlob(projectRoot, rule.glob);
-  if (actual === null) return null;
-  if (claimed === actual) return null;
-  return { label: rule.label || rule.glob, doc: rule.doc, claimed, actual, glob: rule.glob };
+  if (actual === null) return no;
+  if (claimed === actual) return { checked: true, mismatch: null };
+  return { checked: true, mismatch: { label: rule.label || rule.glob, doc: rule.doc, claimed, actual, glob: rule.glob } };
+}
+
+/** The drift_key spelling for a count rule — one definition, used for both the
+ *  finding and the checked set. */
+function countDriftKey(doc, label) {
+  return `count:${doc}:${label}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -492,14 +513,28 @@ export function defaultGitIgnored(projectRoot, paths) {
  * (injectable for tests; defaults to a real `git check-ignore`).
  */
 export function reconcileProject({ projectRoot, countRules = [], gitIgnored = defaultGitIgnored }) {
+  return scanProject({ projectRoot, countRules, gitIgnored }).findings;
+}
+
+/**
+ * The same reconciliation, also returning `checkedKeys` — the drift_key of
+ * every claim this pass actually RE-CHECKED, found or not: `path:<doc>` for
+ * every document collected, `count:<doc>:<label>` for every count rule that
+ * could be evaluated. Ring 4 retracts a stored drift entry only when its key
+ * was checked and not found (plan A4) — never from mere absence.
+ * @returns {{findings: object[], checkedKeys: Set<string>}}
+ */
+export function scanProject({ projectRoot, countRules = [], gitIgnored = defaultGitIgnored }) {
   const findings = [];
-  if (!projectRoot || !existsSync(projectRoot)) return findings;
+  const checkedKeys = new Set();
+  if (!projectRoot || !existsSync(projectRoot)) return { findings, checkedKeys };
 
   // 1. Missing-path pass over the document set. Collect all misses first, run
   //    ONE gitignore check across the union, then drop the expected-absent.
   const perDoc = [];
   const union = new Set();
   for (const doc of collectDocuments(projectRoot)) {
+    checkedKeys.add(`path:${doc.label}`);
     const missing = reconcileDocPaths(doc.text, projectRoot);
     if (missing.length > 0) {
       perDoc.push({ doc: doc.label, missing });
@@ -521,12 +556,13 @@ export function reconcileProject({ projectRoot, countRules = [], gitIgnored = de
 
   // 2. Count-claim pass over declared rules.
   for (const rule of (Array.isArray(countRules) ? countRules : [])) {
-    const mismatch = reconcileCountRule(projectRoot, rule);
+    const { checked, mismatch } = evaluateCountRule(projectRoot, rule);
+    if (checked) checkedKeys.add(countDriftKey(rule.doc, rule.label || rule.glob));
     if (mismatch) {
       findings.push({
         kind: 'count-mismatch',
         doc: mismatch.doc,
-        drift_key: `count:${mismatch.doc}:${mismatch.label}`,
+        drift_key: countDriftKey(mismatch.doc, mismatch.label),
         label: mismatch.label,
         claimed: mismatch.claimed,
         actual: mismatch.actual,
@@ -535,11 +571,13 @@ export function reconcileProject({ projectRoot, countRules = [], gitIgnored = de
     }
   }
 
-  return findings;
+  return { findings, checkedKeys };
 }
 
 // ---------------------------------------------------------------------------
-// Inbox filing
+// Drift state (Simplification Project 2, plan A4; act:dafa9afa) — a drift
+// claim is a PROJECT fact, written to state/projects/<slug>/doc-drift.json,
+// never an inbox item. Ring 1 renders the count into Standing Issues.
 // ---------------------------------------------------------------------------
 
 function findingTitle(projectName, finding) {
@@ -557,33 +595,19 @@ function findingSummary(finding) {
 }
 
 /**
- * File a deduped doc-drift inbox item for one finding. Dedup is one pending
- * item per drift_key per project (mirrors Ring 2's roster_kind convention) —
- * a still-open drift item is a reference, not a duplicate. Returns true if a
- * new item was filed.
+ * Upsert one finding into the project's drift state, keyed by drift_key (one
+ * entry per claim). Returns true when the claim is NEW (the item cap counts
+ * new claims, as it counted new inbox items before).
  */
-function fileDriftItem({ projectName, projectPath, finding, file, listPendingItems }) {
-  const pending = listPendingItems({ project: projectName, category: 'doc-drift' });
-  if (pending.some(qi => qi.evidence?.drift_key === finding.drift_key)) {
-    return false; // already surfaced — don't re-file
-  }
-  file({
-    project: projectName,
-    project_path: projectPath,
-    filed_by: 'ring4',
-    category: 'doc-drift',
-    urgency: 'low',
+function recordDriftFinding({ projectName, projectPath, finding, now, upsert }) {
+  const { added } = upsert(projectName, {
+    ...finding,
     title: findingTitle(projectName, finding),
     summary: findingSummary(finding),
-    context_anchor: finding.doc,
-    evidence: { drift_key: finding.drift_key, kind: finding.kind, doc: finding.doc, ...finding },
-    options: [
-      { value: 'fix-doc', label: 'Fix the document', description: 'Update the claim to match reality' },
-      { value: 'fix-code', label: 'Restore / fix the code', description: 'The claim is right; reality drifted' },
-      { value: 'dismiss', label: 'Dismiss', description: 'Acceptable / intentional' },
-    ],
-  });
-  return true;
+    filed_by: 'ring4',
+    project_path: projectPath,
+  }, { now });
+  return added;
 }
 
 // ---------------------------------------------------------------------------
@@ -613,15 +637,19 @@ function countRulesFor(projConfig) {
 }
 
 /**
- * Main reconciliation pass. deps.{now, file, listPendingItems, gitLastCommitMs}
- * are injectable so tests stay hermetic. Honors the weekly cadence gate and the
- * per-run project + item caps. Stamps state regardless of whether work was
- * found, so the cadence gate holds even on a clean portfolio.
+ * Main reconciliation pass. deps.{now, upsert, retract, gitLastCommitMs,
+ * gitIgnored} are injectable so tests stay hermetic (the defaults are the
+ * real doc-drift state writers). Per reconciled project: every finding is
+ * upserted into state/projects/<slug>/doc-drift.json, then every stored claim
+ * this pass re-checked and did NOT find is removed. Honors the weekly cadence
+ * gate and the per-run project + new-claim caps. Stamps state regardless of
+ * whether work was found, so the cadence gate holds even on a clean portfolio.
+ * Returns { recorded (new claims), removed (cleared claims), reconciled }.
  */
 export function runReconciliation(config, deps = {}) {
   const now = deps.now || Date.now();
-  const file = deps.file || createItem;
-  const listPendingItems = deps.listPendingItems || listPending;
+  const upsert = deps.upsert || upsertDocDriftEntry;
+  const retract = deps.retract || retractDocDriftEntries;
   const gitLastCommitMs = deps.gitLastCommitMs || defaultGitLastCommitMs;
   const gitIgnored = deps.gitIgnored || defaultGitIgnored;
 
@@ -633,7 +661,7 @@ export function runReconciliation(config, deps = {}) {
 
   if (!deps.force && !shouldRunReconciliation(state, now)) {
     log('Reconciliation not due (weekly cadence)');
-    return { filed: 0, reconciled: 0, skipped: 'cadence' };
+    return { recorded: 0, removed: 0, reconciled: 0, skipped: 'cadence' };
   }
 
   const projects = config.projects || {};
@@ -643,7 +671,7 @@ export function runReconciliation(config, deps = {}) {
     mkdirSync(join(WATCHTOWER_DIR, 'state'), { recursive: true });
     atomicWrite(statePath, JSON.stringify(state, null, 2));
     log('Reconciliation — no projects configured');
-    return { filed: 0, reconciled: 0 };
+    return { recorded: 0, removed: 0, reconciled: 0 };
   }
 
   const checked = state.projects_checked || {};
@@ -663,30 +691,39 @@ export function runReconciliation(config, deps = {}) {
   const selected = selectReconcileProjects(projectNames, checked, gitActive);
   log(`Reconciliation — ${selected.length} of ${projectNames.length} project(s) (${gitActive.size} git-active)`);
 
-  let filed = 0;
+  let recorded = 0;
+  let removed = 0;
   let reconciled = 0;
   for (const name of selected) {
     const projectPath = resolvedPaths[name];
     if (!projectPath || !existsSync(projectPath)) { checked[name] = now; continue; }
     try {
-      const findings = reconcileProject({
+      const { findings, checkedKeys } = scanProject({
         projectRoot: projectPath,
         countRules: countRulesFor(projects[name]),
         gitIgnored,
       });
       reconciled += 1;
       for (const finding of findings) {
-        if (filed >= RING4_ITEM_CAP) break;
-        if (fileDriftItem({ projectName: name, projectPath, finding, file, listPendingItems })) {
-          filed += 1;
-          log(`Filed doc-drift for ${name}: ${finding.drift_key}`);
+        if (recorded >= RING4_ITEM_CAP) break;
+        if (recordDriftFinding({ projectName: name, projectPath, finding, now, upsert })) {
+          recorded += 1;
+          log(`Recorded doc-drift for ${name}: ${finding.drift_key}`);
         }
+      }
+      // The exit (plan A4): a claim this pass re-checked and no longer found
+      // is cleared. found = EVERY finding, recorded or capped, so a claim over
+      // the cap is never retracted for being unrecorded.
+      const cleared = retract(name, { checkedKeys, foundKeys: new Set(findings.map((f) => f.drift_key)) });
+      if (cleared > 0) {
+        removed += cleared;
+        log(`Cleared ${cleared} doc-drift claim(s) for ${name} — re-checked and no longer found`);
       }
     } catch (e) {
       logError(`Reconciliation failed for ${name}: ${e.message}`);
     }
     checked[name] = now;
-    if (filed >= RING4_ITEM_CAP) {
+    if (recorded >= RING4_ITEM_CAP) {
       log(`Reconciliation item cap (${RING4_ITEM_CAP}) reached — remaining projects deferred to next run`);
       break;
     }
@@ -697,8 +734,8 @@ export function runReconciliation(config, deps = {}) {
   mkdirSync(join(WATCHTOWER_DIR, 'state'), { recursive: true });
   atomicWrite(statePath, JSON.stringify(state, null, 2));
 
-  log(`Reconciliation complete — ${reconciled} reconciled, ${filed} drift item(s) filed`);
-  return { filed, reconciled };
+  log(`Reconciliation complete — ${reconciled} reconciled, ${recorded} new drift claim(s) recorded, ${removed} cleared`);
+  return { recorded, removed, reconciled };
 }
 
 // ---------------------------------------------------------------------------
