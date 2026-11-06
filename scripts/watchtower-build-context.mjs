@@ -234,8 +234,8 @@ function countQueueItems() {
 }
 
 // Plain-English category name from the detector registry (plan B2 / T16);
-// a category the registry does not know (qa-handoff until plan B1 lands,
-// anything unregistered) falls back to its key.
+// a category the registry does not know (anything unregistered — qa-handoff
+// was one until plan B1 registered it) falls back to its key.
 function categoryLabel(category) {
   const entry = INBOX_DETECTOR_REGISTRY[category];
   return entry && typeof entry.label === 'string' && entry.label.trim() ? entry.label : category;

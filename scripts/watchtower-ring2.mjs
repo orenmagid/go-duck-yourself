@@ -21,8 +21,11 @@
 //   - Stale work detection (14d → stale-project, all-done → project-completion)
 //   - Quality pattern detection — routes Ring 3 patterns to cabinet members via inbox
 //     (act:a49b9191: classifies each pattern against the encoded rule set first —
-//     instances go to state/rule-instances/<project>.jsonl; threshold → ONE
-//     promotion proposal; themes collapse before fan-out; flag pattern_rule_classifier)
+//     instances go to state/rule-instances/<project>.jsonl and file nothing;
+//     threshold → ONE promotion proposal; novel patterns collapse by theme
+//     before fan-out. Unconditional since Simplification Project 2 A2 — the
+//     counter is the only per-rule path. Sections Phase 2e stamped with a
+//     project are classified against that project's rules + global only.)
 //   - Cabinet-roster review (occasional, weekly slot): uncovered tech,
 //     dormant skills (reuses scripts/skill-usage.mjs), briefing staleness
 //   - Consumer hooks (subshell, 60s timeout)
@@ -1408,14 +1411,36 @@ export function patternIsStale(dateStr, now = Date.now()) {
   return (nowMs - t) > PATTERN_STALE_DAYS * 86400000;
 }
 
+// Pure: the stamp Phase 2e writes after the date in a section header
+// (`### <date> · project: <name> · session: <id>`, act:7c03b6a0 — written by
+// ring3's appendAuditPatternsSection). An unstamped header (every section
+// written before the stamp) yields nulls.
+export function parseAuditPatternsHeaderStamp(rest) {
+  const field = (name) => {
+    const m = new RegExp(`·\\s*${name}:\\s*([^·]+)`).exec(String(rest || ''));
+    const v = m ? m[1].trim() : '';
+    return v || null;
+  };
+  return { project: field('project'), session_id: field('session') };
+}
+
+// Each pattern carries `project` and `session_id` from its section header's
+// stamp (null when the section is unstamped). They are NOT part of the hash,
+// so a section's processed state survives the stamp's introduction.
 export function parseAuditPatterns(content) {
   const patterns = [];
   let currentDate = null;
+  let currentStamp = { project: null, session_id: null };
   const lines = content.split('\n');
 
   for (let i = 0; i < lines.length; ) {
-    const dateMatch = lines[i].match(/^### (\d{4}-\d{2}-\d{2})/);
-    if (dateMatch) { currentDate = dateMatch[1]; i++; continue; }
+    const dateMatch = lines[i].match(/^### (\d{4}-\d{2}-\d{2})(.*)$/);
+    if (dateMatch) {
+      currentDate = dateMatch[1];
+      currentStamp = parseAuditPatternsHeaderStamp(dateMatch[2]);
+      i++;
+      continue;
+    }
 
     const patternMatch = lines[i].match(/^## (.+)/);
     if (patternMatch && currentDate) {
@@ -1427,7 +1452,7 @@ export function parseAuditPatterns(content) {
         i++;
       }
       const body = bodyLines.join('\n').trim();
-      if (body) patterns.push({ title, body, date: currentDate, hash: simpleHash(title + body) });
+      if (body) patterns.push({ title, body, date: currentDate, ...currentStamp, hash: simpleHash(title + body) });
       continue;
     }
     i++;
@@ -1466,25 +1491,29 @@ export function parseAuditPatterns(content) {
 //
 // The act:78db81d9 invariant, restated so "file no item" is never read as
 // suppression: EVERY instance is retained, with its Evidence block, in
-// `state/rule-instances/<project>.jsonl` (append-only) — in BOTH flag
-// states. Phase 2e's prompt is untouched.
+// `state/rule-instances/<project>.jsonl` (append-only). Phase 2e's prompt is
+// untouched.
 //
-// Attribution: audit-patterns.md carries a date and nothing else — no
-// project, no session id — so an instance of a project-scoped rule belongs
-// to that project (the first config project holding it when several do),
-// and an instance of a GLOBAL-only rule is attributed to the first config
-// project, which is where today's member routing lands it anyway (routing
-// picks the first project in config order that has the named member).
-// `session_id` is recorded as null until Phase 2e stamps one.
+// Attribution and scope (act:7c03b6a0, folded into Simplification Project 2
+// B5): Phase 2e stamps each section header with the session's project and
+// session id. A section stamped with a config project is classified against
+// THAT project's encoded set — its rules + global rules, its pinned memory,
+// and the patterns promoted in it — and every instance it yields is
+// attributed to that project, with the stamped session id. A section with no
+// stamp (written before the stamp existed) or naming a project not in config
+// is not classified at all: it files as a novel pattern and is counted in
+// `last_scan_unstamped_patterns` (operator ruling 2026-11-01, option b — no
+// instance is ever credited to a project it did not come from). The
+// portfolio-wide set (buildEncodedRuleSet with no project) still judges
+// orphaned rules in the summary; within it a project-scoped rule belongs to
+// the first config project holding it, a GLOBAL-only rule to the first.
 //
-// Flag: `defaults.pattern_rule_classifier === true` (opt-IN, ships OFF —
-// watchtower-contracts.md "New Dedup Corpora Ship OFF"). OFF: classify,
-// count, and file exactly as before — pure measurement. ON: instances file
-// no item, a rule crossing PROMOTION_THRESHOLD instances inside
-// PROMOTION_WINDOW_DAYS files ONE promotion proposal carrying them all, and
-// novel patterns collapse by theme before member fan-out. ON writes fewer
-// items than OFF, never more; a classifier failure fails OPEN (the pattern
-// files as if novel).
+// Behavior (unconditional since Simplification Project 2 A2, which deleted
+// the opt-in flag after one live slow tick with it on): an instance files no
+// item; a rule crossing PROMOTION_THRESHOLD instances inside
+// PROMOTION_WINDOW_DAYS files ONE promotion proposal carrying them all; novel
+// patterns collapse by theme before member fan-out. A classifier failure
+// fails OPEN (the pattern files as if novel).
 
 export const RULE_INSTANCE_DIR = 'rule-instances';
 export const PROMOTION_THRESHOLD = 5;
@@ -1585,18 +1614,23 @@ export function promotedPatternEntries(items) {
   return out;
 }
 
-// The encoded set for one scan, portfolio-wide, deduped by hash. Fails open
-// at every step: an unreadable scope shrinks the set (fewer instances
-// recognized → more items filed), never aborts the scan.
+// The encoded set for one scan, deduped by hash: portfolio-wide by default,
+// or — with `deps.project` naming a config project (act:7c03b6a0) — that
+// project's rules + global, its pinned memory and the patterns promoted in
+// it, every entry attributed to it. Fails open at every step: an unreadable
+// scope shrinks the set (fewer instances recognized → more items filed),
+// never aborts the scan.
 export function buildEncodedRuleSet(config, deps = {}) {
   const {
     globalDir,
     memoryDirFn = findMemoryDir,
     listItemsFn = listItems,
     loadRulesFn = loadRulesCorpus,
+    project: scope = null,
   } = deps;
   const projects = [];
   for (const [name, projConfig] of Object.entries((config && config.projects) || {})) {
+    if (scope && name !== scope) continue;
     const path = (projConfig && projConfig.path) || projConfig;
     if (typeof path !== 'string' || !existsSync(path)) continue;
     projects.push({ name, path });
@@ -1625,6 +1659,7 @@ export function buildEncodedRuleSet(config, deps = {}) {
   try { promoted = promotedPatternEntries(listItemsFn({ category: 'pattern-promotion' })); }
   catch { promoted = []; }
   for (const p of promoted) {
+    if (scope && p.project !== scope) continue;
     const home = projects.find((x) => x.name === p.project) || projects[0] || null;
     put({ ...p, project: home ? home.name : null, project_path: home ? home.path : null });
   }
@@ -2108,20 +2143,45 @@ export async function scanAuditPatterns(config, deps = {}) {
   const gapAssertionGate = config?.defaults?.pattern_gap_assertion !== false;
 
   // Rule-instance classification (act:a49b9191) — see the 5a header. The
-  // classifier is an opt-IN (`=== true`, ships OFF) per "New Dedup Corpora
-  // Ship OFF": OFF classifies and COUNTS but files exactly as before; ON
-  // suppresses instances, files threshold proposals, and collapses themes.
-  const classifierOn = config?.defaults?.pattern_rule_classifier === true;
+  // counter is the only per-rule path (Simplification Project 2 A2): an
+  // instance files nothing, a threshold files one proposal, novel patterns
+  // collapse by theme.
+  const setDeps = {
+    listItemsFn,
+    ...(deps.globalRulesDir ? { globalDir: deps.globalRulesDir } : {}),
+    ...(deps.memoryDirFn ? { memoryDirFn: deps.memoryDirFn } : {}),
+  };
+  // The portfolio-wide set: judges orphaned rules in the summary (every
+  // project's set is a subset of it). It classifies nothing.
   let encodedSet = [];
   try {
-    encodedSet = encodedSetFn(config, {
-      listItemsFn,
-      ...(deps.globalRulesDir ? { globalDir: deps.globalRulesDir } : {}),
-      ...(deps.memoryDirFn ? { memoryDirFn: deps.memoryDirFn } : {}),
-    });
+    encodedSet = encodedSetFn(config, setDeps);
   } catch (e) {
-    logError(`Encoded rule set unreadable, classifying against nothing: ${e.message}`);
+    logError(`Encoded rule set unreadable, orphan judgment skipped: ${e.message}`);
   }
+  // A stamped section is classified against its project's set (act:7c03b6a0),
+  // built once per project per scan. A failure to build it classifies against
+  // nothing — the pattern files as novel (fail open), never against another
+  // project's rules. An UNSTAMPED section, or one whose stamp names a project
+  // not in config, is classified against nothing too: it files as novel and
+  // is counted (operator ruling 2026-11-01, option b — a one-time burst is
+  // accepted over crediting an instance to the wrong project).
+  const scopedSets = new Map();
+  let unstampedPatterns = 0;
+  const encodedSetFor = (pattern) => {
+    const name = pattern && pattern.project;
+    if (!name || !Object.prototype.hasOwnProperty.call((config && config.projects) || {}, name)) {
+      unstampedPatterns++;
+      return [];
+    }
+    if (!scopedSets.has(name)) {
+      let set = [];
+      try { set = encodedSetFn(config, { ...setDeps, project: name }); }
+      catch (e) { logError(`Encoded rule set for ${name} unreadable, classifying against nothing: ${e.message}`); }
+      scopedSets.set(name, set);
+    }
+    return scopedSets.get(name);
+  };
   let ruleInstances = 0;
   let suppressedInstances = 0;
   let classifierErrors = 0;
@@ -2155,17 +2215,18 @@ export async function scanAuditPatterns(config, deps = {}) {
 
       // Classify against the encoded set BEFORE routing. A classifier error
       // reads as NOVEL — fail open toward filing, never toward suppression.
+      const patternSet = encodedSetFor(pattern);
       let verdict = { instance_of: null, theme: null, parse_error: false };
-      if (encodedSet.length > 0) {
+      if (patternSet.length > 0) {
         try {
-          verdict = (await classifyFn(pattern, encodedSet)) || verdict;
+          verdict = (await classifyFn(pattern, patternSet)) || verdict;
         } catch (e) {
           classifierErrors++;
           logError(`Rule classification failed (pattern files as novel): ${e.message}`);
           verdict = { instance_of: null, theme: null, parse_error: true };
         }
       }
-      const entry = verdict.instance_of ? encodedSet[verdict.instance_of - 1] : null;
+      const entry = verdict.instance_of ? patternSet[verdict.instance_of - 1] : null;
       if (entry) {
         ruleInstances++;
         appendRuleInstance(watchtowerDir, entry.project, {
@@ -2175,35 +2236,30 @@ export async function scanAuditPatterns(config, deps = {}) {
           rule_file: entry.file || null,
           rule_scope: entry.scope,
           project: entry.project,
-          session_id: null,
+          session_id: pattern.session_id || null,
           pattern_hash: pattern.hash,
           pattern_title: pattern.title,
           source_date: pattern.date,
           evidence: extractLabeledBlock(pattern.body, EVIDENCE_MARKER) || pattern.body.slice(0, 300),
           theme: verdict.theme,
           filed_at: nowIso(),
-          classifier_on: classifierOn,
-          filed_item: !classifierOn,
+          classifier_on: true,
+          filed_item: false,
         });
-        log(`Slow: pattern is an instance of "${entry.title}"${classifierOn ? ' — counted, not filed' : ' — counted AND filed (classifier off)'}: ${pattern.title.slice(0, 60)}`);
-        if (classifierOn) {
-          suppressedInstances++;
-          processedSet.add(pattern.hash);
-          continue;
-        }
+        log(`Slow: pattern is an instance of "${entry.title}" — counted, not filed: ${pattern.title.slice(0, 60)}`);
+        suppressedInstances++;
+        processedSet.add(pattern.hash);
+        continue;
       }
-      survivors.push({ ...pattern, theme: verdict.theme, instance: entry ? { rule: entry.title, rule_hash: entry.hash } : null });
+      survivors.push({ ...pattern, theme: verdict.theme });
     } catch (e) {
       logError(`Pattern classification failed: ${e.message}`);
       processedSet.add(pattern.hash);
     }
   }
 
-  // Theme collapse before member fan-out (ON only; OFF keeps one item per
-  // pattern exactly as before).
-  const groups = classifierOn
-    ? groupPatternsByTheme(survivors)
-    : survivors.map((p) => ({ key: `self:${p.hash}`, patterns: [p] }));
+  // Theme collapse before member fan-out — the novel-pattern filing site.
+  const groups = groupPatternsByTheme(survivors);
 
   for (const group of groups) {
     const primary = group.patterns[0];
@@ -2244,7 +2300,6 @@ export async function scanAuditPatterns(config, deps = {}) {
             theme_key: group.key,
             theme_hashes: hashes,
             theme_patterns: group.patterns.map((p) => ({ hash: p.hash, title: p.title, source_date: p.date, text: p.body })),
-            ...(primary.instance ? { instance_of_rule: primary.instance } : {}),
           },
           options: [
             { value: 'write', label: 'Write to member', description: `Add to cabinet-${lead.name}/patterns-project.md` },
@@ -2261,50 +2316,48 @@ export async function scanAuditPatterns(config, deps = {}) {
     }
   }
 
-  // Promotion proposals — the Promote stage finally has a producer (ON only:
-  // OFF must never add an item).
+  // Promotion proposals — the counter's one filing site: a rule crossing the
+  // threshold files ONE proposal carrying every instance in its window.
   let proposalsFiled = 0;
-  if (classifierOn) {
-    for (const [name, projConfig] of Object.entries(config?.projects || {})) {
-      try {
-        const instances = readRuleInstances(watchtowerDir, name);
-        if (!instances.length) continue;
-        const existingProposals = listItemsFn({ category: 'pattern-promotion', project: name })
-          .filter((i) => i && i.evidence && i.evidence.proposal_key);
-        const nowMs = Date.parse(nowIso());
-        for (const p of proposePromotions(instances, { existingProposals, now: Number.isNaN(nowMs) ? Date.now() : nowMs })) {
-          const projectPath = (projConfig && projConfig.path) || projConfig;
-          createItemFn({
-            project: name,
-            project_path: typeof projectPath === 'string' ? projectPath : null,
-            filed_by: 'ring2-slow',
-            category: 'pattern-promotion',
-            urgency: 'normal',
-            title: `Promotion proposal: ${p.rule} — ${p.instance_count} instances in ${PROMOTION_WINDOW_DAYS} days`,
-            summary: `${p.instance_count} observed instances of "${p.rule}" between ${p.window_start.slice(0, 10)} and ${p.window_end.slice(0, 10)}. A rule this often not followed is the Monitor-stage condition (enforcement-pipeline.md §5): the encoding is at the wrong layer. Review the instances and decide whether to move the rule up the compliance stack.`,
-            context_anchor: `state/${RULE_INSTANCE_DIR}/${slugify(name)}.jsonl`,
-            evidence: {
-              proposal_key: p.proposal_key,
-              rule: p.rule,
-              rule_hash: p.rule_hash,
-              rule_file: p.rule_file,
-              rule_kind: p.rule_kind,
-              window_start: p.window_start,
-              window_end: p.window_end,
-              instance_count: p.instance_count,
-              instances: p.instances,
-            },
-            options: [
-              { value: 'promote', label: 'Promote the rule', description: 'File an action to move this rule up the compliance stack (rule → hook → structural)' },
-              { value: 'dismiss', label: 'Dismiss', description: 'The instances do not justify a mechanism yet' },
-            ],
-          });
-          proposalsFiled++;
-          log(`Slow: filed promotion proposal for "${p.rule}" (${p.instance_count} instances)`);
-        }
-      } catch (e) {
-        logError(`Promotion proposal pass failed for ${name}: ${e.message}`);
+  for (const [name, projConfig] of Object.entries(config?.projects || {})) {
+    try {
+      const instances = readRuleInstances(watchtowerDir, name);
+      if (!instances.length) continue;
+      const existingProposals = listItemsFn({ category: 'pattern-promotion', project: name })
+        .filter((i) => i && i.evidence && i.evidence.proposal_key);
+      const nowMs = Date.parse(nowIso());
+      for (const p of proposePromotions(instances, { existingProposals, now: Number.isNaN(nowMs) ? Date.now() : nowMs })) {
+        const projectPath = (projConfig && projConfig.path) || projConfig;
+        createItemFn({
+          project: name,
+          project_path: typeof projectPath === 'string' ? projectPath : null,
+          filed_by: 'ring2-slow',
+          category: 'pattern-promotion',
+          urgency: 'normal',
+          title: `Promotion proposal: ${p.rule} — ${p.instance_count} instances in ${PROMOTION_WINDOW_DAYS} days`,
+          summary: `${p.instance_count} observed instances of "${p.rule}" between ${p.window_start.slice(0, 10)} and ${p.window_end.slice(0, 10)}. A rule this often not followed is the Monitor-stage condition (enforcement-pipeline.md §5): the encoding is at the wrong layer. Review the instances and decide whether to move the rule up the compliance stack.`,
+          context_anchor: `state/${RULE_INSTANCE_DIR}/${slugify(name)}.jsonl`,
+          evidence: {
+            proposal_key: p.proposal_key,
+            rule: p.rule,
+            rule_hash: p.rule_hash,
+            rule_file: p.rule_file,
+            rule_kind: p.rule_kind,
+            window_start: p.window_start,
+            window_end: p.window_end,
+            instance_count: p.instance_count,
+            instances: p.instances,
+          },
+          options: [
+            { value: 'promote', label: 'Promote the rule', description: 'File an action to move this rule up the compliance stack (rule → hook → structural)' },
+            { value: 'dismiss', label: 'Dismiss', description: 'The instances do not justify a mechanism yet' },
+          ],
+        });
+        proposalsFiled++;
+        log(`Slow: filed promotion proposal for "${p.rule}" (${p.instance_count} instances)`);
       }
+    } catch (e) {
+      logError(`Promotion proposal pass failed for ${name}: ${e.message}`);
     }
   }
 
@@ -2337,6 +2390,11 @@ export async function scanAuditPatterns(config, deps = {}) {
   state.promotion_proposals_total = (state.promotion_proposals_total || 0) + proposalsFiled;
   state.last_scan_promotion_proposals = proposalsFiled;
   state.encoded_set_size = encodedSet.length;
+  // Sections filed as novel without classification because they carry no
+  // project stamp (or name a project not in config) — act:7c03b6a0, operator
+  // ruling 2026-11-01 (option b).
+  state.last_scan_unstamped_patterns = unstampedPatterns;
+  state.scoped_projects_last_scan = [...scopedSets.keys()];
   atomicWrite(statePath, JSON.stringify(state, null, 2));
   if (rejectedMalformed > 0) {
     log(`Slow: ${rejectedMalformed} malformed pattern(s) rejected this scan `

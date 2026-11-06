@@ -2594,7 +2594,31 @@ Only report PROBLEMATIC patterns:
 
 Output as markdown with ## headers for each pattern found. Include **Evidence:** (what you observed) and **Gap:** (what's missing or broken) for each — sections missing either block are discarded downstream. If no meaningful patterns, output "No recurring patterns detected."`;
 
-async function qualityPatternCapture(compressed, projectPath) {
+// Pure: audit-patterns.md after appending one session's Phase 2e response
+// (`existing` null = the file does not exist yet). Exported for the hermetic
+// suite.
+//
+// The section header is stamped `### <date> · project: <name> · session: <id>`
+// (act:7c03b6a0, folded into Simplification Project 2 B5). Ring 2's
+// parseAuditPatterns reads the stamp back and scopes the rule classifier to
+// that project's rules + global, attributing the instance to that project —
+// before the stamp the file carried a date and nothing else, so a cabinet
+// pattern was classified against maginnis's rules too. The date still opens
+// the header, so the stale-section sweep reads it unchanged. A part with no
+// value is omitted; `·` and line breaks are stripped from values so a name
+// can never forge another field or end the header.
+export function appendAuditPatternsSection(existing, { date, project = null, sessionId = null, response }) {
+  const clean = (v) => String(v).replace(/[\r\n·]+/g, ' ').trim();
+  let header = `### ${date}`;
+  if (project && clean(project)) header += ` · project: ${clean(project)}`;
+  if (sessionId && clean(sessionId)) header += ` · session: ${clean(sessionId)}`;
+  const text = String(response || '').trim();
+  return typeof existing === 'string'
+    ? existing + `\n\n---\n\n${header}\n\n${text}\n`
+    : `# Quality Patterns\n\n${header}\n\n${text}\n`;
+}
+
+async function qualityPatternCapture(compressed, projectPath, { projectName = null, sessionId = null } = {}) {
   log('Phase 2e: Quality pattern capture');
 
   if (!projectPath) {
@@ -2636,10 +2660,10 @@ async function qualityPatternCapture(compressed, projectPath) {
 
     // Write patterns to watchtower state (append-only log, read by Ring 2 for routing)
     const patternsPath = join(WATCHTOWER_DIR, 'state', 'audit-patterns.md');
-    const dateStr = new Date().toISOString().slice(0, 10);
-    const content = existsSync(patternsPath)
-      ? readFileSync(patternsPath, 'utf8') + `\n\n---\n\n### ${dateStr}\n\n${response.trim()}\n`
-      : `# Quality Patterns\n\n### ${dateStr}\n\n${response.trim()}\n`;
+    const content = appendAuditPatternsSection(
+      existsSync(patternsPath) ? readFileSync(patternsPath, 'utf8') : null,
+      { date: new Date().toISOString().slice(0, 10), project: projectName, sessionId, response },
+    );
 
     atomicWrite(patternsPath, content);
     log('Phase 2e: Quality patterns written');
@@ -3185,10 +3209,13 @@ Output ONLY the JSON array, no other text.`;
 // (production omits it → this run's claudeCall).
 //
 //   2n: Raised-but-unhandled — anything the session RAISED but neither did
-//       nor filed (passing promises, side-issues, hanging questions) → inbox.
+//       nor filed (passing promises, side-issues, hanging questions) → the
+//       session record's `## Loose ends` (never the inbox since Simplification
+//       Project 2 A3; runs only on the no-receipt fallback branch).
 //   2o: Skill-candidate — a manual procedure repeated by hand that a skill
-//       would automate → inbox. The skill-discovery extension of the
-//       knowledge-extraction concern (the retired Phase 2d's sibling).
+//       would automate → the session record's `## Skill candidates`, same
+//       branch. The skill-discovery extension of the knowledge-extraction
+//       concern (the retired Phase 2d's sibling).
 //   2p: Checklist-catch — a surfaced change-impact check that caught a real
 //       bug → recorded to checklist-stats.json (the catch-recording side of
 //       /debrief's checklist-feedback phase, which dies with debrief; feeds
@@ -4295,7 +4322,8 @@ async function main() {
 
   // Phase 2e: Audit pattern capture
   try {
-    await qualityPatternCapture(compressed, project.path);
+    await qualityPatternCapture(compressed, project.path,
+      { projectName: project.name, sessionId: args.sessionId });
   } catch (e) {
     logError(`Phase 2e failed: ${e.message}`);
   }

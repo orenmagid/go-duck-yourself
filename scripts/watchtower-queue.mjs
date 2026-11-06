@@ -1547,8 +1547,15 @@ function threadKeyOf(slug, e) {
  *                    item (`reason` says which); nothing written.
  * Throws only on a proposal with no key, or a failed write (createItem's
  * redirect then falls back to the queue — visibility, never loss).
+ *
+ * `allowQueueItems` — ids of historical `significance-change` queue items
+ * that may carry this key WITHOUT excluding the write. The backlog walk
+ * (plan C1 `route-thread`) moves a pending queue item onto its thread, and
+ * that item is itself the legacy record this exclusion would otherwise find
+ * (carried from lane 6, act:2c133dc3); the walk passes the walked item's own
+ * id. Any OTHER queue item carrying the key still excludes.
  */
-export function appendThreadProposal(threadsDir, slug, proposal = {}) {
+export function appendThreadProposal(threadsDir, slug, proposal = {}, { allowQueueItems = [] } = {}) {
   if (typeof slug !== 'string' || !slug || slug.startsWith('.') || /[/\\]/.test(slug)) return null;
   const path = join(threadsDir, `${slug}.json`);
   if (!existsSync(path)) return null;
@@ -1567,8 +1574,9 @@ export function appendThreadProposal(threadsDir, slug, proposal = {}) {
   if ((Array.isArray(thread.recolor_log) ? thread.recolor_log : []).some((e) => threadKeyOf(slug, e) === key)) {
     return { outcome: 'excluded', reason: 'applied', path, entry: null, display_name };
   }
+  const allowed = new Set(Array.isArray(allowQueueItems) ? allowQueueItems : [allowQueueItems]);
   const legacy = listItems({ category: 'significance-change' })
-    .find((i) => i.evidence && i.evidence.relation_key === key);
+    .find((i) => !allowed.has(i.id) && i.evidence && i.evidence.relation_key === key);
   if (legacy) {
     return { outcome: 'excluded', reason: 'queue', item_id: legacy.id, path, entry: null, display_name };
   }

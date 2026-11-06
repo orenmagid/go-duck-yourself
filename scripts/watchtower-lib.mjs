@@ -110,11 +110,36 @@ export function autoReconcileItem(id, { resolution, notes, actor = 'ring1', evid
 // The snapshot's own CATEGORY_LABEL map in watchtower-snapshot.mjs is older
 // and incomplete; folding it onto this field is Project 4's vocabulary
 // cleanup, not this lane's.
+//
+// Every LIVE entry ALSO declares `reader` and `exit` (Simplification Project
+// 2, plan B1 / Decision 5; act:fcb42cdd). Expiry was deleted outright (A1):
+// nothing leaves the inbox by age, so every category must say who acts on it
+// and how it leaves. `reader` — who acts and where they see it. `exit` —
+// `{ mechanical: '<function> (<ring>): <condition>' }` (a retraction the code
+// performs on an event) and/or `{ operator: '<verbs>' }`; never an age (age
+// shows on the start block's oldest line, it never resolves). The structural
+// test enforces both, pins the live set, and requires every mechanical
+// function to exist in a ring script; B6's growth alarm reads the declared
+// exits. These fields sit BESIDE reconciler | exempt — the detector-symmetry
+// trichotomy is unchanged. `filed_outside_rings: true` marks a live category
+// a skill files rather than a ring (qa-handoff), so the census does not
+// demand a ring filing site for it.
+
+// One reader for every live category after Project 2: the operator, on the
+// three surfaces that show pending items (the start block names this
+// project's oldest, with age).
+const OPERATOR_READER = 'operator — /inbox, /briefing, start-block oldest line';
 
 export const INBOX_DETECTOR_REGISTRY = {
   // ring1-filed
   'branch-diverged': {
     label: 'diverged branch',
+    reader: OPERATOR_READER,
+    exit: {
+      mechanical: 'autoResolveBranchDivergedItems (ring1): the branch is verifiably gone, '
+        + 'has no unmerged content (squash-aware), or its name became excluded',
+      operator: 'merge or delete the branch, or dismiss in /inbox',
+    },
     reconciler: 'autoResolveBranchDivergedItems (ring1): retracts on verified-gone '
       + '(membership in a successful branch listing), squash-aware no-unmerged-content, '
       + 'or excluded name; filing exclusion: defaults.long_lived_branches '
@@ -123,6 +148,12 @@ export const INBOX_DETECTOR_REGISTRY = {
   },
   'worktree-unmerged': {
     label: 'unmerged worktree',
+    reader: OPERATOR_READER,
+    exit: {
+      mechanical: 'autoResolveWorktreeItems (ring1): the branch is verifiably gone, or it '
+        + 'has no unmerged content and no real uncommitted changes',
+      operator: 'merge or remove the worktree, or dismiss in /inbox',
+    },
     reconciler: 'autoResolveWorktreeItems (ring1): retracts on verified-gone branch or '
       + 'no-unmerged-content + no-real-uncommitted; fileOrphanedWorktreeItem supersedes '
       + 'on register change (unmerged ↔ uncommitted-only); filing exclusion: '
@@ -131,6 +162,12 @@ export const INBOX_DETECTOR_REGISTRY = {
   // ring3-filed, ring1-reconciled
   'completion-review': {
     label: 'finished action to confirm',
+    reader: OPERATOR_READER,
+    exit: {
+      mechanical: 'autoReconcileCompletionReviews (ring1): the referenced action is '
+        + 'verifiably closed in its own project db',
+      operator: 'complete the action, or dismiss in /inbox',
+    },
     reconciler: 'autoReconcileCompletionReviews (ring1): resolves when the referenced '
       + 'action (plan_fid || evidence.fid) is verifiably closed in its OWN project db; '
       + 'fid-not-found keeps (flow vestigial-db + misattribution protection). Filing '
@@ -203,6 +240,8 @@ export const INBOX_DETECTOR_REGISTRY = {
   },
   'upstream-friction': {
     label: 'friction report',
+    reader: OPERATOR_READER,
+    exit: { operator: 'make the config change, or dismiss in /inbox' },
     exempt: 'NARROWED to config-change friction (Project 2, prj:4a433dac, plan A5 / '
       + 'Decision 2, 2026-10-31): a setting, hook or doc only the operator controls — a '
       + 'decision with no mechanical truth condition. Ring 3 Phase 2g (routeFriction) '
@@ -217,6 +256,8 @@ export const INBOX_DETECTOR_REGISTRY = {
   },
   'advisor-finding': {
     label: 'advisor finding',
+    reader: OPERATOR_READER,
+    exit: { operator: 'add the proposed cabinet seat, or dismiss in /inbox' },
     exempt: 'NARROWED to cabinet-seat proposals (Project 2, prj:4a433dac, plan A4 / '
       + 'Decision 4, 2026-10-31): the ONE filer is ring2\'s cabinet-roster review '
       + '(fileRosterFinding, kind uncovered-tech, evidence.roster_kind), which proposes '
@@ -262,6 +303,8 @@ export const INBOX_DETECTOR_REGISTRY = {
   // ring2-filed
   'deferred-trigger': {
     label: 'fired trigger',
+    reader: OPERATOR_READER,
+    exit: { operator: 'pick up the released action, or dismiss in /inbox' },
     exempt: 'one-time trigger event; dedup-vs-pending blocks refiring. Candidate future '
       + 'reconciler: the referenced deferred action closed.',
   },
@@ -306,6 +349,14 @@ export const INBOX_DETECTOR_REGISTRY = {
   // routines-filed (in the census since act:ea23b3a5)
   'routine': {
     label: 'scheduled routine',
+    reader: 'operator — the desk badge and mux dispatch, /inbox, /briefing, start-block '
+      + 'oldest line',
+    exit: {
+      mechanical: 'sweepExpiredMoments (routines, on Ring 1\'s tick): a time-of-day '
+        + 'firing\'s day ended; runRoutinePass supersedes a stale pending firing when the '
+        + 'next due firing arrives',
+      operator: 'run the routine and resolve it, or dismiss in /inbox',
+    },
     exempt: 'a declared interactive routine that fired. The dispatch engine owns the '
       + 'whole lifecycle, so there is nothing for a Ring 1 reconciler to re-check: a '
       + 'pending item blocks refiring, a stale one is superseded at the next due firing, '
@@ -315,17 +366,38 @@ export const INBOX_DETECTOR_REGISTRY = {
   },
   'stale-project': {
     label: 'stale project',
+    reader: OPERATOR_READER,
+    exit: { operator: 'resume, park or close the project, or dismiss in /inbox' },
     exempt: 'staleness notification. Candidate future reconciler: project activity '
       + 'resumed ⇒ retract.',
   },
   'project-completion': {
     label: 'project nearing completion',
+    reader: OPERATOR_READER,
+    exit: { operator: 'complete the project (pib_complete_project walk), or dismiss in /inbox' },
     exempt: 'human judgment (close a project?); never mechanically resolvable.',
   },
   'pattern-promotion': {
     label: 'recurring pattern',
-    exempt: 'threshold event (≥3 sweep instances of a failure class), deduped at '
-      + 'filing; promotion up the compliance stack is a human decision.',
+    reader: OPERATOR_READER,
+    exit: { operator: 'write or promote the pattern, or dismiss in /inbox' },
+    exempt: 'threshold event, deduped at filing; promotion up the compliance stack is a '
+      + 'human decision. Two threshold producers (Project 2, plan D1): Ring 2\'s rule '
+      + 'counter files ONE promotion proposal per rule crossing its window threshold, and '
+      + 'emitPatternPromotion (watchtower-queue) files one per qa-gate failure class with '
+      + '≥3 sweep instances, deduped by (source_item_id, failure_class). Ring 2\'s '
+      + 'novel-pattern routing is the residual filer.',
+  },
+  // filed by the /qa-handoff skill (Project 2, plan B1): outside the rings,
+  // so the census's ring filing-site scan cannot see it — hence the flag.
+  'qa-handoff': {
+    label: 'QA handoff',
+    reader: 'operator — the QA station (/qa-drain, the desk badge), /inbox, /briefing, '
+      + 'start-block oldest line',
+    exit: { operator: 'record the QA verdict (validateQaVerdict), or a typed dismissal' },
+    exempt: 'filed by the /qa-handoff skill, not a ring; leaves only through the '
+      + 'structural QA verdict gate (validateQaVerdict) or a typed dismissal',
+    filed_outside_rings: true,
   },
   'verify-backfill': {
     label: 'missing verify plan',
@@ -394,6 +466,62 @@ export const INBOX_DETECTOR_REGISTRY = {
     },
   },
 };
+
+// The LIVE inbox categories — every registry entry not marked retired. The
+// one derivation of "what can still be pending and should be watched": the
+// inbox history samples exactly this set, and B6's alarms read it.
+export function liveInboxCategories(registry = INBOX_DETECTOR_REGISTRY) {
+  return Object.keys(registry).filter((k) => !registry[k].retired);
+}
+
+// ---------------------------------------------------------------------------
+// Inbox history — state/inbox-history.jsonl (Simplification Project 2, plan
+// B6 / EP1 / EP3; act:b58a947b)
+// ---------------------------------------------------------------------------
+//
+// Expiry is gone (A1), so inbox growth must be a numbered, mechanical signal.
+// Ring 1 appends ONE row per calendar day (UTC date), `{ date,
+// pending_by_category }` — pending counts for every live category. The first
+// tick of the day writes it; a later tick finds the date already present and
+// appends nothing, so a row is the day's first sample. Read by Ring 1's growth
+// alarm and Q2 revisit trigger, and by the §Measurement weekly growth numbers.
+// A missing file is an empty history; an unparseable line is skipped (the
+// alarm then sees a gap, which only ever makes it quieter).
+
+export function inboxHistoryPath({ watchtowerDir = getWatchtowerDir() } = {}) {
+  return join(watchtowerDir, 'state', 'inbox-history.jsonl');
+}
+
+export function readInboxHistory({ watchtowerDir = getWatchtowerDir() } = {}) {
+  const p = inboxHistoryPath({ watchtowerDir });
+  if (!existsSync(p)) return [];
+  const out = [];
+  for (const line of readFileSync(p, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (row && typeof row.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(row.date)
+        && row.pending_by_category && typeof row.pending_by_category === 'object') {
+        out.push(row);
+      }
+    } catch { /* skipped — a gap */ }
+  }
+  return out;
+}
+
+export function appendInboxHistory({ date, pending_by_category } = {}, { watchtowerDir = getWatchtowerDir() } = {}) {
+  if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error(`appendInboxHistory: date must be YYYY-MM-DD, got ${date}`);
+  }
+  if (readInboxHistory({ watchtowerDir }).some((r) => r.date === date)) {
+    return { appended: false, date };
+  }
+  const p = inboxHistoryPath({ watchtowerDir });
+  const dir = dirname(p);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  appendFileSync(p, JSON.stringify({ date, pending_by_category: pending_by_category || {} }) + '\n');
+  return { appended: true, date, path: p };
+}
 
 // ---------------------------------------------------------------------------
 // getWatchtowerDir — resolve watchtower root directory
@@ -1817,7 +1945,11 @@ export function resolveProjectIdentity(cwdOrPath, config, opts = {}) {
 
 const MUX_WORKTREES_SLUG_MARKER = '--mux-worktrees-';
 
-function encodeSlugComponent(s) {
+// Claude Code's transcript-directory encoding of a path: every
+// non-alphanumeric character becomes '-'. Exported so a consumer holding only
+// such a slug can match it against a registered path without re-deriving the
+// rule.
+export function encodeSlugComponent(s) {
   return String(s).replace(/[^a-zA-Z0-9]/g, '-');
 }
 

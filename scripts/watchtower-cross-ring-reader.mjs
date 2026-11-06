@@ -239,6 +239,26 @@ export function projectCursorTimeline(thread) {
       explanation: (r && r.explanation) ?? null,
       confirmed_via: (r && r.confirmed_via) ?? null,
     })) : [],
+    // proposed_recolors (appendThreadProposal, watchtower-queue.mjs) is the
+    // NOT-YET-DECIDED counterpart of recolor_log: re-readings a later session
+    // proposed that no one has confirmed or declined. Ring 3 writes them at
+    // close and the P2 backlog walk wrote 48 of them on 2026-11-03; until
+    // then the only reader was /threads (operator, 2026-11-03: "I worry
+    // about these only being accessed when running the threads skill").
+    // Exposed with a count so /briefing 3b can weigh "N re-readings waiting
+    // on <thread>" per project. The count is the raw list length — a
+    // malformed entry is still a proposal waiting, never silently dropped.
+    proposals: Array.isArray(t.proposed_recolors) ? t.proposed_recolors.map((r) => ({
+      relation_key: (r && r.relation_key) ?? null,
+      verb: (r && r.verb) ?? null,
+      prior_date: (r && r.prior_date) ?? null,
+      prior_session_id: (r && r.prior_session_id) ?? null,
+      new_session_id: (r && r.new_session_id) ?? null,
+      explanation: (r && typeof r.explanation === 'string') ? r.explanation : '',
+      proposed_at: (r && r.proposed_at) ?? null,
+      also_noticed: (r && Array.isArray(r.also_noticed_by)) ? r.also_noticed_by.length : 0,
+    })) : [],
+    proposals_waiting: Array.isArray(t.proposed_recolors) ? t.proposed_recolors.length : 0,
   };
 }
 
@@ -482,6 +502,9 @@ export function assembleProjectView({ name, slug, path = null, since } = {}) {
       return ka < kb ? -1 : ka > kb ? 1 : 0;
     });
   ring3.threads_matched = matchedThreads.length;
+  // Re-readings waiting on the operator across this project's threads — the
+  // one number /briefing 3b needs before deciding whether to spend a line.
+  ring3.thread_proposals_waiting = ring3.threads.reduce((n, t) => n + (t.proposals_waiting || 0), 0);
 
   // Inbox: pending counts + resolution history (name-keyed).
   const inbox = readInboxView(name, sinceIso);

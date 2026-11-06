@@ -34,6 +34,8 @@ import {
   writeProjectStatePreservingRing3, flushFeedbackOutbox, resolveCcSourceRepo,
   authoredClaudeDirs, claudeChurnIsDisposable,
   autoReconcileItem, docDriftStatePath, readDocDrift,
+  INBOX_DETECTOR_REGISTRY, liveInboxCategories, appendInboxHistory, readInboxHistory,
+  redirectLedgerPath, unresolvedFrictionPath,
 } from './watchtower-lib.mjs';
 // listItems for the dismissal-aware worktree dedup (act:6dcb8015) — the
 // pending-only corpus is what let a git-evidenced dismissal be re-litigated
@@ -1671,6 +1673,186 @@ function runtimeDriftAttentionLine(drift) {
   return `⚠ watchtower runtime drift: ${parts.join(' + ')} — run \`/watchtower sync\``;
 }
 
+// ---------------------------------------------------------------------------
+// Inbox alarms — the growth alarm (EP1), the Q2 revisit trigger (EP3), the
+// redirect count per producer (A9 / EP4) and the unresolved-identity friction
+// count (§Edge Cases, default 22). Simplification Project 2, plan B6
+// (act:b58a947b). Expiry is gone, so nothing leaves the inbox by age; these
+// lines make growth a numbered signal in summary.md's ## Inbox section, which
+// every start block injects. The queue is portfolio-wide, so these are
+// portfolio lines (default 25). Measurement renders only — they file nothing.
+// ---------------------------------------------------------------------------
+
+export const INBOX_ALARM_CAP = 3;
+const ALARM_WINDOW_DAYS = 28;
+const GROWTH_SAMPLE_OFFSETS = [28, 21, 14, 7, 0]; // oldest → today
+// A weekly sample may stand in from the nearest recorded day at most this far
+// from its target (half the sample spacing), so two targets can never resolve
+// to the same day and a short history stays silent.
+const GROWTH_SAMPLE_TOLERANCE_DAYS = 3;
+const REVISIT_THRESHOLD = 100;
+const REVISIT_DAYS = 14;
+const DAY_MS = 86400000;
+
+const utcDateKey = (d) => new Date(d).toISOString().slice(0, 10);
+const dayNumber = (dateKey) => Math.floor(Date.parse(`${dateKey}T00:00:00Z`) / DAY_MS);
+const categoryLabel = (registry, k) => registry[k]?.label || k;
+
+// Pure: every alarm line, uncapped, in priority order (revisit trigger, then
+// growth, then automatic-exit, then producers still filing the old way).
+// `history` — rows from readInboxHistory; `items` — queue items of ANY status
+// (at least those touched in the last 28 days); `redirects` — redirect-ledger
+// rows. Missing or short inputs only ever make it quieter.
+export function computeInboxAlarms({
+  now = new Date(), history = [], items = [], redirects = [],
+  registry = INBOX_DETECTOR_REGISTRY,
+} = {}) {
+  const live = liveInboxCategories(registry);
+  const nowMs = new Date(now).getTime();
+  const today = dayNumber(utcDateKey(nowMs));
+  const byDay = new Map();
+  for (const row of history) {
+    const n = dayNumber(row.date);
+    if (Number.isFinite(n) && n <= today && !byDay.has(n)) byDay.set(n, row.pending_by_category || {});
+  }
+  const liveTotal = (counts) => live.reduce((s, k) => s + (Number(counts[k]) || 0), 0);
+
+  // Revisit trigger (EP3): above 100 on each of the last 14 CALENDAR days,
+  // today included — a gap (Ring 1 down) resets it.
+  const revisit = [];
+  let streak = true;
+  for (let d = today; d > today - REVISIT_DAYS; d--) {
+    const counts = byDay.get(d);
+    if (!counts || liveTotal(counts) <= REVISIT_THRESHOLD) { streak = false; break; }
+  }
+  if (streak) {
+    revisit.push(`⚠ inbox: above ${REVISIT_THRESHOLD} waiting for ${REVISIT_DAYS} days (${liveTotal(byDay.get(today))} now) — reopen the start-block question (Q2, simplification-2-inbox.md)`);
+  }
+
+  // Growth (EP1, first arm): strictly rising across five weekly samples.
+  const recordedDays = [...byDay.keys()];
+  const nearest = (target) => {
+    let best = null;
+    for (const d of recordedDays) {
+      const dist = Math.abs(d - target);
+      if (dist > GROWTH_SAMPLE_TOLERANCE_DAYS) continue;
+      if (best === null || dist < Math.abs(best - target) || (dist === Math.abs(best - target) && d < best)) best = d;
+    }
+    return best;
+  };
+  const sampleDays = GROWTH_SAMPLE_OFFSETS.map((o) => nearest(today - o));
+  const samplesUsable = sampleDays.every((d) => d !== null) && new Set(sampleDays).size === sampleDays.length;
+  const growth = [];
+  if (samplesUsable) {
+    for (const k of live) {
+      const vals = sampleDays.map((d) => byDay.get(d)[k]);
+      if (!vals.every((v) => typeof v === 'number' && Number.isFinite(v))) continue;
+      if (vals.every((v, i) => i === 0 || v > vals[i - 1])) {
+        growth.push(`⚠ inbox: ${categoryLabel(registry, k)} has only grown for 4 weeks (${vals[0]} → ${vals[vals.length - 1]})`);
+      }
+    }
+  }
+
+  // Growth (EP1, second arm): a declared mechanical exit closed nothing in 28
+  // days while the category had filings. Mechanical = resolved with
+  // resolution_type 'auto-reconciled' (autoReconcileItem's stamp), or a
+  // routine superseded by the routine engine (sweepExpiredMoments / the stale
+  // supersede). supersedeItem stamps no resolved_at, so a superseded routine
+  // is dated by its filed_at — it was closed after it was filed.
+  const windowStart = nowMs - ALARM_WINDOW_DAYS * DAY_MS;
+  const inWindow = (ts) => { const t = Date.parse(ts); return Number.isFinite(t) && t >= windowStart && t <= nowMs; };
+  const exits = [];
+  for (const k of live) {
+    if (!registry[k]?.exit?.mechanical) continue;
+    const ofCat = items.filter((it) => it && it.category === k);
+    const filed = ofCat.filter((it) => inWindow(it.filed_at)).length;
+    if (filed === 0) continue;
+    const closed = ofCat.filter((it) =>
+      (it.status === 'resolved' && it.resolution_type === 'auto-reconciled' && inWindow(it.resolved_at))
+      || (k === 'routine' && it.status === 'superseded' && inWindow(it.resolved_at || it.filed_at))).length;
+    if (closed === 0) {
+      exits.push(`⚠ inbox: ${categoryLabel(registry, k)}'s automatic exit closed nothing in ${ALARM_WINDOW_DAYS} days (${filed} filed)`);
+    }
+  }
+
+  // Producers still filing the old way (A9 / EP4): every redirect and every
+  // refusal in the last 28 days, counted per producer, so the producer gets
+  // fixed. Most first.
+  const producers = new Map();
+  for (const r of redirects) {
+    if (!r || !inWindow(r.ts)) continue;
+    const who = r.filed_by || 'an unnamed producer';
+    const p = producers.get(who) || { redirected: 0, refused: 0 };
+    if (r.refused) p.refused++; else p.redirected++;
+    producers.set(who, p);
+  }
+  const strays = [...producers.entries()]
+    .sort((a, b) => (b[1].redirected + b[1].refused) - (a[1].redirected + a[1].refused) || a[0].localeCompare(b[0]))
+    .map(([who, p]) => `⚠ inbox: ${who} filed ${p.redirected + p.refused} stray item(s) the old way in ${ALARM_WINDOW_DAYS} days (${p.redirected} redirected, ${p.refused} refused) — fix the producer; see state/inbox-redirects.jsonl`);
+
+  return [...revisit, ...growth, ...exits, ...strays];
+}
+
+// At most INBOX_ALARM_CAP lines, then one overflow line — summary.md's
+// 30-line cap holds.
+export function renderInboxAlarmLines(alarms, cap = INBOX_ALARM_CAP) {
+  const list = Array.isArray(alarms) ? alarms : [];
+  if (list.length <= cap) return [...list];
+  return [...list.slice(0, cap), `…and ${list.length - cap} more inbox alarms`];
+}
+
+// Friction from a session whose project could not be resolved has no carry
+// ledger; Ring 3 counts it into unresolved-friction.jsonl and this line keeps
+// it from being silent (§Edge Cases, default 22).
+export function unresolvedFrictionLine(count, path) {
+  if (!count) return null;
+  return `${count} friction report${count === 1 ? '' : 's'} from unidentified sessions — see ${path}`;
+}
+
+function readJsonlRows(p) {
+  if (!existsSync(p)) return [];
+  const out = [];
+  for (const line of readFileSync(p, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line)); } catch { /* skip */ }
+  }
+  return out;
+}
+
+// The I/O half: append today's history sample, read the inputs, return the
+// lines for ## Inbox. Fail-open per input — a broken read loses one line,
+// never the summary.
+function buildInboxAlarmSection(pendingItems, now = new Date()) {
+  const out = [];
+  try {
+    const counts = {};
+    for (const k of liveInboxCategories()) counts[k] = 0;
+    for (const it of pendingItems) if (it && Object.hasOwn(counts, it.category)) counts[it.category]++;
+    appendInboxHistory({ date: utcDateKey(now), pending_by_category: counts });
+  } catch (e) {
+    logError(`inbox history append failed: ${e.message}`);
+  }
+  try {
+    const since = new Date(new Date(now).getTime() - ALARM_WINDOW_DAYS * DAY_MS).toISOString();
+    let redirects = [];
+    try { redirects = readJsonlRows(redirectLedgerPath()); } catch (e) { logError(`redirect ledger read failed: ${e.message}`); }
+    const alarms = computeInboxAlarms({
+      now, history: readInboxHistory(), items: listItems({ since }), redirects,
+    });
+    out.push(...renderInboxAlarmLines(alarms));
+  } catch (e) {
+    logError(`inbox alarms failed: ${e.message}`);
+  }
+  try {
+    const p = unresolvedFrictionPath();
+    const line = unresolvedFrictionLine(readJsonlRows(p).length, p);
+    if (line) out.push(line);
+  } catch (e) {
+    logError(`unresolved-friction count failed: ${e.message}`);
+  }
+  return out;
+}
+
 function assembleSummary(projectStates, config, extraAttention = []) {
   const now = new Date().toISOString();
   const lines = [];
@@ -1805,6 +1987,7 @@ function assembleSummary(projectStates, config, extraAttention = []) {
     );
     lines.push(`${pendingItems.length} pending (oldest: ${ago(Date.now() - new Date(oldest.filed_at).getTime())})`);
   }
+  for (const l of buildInboxAlarmSection(pendingItems)) lines.push(l);
   lines.push('');
 
   // --- Health ---
