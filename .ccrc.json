@@ -19,8 +19,8 @@
     "date": "2026-05-28T14:40:48.357Z",
     "sunset_at": "2026-06-01"
   },
-  "version": "0.62.1",
-  "installedAt": "2026-11-07T15:55:19.256Z",
+  "version": "0.62.2",
+  "installedAt": "2026-11-07T16:05:38.028Z",
   "upstreamPackage": "create-claude-cabinet",
   "modules": {
     "session-loop": true,
