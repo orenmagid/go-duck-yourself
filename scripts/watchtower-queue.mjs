@@ -192,8 +192,9 @@ export const GATED_CATEGORIES = new Set([QA_CATEGORY, 'pending-relation', 'signi
 // exists to catch); each later tear-out lane adds its categories in the same
 // commit that retires them. Homes:
 //   'carry' — the project's carry ledger (state/projects/<slug>/carry.json),
-//             rendered in the next start block (plan B2) and settled by the
-//             /close residue question (plan B3);
+//             rendered in the next start block (plan B2) and settled in
+//             /briefing (act:b94d21b0; a session that fixed one settles it
+//             at /close);
 //   'doc-drift-state' — the project's documentation-drift state
 //             (state/projects/<slug>/doc-drift.json), upserted by drift_key
 //             and rendered by Ring 1 into Standing Issues (plan A4);
@@ -1424,8 +1425,9 @@ function updateCarryFile(path, mutate) {
  * @param {{kind: 'friction'|'loose-end'|'advisor'|'recolor', title: string, detail?: string, source_session?: string|null, source?: object}} entry
  */
 export const CARRY_KINDS = ['friction', 'loose-end', 'advisor', 'recolor'];
-// The kinds that ride every start block until a /close settles them (fixed /
-// filed / dropped) — the others render once and are stamped `shown`.
+// The kinds that ride every start block until they are settled (fixed /
+// filed / dropped) — in /briefing, or by a session that fixed one at /close
+// (act:b94d21b0) — the others render once and are stamped `shown`.
 export const CARRY_PERSISTENT_KINDS = ['friction', 'loose-end'];
 
 export function appendCarryEntry(slug, { kind, title, detail = '', source_session = null, source = null, created_at = null } = {}) {
@@ -1435,6 +1437,20 @@ export function appendCarryEntry(slug, { kind, title, detail = '', source_sessio
   if (typeof title !== 'string' || !title.trim()) {
     throw new Error('appendCarryEntry: a non-empty title is required');
   }
+  // Append-time dedup (act:b94d21b0, plan step 13b): the same report filed
+  // twice (two closes, a re-run walk) must not ride as two entries. A match is
+  // the same kind + the same normalised title among UNRESOLVED entries; a
+  // resolved twin never blocks a fresh append (a recurrence after a fix is
+  // real news). Same shape as createAction's retry twin: the existing entry
+  // comes back marked deduplicated, and nothing is written.
+  // Only the PERSISTENT kinds dedup: advisor and recolor entries are never
+  // resolved (they are shown once and stamped), so an unresolved twin of
+  // those would hide a genuine recurrence forever.
+  const dedups = CARRY_PERSISTENT_KINDS.includes(kind);
+  const want = normCarryTitle(title);
+  const twinOf = (e) => dedups && e && e.kind === kind && !e.resolved && normCarryTitle(e.title) === want;
+  const existing = readCarryFile(carryLedgerPath(slug)).entries.find(twinOf);
+  if (existing) return { ...existing, deduplicated: true };
   const entry = {
     id: 'carry-' + randomBytes(4).toString('hex'),
     kind,
@@ -1446,8 +1462,20 @@ export function appendCarryEntry(slug, { kind, title, detail = '', source_sessio
     resolved: null,
     ...(source ? { source } : {}),
   };
-  updateCarryFile(carryLedgerPath(slug), (ledger) => { ledger.entries.push(entry); });
-  return entry;
+  const twin = updateCarryFile(carryLedgerPath(slug), (ledger) => {
+    // Re-check inside the read-modify-write: a racing append of the same
+    // report between the read above and this write still dedups.
+    const t = ledger.entries.find(twinOf);
+    if (t) return t;
+    ledger.entries.push(entry);
+    return null;
+  });
+  return twin ? { ...twin, deduplicated: true } : entry;
+}
+
+// Lowercased, whitespace collapsed, trailing punctuation stripped.
+function normCarryTitle(t) {
+  return String(t || '').toLowerCase().replace(/\s+/g, ' ').trim().replace(/[\s.,;:!?…—–-]+$/u, '');
 }
 
 /** Read a project's carry ledger. A missing or corrupt file reads as empty. */
@@ -1482,23 +1510,56 @@ export function markCarryShown(slug, ids, { session_id = null, at = null } = {})
 /**
  * Resolve a carry entry. Resolving an already-resolved entry is a no-op that
  * REPORTS it ({ ok: false, reason: 'already-resolved', entry }); an unknown id
- * reports 'not-found'. Never throws.
- * @param {{outcome: 'fixed'|'filed'|'dropped', ref?: string|null, reason?: string|null, session_id?: string|null}} resolution
+ * reports 'not-found'. Never throws. One-element call to resolveCarryEntries,
+ * so the refusal rules live in one place.
+ * @param {{outcome: 'fixed'|'filed'|'dropped', ref?: string|null, reason?: string|null, session_id?: string|null, by?: string|null}} resolution
  */
-export function resolveCarryEntry(slug, id, { outcome, ref = null, reason = null, session_id = null, at = null } = {}) {
-  if (!['fixed', 'filed', 'dropped'].includes(outcome)) {
-    return { ok: false, reason: 'bad-outcome', entry: null };
-  }
+export function resolveCarryEntry(slug, id, resolution = {}) {
+  return resolveCarryEntries(slug, [{ ...resolution, id }])[0];
+}
+
+/**
+ * Apply many settlements to one project's carry ledger in ONE read-modify-
+ * write (act:b94d21b0, plan step 0): a /briefing batch would otherwise be up
+ * to 15 separate rewrites of a file shared with Ring 3's appends and every
+ * start block's shown-stamp, guarded only by updateCarryFile's single mtime
+ * retry. Each item is one of:
+ *   { id, outcome: 'fixed'|'filed'|'dropped', ref, reason, session_id, by, at }
+ *     — resolve it; `by` names the door ('close' | 'briefing'), so the record
+ *       shows which surface settled it;
+ *   { id, defer: true } — an explicit "not now" from /briefing: bump
+ *       `deferred_count` (absent = 0) and resolve nothing. /briefing proposes
+ *       `drop: deferred twice` at 2 (operator ruling 2026-11-07).
+ * Returns one { ok, reason, entry } per item, in order. Never throws.
+ */
+export function resolveCarryEntries(slug, items) {
+  const list = Array.isArray(items) ? items : [];
+  const pre = list.map((it) => {
+    if (!it || typeof it.id !== 'string') return { ok: false, reason: 'bad-item', entry: null };
+    if (it.defer === true) return null;
+    if (!['fixed', 'filed', 'dropped'].includes(it.outcome)) return { ok: false, reason: 'bad-outcome', entry: null };
+    return null;
+  });
+  if (pre.every((r) => r !== null)) return pre;
+  const stamp = new Date().toISOString(); // one write, one timestamp
   try {
-    return updateCarryFile(carryLedgerPath(slug), (ledger) => {
-      const entry = ledger.entries.find((e) => e.id === id);
+    return updateCarryFile(carryLedgerPath(slug), (ledger) => list.map((it, i) => {
+      if (pre[i]) return pre[i];
+      const entry = ledger.entries.find((e) => e && e.id === it.id);
       if (!entry) return { ok: false, reason: 'not-found', entry: null };
       if (entry.resolved) return { ok: false, reason: 'already-resolved', entry };
-      entry.resolved = { outcome, ref, reason, session_id, at: at || new Date().toISOString() };
+      if (it.defer === true) {
+        entry.deferred_count = (Number.isInteger(entry.deferred_count) ? entry.deferred_count : 0) + 1;
+        return { ok: true, deferred: true, entry };
+      }
+      entry.resolved = {
+        outcome: it.outcome, ref: it.ref ?? null, reason: it.reason ?? null,
+        session_id: it.session_id ?? null, by: it.by ?? null, at: it.at || stamp,
+      };
       return { ok: true, entry };
-    });
+    }));
   } catch (e) {
-    return { ok: false, reason: `write-failed: ${e.message}`, entry: null };
+    return list.map((it, i) => pre[i] || { ok: false, reason: `write-failed: ${e.message}`, entry: null });
   }
 }
 
@@ -1862,6 +1923,16 @@ function appendRedirectLedger(record) {
 
 // Write a would-be inbox item into its live home. Returns { to, path, ... }.
 // Throws on a failed write so createItem can fall back to the queue.
+// The carry kind each category that redirects to 'carry' rides as. The keys
+// are exactly the categories redirectHomeFor can send to 'carry': the five
+// retired residue categories (RETIRED_CATEGORIES) and the two narrowed ones.
+export function carryKindFor(category) {
+  if (category === 'advisor-finding') return 'advisor';
+  if (category === 'upstream-friction') return 'friction';
+  if (RETIRED_CATEGORIES.get(category) === 'carry') return 'loose-end';
+  throw new Error(`writeToHome: no carry kind for category ${JSON.stringify(category)}`);
+}
+
 function writeToHome(home, { project, project_path, category, title, summary, evidence, filed_by, urgency }) {
   const sessionId = evidence && typeof evidence.session_id === 'string' ? evidence.session_id : null;
   if (home === 'carry') {
@@ -1872,9 +1943,12 @@ function writeToHome(home, { project, project_path, category, title, summary, ev
     // act:dafa9afa). friction and loose-end are the two kinds the /close
     // residue question reads and settles (fixed / file as action / drop).
     // The origin is kept on `source` so nothing is lost in the relabel.
-    const kind = category === 'advisor-finding' ? 'advisor'
-      : category === 'upstream-friction' ? 'friction'
-        : 'loose-end';
+    // Explicit, never a fall-through (act:b94d21b0, plan step 13a): an
+    // unmapped category used to land as 'loose-end' silently — that is how
+    // three pattern-promotion proposals came to ride flow's ledger as
+    // "unfinished work". An unknown category throws; createItem's catch keeps
+    // the finding in the queue and the redirect ledger records the failure.
+    const kind = carryKindFor(category);
     const entry = appendCarryEntry(project, {
       kind, title, detail: summary, source_session: sessionId,
       source: {
@@ -1883,7 +1957,7 @@ function writeToHome(home, { project, project_path, category, title, summary, ev
         ...(evidence && evidence.directive_key ? { directive_key: evidence.directive_key } : {}),
       },
     });
-    return { to: 'carry', path: carryLedgerPath(project), carry_id: entry.id };
+    return { to: 'carry', path: carryLedgerPath(project), carry_id: entry.id, ...(entry.deduplicated ? { duplicate_of: entry.id } : {}) };
   }
   if (home === 'doc-drift-state') {
     // A stray doc-drift filing (a consumer hook — flow's pulse hook files with

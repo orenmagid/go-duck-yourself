@@ -2720,7 +2720,7 @@ export function frictionRouteIsActionable(route) {
 //                     under the session record's ## Friction section.
 //   project-tracker → one ## Friction record line AND one `friction` carry
 //                     entry in that project's ledger, carried to every
-//                     following start block until a /close settles it (EP2).
+//                     following start block until /briefing settles it, or a session fixes it (EP2, act:b94d21b0).
 //                     A session whose project slug is unresolved has no ledger
 //                     key: the report goes to state/residue/unresolved-
 //                     friction.jsonl (counted, never silent — default 22).

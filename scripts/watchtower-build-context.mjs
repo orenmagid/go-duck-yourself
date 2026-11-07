@@ -53,6 +53,8 @@ const CARRY_ADVISOR_MAX = 3;
 const CARRY_RECOLOR_MAX = 3;
 const CARRY_LINE_MAX = 200;
 const CARRY_HEADER = '--- Carried from earlier sessions ---';
+const DOMAIN_COMPACT_CHARS = 600;   // act:b94d21b0 — compact forms, used only over budget
+const PROJECT_COMPACT_CHARS = 1200;
 
 // --- Argument parsing ---
 
@@ -307,8 +309,8 @@ function renderOldestLines(items, projectName, projectSlug, now = Date.now()) {
 //
 // Reads the project's carry ledger (state/projects/<slug>/carry.json, the
 // ONE per-project carrier lane B3 built) and renders what rides from earlier
-// sessions of this project: unresolved friction every session until a /close
-// settles it; advisor findings and thread re-reading proposals once. Each
+// sessions of this project: unresolved friction every session until /briefing
+// settles it (act:b94d21b0); advisor findings and thread re-reading proposals once. Each
 // line is capped at CARRY_LINE_MAX; the section stays well inside the
 // 9,500-char budget. The builder's ONLY write is the `shown` stamp on the
 // advisor and recolor entries this block surfaced — through the shared
@@ -371,8 +373,8 @@ function renderCarrySection(ledger, { slug, now = Date.now() }) {
   const entries = Array.isArray(ledger && ledger.entries) ? ledger.entries.filter((e) => e && typeof e === 'object') : [];
   const byCreated = (a, b) => (parseIso(a.created_at) ?? Infinity) - (parseIso(b.created_at) ?? Infinity);
   // The PERSISTENT kinds — friction (EP2) and loose ends (operator ruling
-  // 2026-10-31, act:dafa9afa) — ride every start block until a /close settles
-  // them. They share ONE ≤5-line budget, oldest first across both, so the
+  // 2026-10-31, act:dafa9afa) — ride every start block until /briefing settles
+  // them (or a session fixes one at /close; act:b94d21b0). They share ONE ≤5-line budget, oldest first across both, so the
   // section keeps plan B2's size bound; each keeps its own label.
   const persistent = entries
     .filter((e) => (e.kind === 'friction' || e.kind === 'loose-end') && !e.resolved).sort(byCreated);
@@ -387,9 +389,9 @@ function renderCarrySection(ledger, { slug, now = Date.now() }) {
     const age = t === null ? 'age unknown' : daysPhrase(wholeDaysSince(t, now));
     const from = t === null ? 'an unknown date' : new Date(t).toISOString().slice(0, 10);
     if (e.kind === 'loose-end') {
-      lines.push(fitLine(`- loose end: ${e.title}`, ` (${age}, from ${from}) — settle it this session: finish it, or /close will offer to file it or drop it`));
+      lines.push(fitLine(`- loose end: ${e.title}`, ` (${age}, from ${from}) — finish it this session, or settle it in /briefing`));
     } else {
-      lines.push(fitLine(`- friction: ${e.title}`, ` (${age}, from ${from}) — settle it this session: fix it, or /close will offer to file it or drop it`));
+      lines.push(fitLine(`- friction: ${e.title}`, ` (${age}, from ${from}) — fix it this session, or settle it in /briefing`));
     }
   }
   if (persistent.length > CARRY_FRICTION_MAX) lines.push(`…and ${persistent.length - CARRY_FRICTION_MAX} more unresolved`);
@@ -440,63 +442,66 @@ function readActiveThreads() {
   return threads;
 }
 
+// The threads section has a BOUNDED shape, always (act:b94d21b0, operator
+// ruling 2026-11-07). Measured on flow: it printed every active thread of
+// the project (~30 at ~200 chars), the primary in full, AND five other
+// projects' threads — 8.7k of a 9.5k budget, so whole-section dropping took
+// it and the carry block out of most flow sessions. "Active" only means
+// touched in 30 days, so settled topics sat in every work session's note.
+// Now: the primary thread in full, the next ≤5 most recently touched
+// threads of THIS project as one line each, then a count pointing at
+// /threads. Other projects' threads are not shown here at all.
+// Returns { content, compact } (compact = the same shape with the primary's
+// fields cut, used only when the whole note is over budget) or null.
+const THREAD_ONE_LINERS = 5;
+const THREAD_FIELD_COMPACT = 240;
+const THREAD_LINE_COMPACT = 120;
+
+function cutTo(text, max) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  return t.length <= max ? t : t.slice(0, max - 1) + '…';
+}
+
 function renderFocalZoom(threads, projectSlug) {
   if (threads.length === 0) return null;
 
-  // Find threads that touched this project, sorted by recency
+  // Threads that touched this project, most recently touched first.
   const projectThreads = threads
     .filter(t => t.sessions?.some(s => s.project === projectSlug))
     .sort((a, b) => new Date(b.last_updated) - new Date(a.last_updated));
+  if (projectThreads.length === 0) return null;
 
-  // Other active threads not touching this project
-  const otherThreads = threads
-    .filter(t => !t.sessions?.some(s => s.project === projectSlug))
-    .sort((a, b) => new Date(b.last_updated) - new Date(a.last_updated));
+  const primary = projectThreads[0];
+  const c = currentCursor(primary);
+  const sessCount = primary.sessions?.length || 0;
+  const footer = `  (${sessCount} session${sessCount !== 1 ? 's' : ''}, last updated ${primary.last_updated?.slice(0, 10) || '?'})`;
+  const rest = projectThreads.slice(1, 1 + THREAD_ONE_LINERS);
+  const overflow = projectThreads.length - 1 - rest.length;
+  const tail = overflow > 0 ? [`…and ${overflow} more — /threads`] : [];
 
-  if (projectThreads.length === 0 && otherThreads.length === 0) return null;
-
-  const lines = ['--- Active Threads ---'];
-
-  // Cursor level: primary thread for this project, full detail
-  if (projectThreads.length > 0) {
-    const primary = projectThreads[0];
-    const c = currentCursor(primary);
-    lines.push(`**${primary.thread}** (primary)`);
-    if (c.what) lines.push(`  What: ${c.what}`);
-    if (c.why) lines.push(`  Why: ${c.why}`);
-    if (c.where_left_off) lines.push(`  Where left off: ${c.where_left_off}`);
-    if (c.open_questions?.length > 0) {
-      lines.push(`  Open questions: ${c.open_questions.join('; ')}`);
-    }
-    if (c.next_steps?.length > 0) {
-      lines.push(`  Next: ${c.next_steps.join('; ')}`);
-    }
-    const sessCount = primary.sessions?.length || 0;
-    lines.push(`  (${sessCount} session${sessCount !== 1 ? 's' : ''}, last updated ${primary.last_updated?.slice(0, 10) || '?'})`);
+  const full = ['--- Active Threads ---', `**${primary.thread}** (primary)`];
+  if (c.what) full.push(`  What: ${c.what}`);
+  if (c.why) full.push(`  Why: ${c.why}`);
+  if (c.where_left_off) full.push(`  Where left off: ${c.where_left_off}`);
+  if (c.open_questions?.length > 0) full.push(`  Open questions: ${c.open_questions.join('; ')}`);
+  if (c.next_steps?.length > 0) full.push(`  Next: ${c.next_steps.join('; ')}`);
+  full.push(footer);
+  for (const t of rest) {
+    full.push(fitLine(`${t.thread}: ${currentCursor(t).what || ''}`, ` (${t.last_updated?.slice(0, 10) || '?'})`));
   }
+  full.push(...tail);
 
-  // Thread level: other project threads, one line each
-  for (const t of projectThreads.slice(1)) {
-    const what = currentCursor(t).what || '';
-    const age = t.last_updated?.slice(0, 10) || '?';
-    lines.push(`${t.thread}: ${what} (${age})`);
+  const compact = ['--- Active Threads ---', `**${primary.thread}** (primary)`];
+  if (c.what) compact.push(`  What: ${cutTo(c.what, THREAD_FIELD_COMPACT)}`);
+  if (c.where_left_off) compact.push(`  Where left off: ${cutTo(c.where_left_off, THREAD_FIELD_COMPACT)}`);
+  if (c.next_steps?.length > 0) compact.push(`  Next: ${cutTo(c.next_steps.join('; '), THREAD_FIELD_COMPACT)}`);
+  compact.push(footer);
+  for (const t of rest) {
+    compact.push(`${cutTo(`${t.thread}: ${currentCursor(t).what || ''}`, THREAD_LINE_COMPACT)} (${t.last_updated?.slice(0, 10) || '?'})`);
   }
+  compact.push(...tail);
 
-  // Other active threads across portfolio, one line each
-  if (otherThreads.length > 0) {
-    lines.push('');
-    lines.push('Other active threads:');
-    for (const t of otherThreads.slice(0, 5)) {
-      const what = currentCursor(t).what || '';
-      const proj = t.sessions?.[t.sessions.length - 1]?.project || '?';
-      lines.push(`  ${t.thread} [${proj}]: ${what}`);
-    }
-    if (otherThreads.length > 5) {
-      lines.push(`  ... and ${otherThreads.length - 5} more`);
-    }
-  }
-
-  return lines.join('\n');
+  return { content: full.join('\n'), compact: compact.join('\n') };
 }
 
 // --- Enforcement patterns (.claude/memory/patterns/) ---
@@ -553,7 +558,13 @@ function renderPatterns(projectPath) {
   const more = files.length > MAX_PATTERN_LINES
     ? `\n…and ${files.length - MAX_PATTERN_LINES} more`
     : '';
-  return `--- Enforcement Patterns ---\n${lines.join('\n')}${more}`;
+  // Compact form (used only over budget): names only, top 3.
+  const names = lines.map((l) => l.replace(/ — .*$/, ''));
+  const compactMore = files.length > 3 ? `\n…and ${files.length - 3} more` : '';
+  return {
+    content: `--- Enforcement Patterns ---\n${lines.join('\n')}${more}`,
+    compact: `--- Enforcement Patterns ---\n${names.slice(0, 3).join('\n')}${compactMore}`,
+  };
 }
 
 // --- Missed-routine re-delivery (act:4b4fa7d9) ---
@@ -753,9 +764,13 @@ function main() {
       const domainPath = join(WATCHTOWER_DIR, 'state', `${domain}.md`);
       const domainContent = safeReadFile(domainPath);
       if (domainContent) {
+        const body = domainContent.trim();
         domainSections.push({
           key: `domain:${domain}`,
-          content: `--- ${domain} ---\n${domainContent.trim()}`,
+          content: `--- ${domain} ---\n${body}`,
+          ...(body.length > DOMAIN_COMPACT_CHARS
+            ? { compact: `--- ${domain} ---\n${body.slice(0, DOMAIN_COMPACT_CHARS)}…(trimmed — read ${domainPath})` }
+            : {}),
           priority: PRIORITY_DOMAIN,
         });
       }
@@ -771,9 +786,13 @@ function main() {
       const projectStateAge = fileAge(projectStatePath);
       const projectStaleDays = projectStateAge / (24 * 60 * 60 * 1000);
       if (projectStaleDays < PROJECT_STALENESS_DAYS) {
+        const body = projectStateContent.trim();
         sections.push({
           key: `project:${projectSlug}`,
-          content: `--- Project: ${projectSlug} ---\n${projectStateContent.trim()}`,
+          content: `--- Project: ${projectSlug} ---\n${body}`,
+          ...(body.length > PROJECT_COMPACT_CHARS
+            ? { compact: `--- Project: ${projectSlug} ---\n${wholeLinesUpTo(body, PROJECT_COMPACT_CHARS)}\n…(trimmed — full state: ${projectStatePath})` }
+            : {}),
           priority: PRIORITY_PROJECT,
         });
       }
@@ -781,7 +800,7 @@ function main() {
   }
 
   // Step 4b: Carried from earlier sessions (plan B2). Unresolved friction
-  // rides every session until /close settles it; advisor findings and
+  // rides every session until /briefing settles it (act:b94d21b0); advisor findings and
   // thread re-reading proposals ride once. The `shown` stamp is deferred to
   // after assembly so an entry counts as shown only if its section survived
   // the budget — and it is the builder's one write, through one helper (T9).
@@ -805,7 +824,8 @@ function main() {
     if (focalZoom) {
       sections.push({
         key: 'threads',
-        content: focalZoom,
+        content: focalZoom.content,
+        compact: focalZoom.compact,
         priority: PRIORITY_KEEP,
       });
     }
@@ -834,7 +854,8 @@ function main() {
   if (patternsSection) {
     sections.push({
       key: 'patterns',
-      content: patternsSection,
+      content: patternsSection.content,
+      compact: patternsSection.compact,
       priority: PRIORITY_PATTERNS,
     });
   }
@@ -883,48 +904,76 @@ function main() {
   process.stdout.write(output);
 }
 
-function assembleSections(sections) {
-  // Sort by priority (0 = never truncate, higher = truncate first)
-  // Build full output first
-  let fullOutput = sections.map(s => s.content).join('\n\n');
+// Sections SHRINK before any section drops (act:b94d21b0, operator ruling
+// 2026-11-07: "how can we get the important shit within the limit?"). Two
+// passes:
+//   1. Walk sections from the highest priority number down (push order
+//      within a tier), skipping PRIORITY_NEVER, and swap each section that
+//      carries a `compact` form for it. Stop as soon as the output fits.
+//   2. Only if every compact form is in and it still does not fit, drop
+//      whole sections in the same order — and say so in ONE final line
+//      naming what was left out (a part that vanishes silently is the
+//      failure this replaces: the carry block went missing from almost
+//      every flow session and nothing said why).
+// The drop pass measures that notice line itself, so it never pushes the
+// note back over the cap.
 
-  if (fullOutput.length <= MAX_OUTPUT_CHARS) {
-    return fullOutput;
+function sectionHeader(section) {
+  const first = String(section.content || '').split('\n')[0].trim();
+  return first.replace(/^-+\s*/, '').replace(/\s*-+$/, '').replace(/^#\s*/, '') || section.key;
+}
+
+function assembleSections(sections, { max = MAX_OUTPUT_CHARS } = {}) {
+  const join2 = (list) => list.map((s) => s.content).join('\n\n');
+  let current = sections.map((s) => ({ ...s }));
+  if (join2(current).length <= max) return join2(current);
+
+  const order = [...current].sort((a, b) => b.priority - a.priority); // stable: push order within a tier
+
+  // Pass 1 — compact forms.
+  for (const section of order) {
+    if (section.priority === PRIORITY_NEVER) break;
+    if (typeof section.compact !== 'string') continue;
+    const s = current.find((x) => x.key === section.key);
+    s.content = s.compact;
+    if (join2(current).length <= max) return join2(current);
   }
 
-  // Need to truncate. Remove sections in reverse priority order (highest first).
-  // PRIORITY_PATTERNS (4) = enforcement patterns (truncated first)
-  // PRIORITY_DOMAIN (3)   = domain files
-  // PRIORITY_PROJECT (2)  = project file
-  // PRIORITY_KEEP (1)     = threads/queue/advisories/untracked (try to keep)
-  // PRIORITY_NEVER (0)    = summary (never truncated)
-
-  const sortedByTruncPriority = [...sections].sort((a, b) => b.priority - a.priority);
-
-  let remaining = [...sections];
-  for (const section of sortedByTruncPriority) {
-    if (section.priority === PRIORITY_NEVER) break; // Never truncate summary
-
-    const idx = remaining.findIndex(s => s.key === section.key);
+  // Pass 2 — drop whole sections, announced.
+  const dropped = [];
+  const notice = () => `(start note over budget — left out: ${dropped.join(', ')})`;
+  for (const section of order) {
+    if (section.priority === PRIORITY_NEVER) break;
+    const idx = current.findIndex((x) => x.key === section.key);
     if (idx === -1) continue;
-
-    remaining.splice(idx, 1);
-    const candidate = remaining.map(s => s.content).join('\n\n');
-    if (candidate.length <= MAX_OUTPUT_CHARS) {
-      return candidate;
-    }
+    dropped.push(sectionHeader(current[idx]));
+    current.splice(idx, 1);
+    // Measure the notice itself — it grows with every dropped section.
+    if (join2(current).length + 2 + notice().length <= max) break;
   }
+  // If still too long after removing every droppable section, return what is
+  // left (the never-truncated sections) — still announced.
+  return dropped.length ? `${join2(current)}\n\n${notice()}` : join2(current);
+}
 
-  // If still too long after removing all truncatable sections,
-  // return what we have (summary only, possibly)
-  return remaining.map(s => s.content).join('\n\n');
+function wholeLinesUpTo(text, max) {
+  const lines = String(text).split('\n');
+  const out = [];
+  let len = 0;
+  for (const line of lines) {
+    if (len + line.length + 1 > max) break;
+    out.push(line);
+    len += line.length + 1;
+  }
+  // A first line longer than the cap would leave nothing: cut it instead.
+  return out.length ? out.join('\n') : cutTo(lines[0], max);
 }
 
 // Exports for hermetic tests (act:a136b362). Importing this module must NOT
 // run main() — gate the entry on an argv/url match (matches the ring scripts).
 export {
   reverifyGitAttention, verifyGitFact, renderMissedRoutineSection, renderSessionAckSection, renderRing3FailedSection, isMainCheckout,
-  renderOldestLines, renderCarrySection, categoryLabel,
+  renderOldestLines, renderCarrySection, categoryLabel, assembleSections, renderFocalZoom,
 };
 
 const isMain = (() => {

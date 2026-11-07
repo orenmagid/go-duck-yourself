@@ -185,12 +185,14 @@ export function findFiledCommitment(candidateText, actions) {
 //                 verify-backfill scan used);
 //   coverage    — UI paths changed in the session's commits with no .feature
 //                 edit (detectUncoveredUi + resolveUiPaths), same gate;
-//   friction    — every unresolved `friction` entry in the project's carry
-//                 ledger, with its carry_id (EP2: carried until settled);
-//   loose-end   — every unresolved `loose-end` entry, the same way (a
-//                 residue finding createItem redirected — act:dafa9afa).
 // Each carries a proposed disposition the skill shows and the operator
-// accepts with one word or edits by number.
+// accepts with one word or edits by number. Carried friction and loose ends
+// are NOT findings (act:b94d21b0): they print in a separate `carried` array
+// (carriedEntries — the same filter /briefing's --carry uses). /close numbers
+// one only when the session fixed it (it appends that finding itself, with
+// proposed "fixed: <sha>") and shows the rest as one pointer line; for an
+// unregistered project (`carried_offer: true`) /close still offers them,
+// because /briefing cannot address that ledger.
 //
 // `--record --session-id <id>` writes the receipt (state/residue/<id>.json,
 // keyed by session id — T4) from stdin or `--json '<string>'`, never a file
@@ -201,9 +203,16 @@ export function findFiledCommitment(candidateText, actions) {
 // leaves the residue fields untouched — on a fresh receipt it writes no
 // findings array at all, so Ring 3 does not read it as "/close asked".
 // `--record-answer --session-id <id>` takes the dispositions the same way,
-// stamps answered: true, and resolves every carry entry a friction or
-// loose-end line settles (resolveCarryEntry; a second answer on a resolved
-// entry is a reported no-op).
+// stamps answered: true, and settles every carry entry a finding line names
+// through settleCarry (a second answer on a resolved entry is a reported
+// no-op). With carried lines and no resolvable project it exits 1 BEFORE any
+// write, naming --cwd.
+//
+// /briefing's doors (act:b94d21b0): `--carry --project <name|slug>` lists the
+// project's unresolved friction + loose ends; `--settle --project … --json
+// '{"settlements":{"<carry_id>":{"disposition","proposed"}}}'` settles them.
+// --record-answer and --settle share ONE path, settleCarry → one
+// lib.resolveCarryEntries write per call.
 //
 // Why this script and not a new one (decision default 12): it is already
 // /close's, already on the close-scope guard's node allowlist, and already the
@@ -370,24 +379,111 @@ export async function residueFindings({ sessionId, cwd, transcriptPath = null } 
   }
 
   // (d) carried friction and loose ends — unresolved entries of the two
-  // persistent carry kinds, with their carry ids. A loose end (a residue
-  // finding createItem redirected; operator ruling 2026-10-31, act:dafa9afa)
-  // is offered exactly as carried friction is, under its own kind.
-  for (const e of lib.readCarry(project.slug).entries) {
-    if (!(e.kind === 'friction' || e.kind === 'loose-end') || e.resolved) continue;
-    const origin = e.source && e.source.category && e.source.category !== 'upstream-friction' ? ` (${e.source.category})` : '';
-    findings.push({
-      kind: e.kind, carry_id: e.id,
-      text: `${e.title}${origin}${e.detail ? ` — ${e.detail}` : ''} (carried since ${String(e.created_at || '').slice(0, 10)}, from session ${e.source_session || 'unknown'})`,
-      proposed: 'settle: fixed: <commit> | file as action | drop: <reason>',
-    });
-  }
-
+  // persistent kinds. They are NOT findings any more (act:b94d21b0, operator
+  // ruling 2026-11-07): /briefing settles them, and /close numbers one only
+  // when THIS session fixed it, collapsing the rest into one pointer line.
+  // An UNREGISTERED project's ledger cannot be addressed by /briefing (it
+  // reaches config.projects keys only), so there /close keeps offering them —
+  // signalled by carried_offer: true.
+  const carried = carriedEntries(project.slug, { lib });
   findings.forEach((f, i) => { f.n = i + 1; });
   return {
     session_id: sessionId, project: project.name, project_slug: project.slug, project_path: project.path,
-    session_start: parsed.sessionStart, transcript: tp, findings,
+    session_start: parsed.sessionStart, transcript: tp, findings, carried,
+    ...(project.registered ? {} : { carried_offer: true }),
   };
+}
+
+/**
+ * The unresolved friction + loose-end entries of one project's carry ledger,
+ * oldest first — the ONE filter behind both `--residue`'s `carried` array and
+ * /briefing's `--carry` list. `origin` is the category the entry was filed
+ * under (`source.category`), or null.
+ */
+export function carriedEntries(slug, { lib, now = Date.now() } = {}) {
+  const ts = (e) => { const t = Date.parse(e.created_at || ''); return Number.isFinite(t) ? t : Infinity; };
+  return lib.readCarry(slug).entries
+    .filter((e) => e && (e.kind === 'friction' || e.kind === 'loose-end') && !e.resolved)
+    .sort((a, b) => ts(a) - ts(b))
+    .map((e) => ({
+      carry_id: e.id, kind: e.kind, title: e.title, detail: e.detail || '',
+      created_at: e.created_at || null,
+      age_days: Number.isFinite(ts(e)) ? Math.floor((now - ts(e)) / 86400000) : null,
+      source_session: e.source_session || null,
+      origin: (e.source && e.source.category) || null,
+      deferred_count: Number.isInteger(e.deferred_count) ? e.deferred_count : 0,
+    }));
+}
+
+const ACCEPTED_DISPOSITIONS = 'ok | fixed: <ref> | file as action act:xxxxxxxx | drop: <reason> | not now';
+
+/**
+ * The ONE settle path for carried entries (act:b94d21b0). Both doors call it:
+ * `--record-answer` (/close, by: 'close') and `--settle` (/briefing, by:
+ * 'briefing'). `items` is [{ carry_id, disposition, proposed }]; "ok" applies
+ * the item's own `proposed`. `resolveMany` is REQUIRED — callers pass the
+ * loaded lib.resolveCarryEntries (the lib is imported dynamically, so no
+ * synchronous default can reference it). Every write happens in ONE
+ * resolveMany call. An explicit "not now" is recorded as a deferral only when
+ * by === 'briefing' (the decay count /briefing reads); an omitted answer is
+ * never a deferral — no reply is not consent.
+ * @returns {{resolved: object[], deferred: object[], noop: object[], skipped: object[]}}
+ */
+export function settleCarry(slug, items, { session_id = null, by = null, resolveMany } = {}) {
+  if (!slug) throw new Error('settleCarry: a project slug is required');
+  if (typeof resolveMany !== 'function') throw new Error('settleCarry: resolveMany (lib.resolveCarryEntries) is required');
+  const out = { resolved: [], deferred: [], noop: [], skipped: [] };
+  const batch = [];
+  for (const it of Array.isArray(items) ? items : []) {
+    if (!it || !it.carry_id) continue;
+    const d = it.disposition;
+    if (d === undefined || d === null || String(d).trim() === '') {
+      out.skipped.push({ carry_id: it.carry_id, reason: 'no disposition — stays carried' });
+      continue;
+    }
+    if (/^not now$/i.test(String(d).trim())) {
+      if (by === 'briefing') batch.push({ carry_id: it.carry_id, item: { id: it.carry_id, defer: true } });
+      else out.skipped.push({ carry_id: it.carry_id, reason: 'not now — stays carried' });
+      continue;
+    }
+    const outcome = carryOutcomeFor(d, it.proposed);
+    if (!outcome) {
+      out.skipped.push({ carry_id: it.carry_id, reason: `unrecognized disposition ${JSON.stringify(d)}${/^ok$/i.test(String(d).trim()) ? ' (no proposal to accept)' : ''} — stays carried; accepted: ${ACCEPTED_DISPOSITIONS}` });
+      continue;
+    }
+    if (outcome.outcome === 'filed' && outcome.ref) outcome.ref = String(outcome.ref).toLowerCase();
+    if (outcome.outcome === 'filed' && !/^act:[0-9a-f]{8}$/.test(String(outcome.ref || ''))) {
+      out.skipped.push({ carry_id: it.carry_id, reason: 'file as action needs the filed fid (file as action act:xxxxxxxx) — create the action first; stays carried' });
+      continue;
+    }
+    batch.push({ carry_id: it.carry_id, outcome, item: { id: it.carry_id, ...outcome, session_id, by } });
+  }
+  if (batch.length === 0) return out;
+  const results = resolveMany(slug, batch.map((b) => b.item));
+  batch.forEach((b, i) => {
+    const r = (results && results[i]) || { ok: false, reason: 'no result' };
+    if (r.ok && r.deferred) out.deferred.push({ carry_id: b.carry_id, deferred_count: r.entry && r.entry.deferred_count });
+    else if (r.ok) out.resolved.push({ carry_id: b.carry_id, outcome: b.outcome.outcome, ref: b.outcome.ref, reason: b.outcome.reason });
+    else out.noop.push({ carry_id: b.carry_id, reason: r.reason });
+  });
+  return out;
+}
+
+/**
+ * Resolve a --project argument for /briefing's modes: an exact config.projects
+ * key wins, else the unique key whose slug equals the argument. Never cwd —
+ * /briefing runs from any desk. Returns { name, slug, path } or null.
+ */
+export function resolveNamedProject(arg, config, { lib }) {
+  const keys = Object.keys((config && config.projects) || {});
+  if (!arg) return null;
+  let key = keys.includes(arg) ? arg : null;
+  if (!key) {
+    const hits = keys.filter((k) => lib.slugify(k) === arg);
+    if (hits.length === 1) key = hits[0];
+  }
+  if (!key) return null;
+  return { name: key, slug: lib.slugify(key), path: config.projects[key].path || null };
 }
 
 // A disposition string → the carry resolution it means. 'ok' applies the
@@ -398,7 +494,7 @@ export function carryOutcomeFor(disposition, proposed) {
   let m;
   if ((m = /^fixed\s*[:\-—]?\s*(.*)$/i.exec(text))) return { outcome: 'fixed', ref: m[1].trim() || null, reason: null };
   if ((m = /^file(?:d| as action)?\s*[:\-—]?\s*(.*)$/i.exec(text))) {
-    const fid = (m[1].match(/act:[0-9a-f]{8}/) || [])[0] || null;
+    const fid = ((m[1].match(/act:[0-9a-f]{8}/i) || [])[0] || '').toLowerCase() || null;
     return { outcome: 'filed', ref: fid || (m[1].trim() || null), reason: null };
   }
   if ((m = /^drop(?:ped)?\s*[:\-—]?\s*(.*)$/i.exec(text))) return { outcome: 'dropped', ref: null, reason: m[1].trim() || null };
@@ -427,7 +523,9 @@ const USAGE = [
   'usage: watchtower-commitments.mjs --scan <file>',
   '       watchtower-commitments.mjs --residue --session-id <id> --cwd <dir> [--transcript <path>]',
   '       watchtower-commitments.mjs --record --session-id <id> [--json <receipt-json>]   (else stdin)',
-  '       watchtower-commitments.mjs --record-answer --session-id <id> [--json <answer-json>] (else stdin)',
+  '       watchtower-commitments.mjs --record-answer --session-id <id> [--cwd <dir>] [--json <answer-json>] (else stdin)',
+  '       watchtower-commitments.mjs --carry --project <config name|slug>',
+  '       watchtower-commitments.mjs --settle --project <config name|slug> [--session-id <id>] [--json \'{"settlements":{"<carry_id>":{"disposition":"ok","proposed":"drop: stale"}}}\'] (else stdin)',
 ].join('\n');
 
 // CLI entry. `--scan <file>` prints detected commitments as JSON (so the
@@ -435,7 +533,7 @@ const USAGE = [
 // residue modes are /close Step 6c's.
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   const argv = process.argv;
-  const mode = ['--scan', '--residue', '--record', '--record-answer'].find((f) => argv.includes(f));
+  const mode = ['--scan', '--residue', '--record-answer', '--record', '--carry', '--settle'].find((f) => argv.includes(f));
   if (!mode) {
     console.error(USAGE);
     process.exit(2);
@@ -452,6 +550,52 @@ if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
       process.exit(1);
     }
     console.log(JSON.stringify(detectCommitments(text), null, 2));
+  } else if (mode === '--carry' || mode === '--settle') {
+    // /briefing's two doors (act:b94d21b0). Portfolio-wide: the project is
+    // named, never taken from cwd.
+    const lib = await import('./watchtower-lib.mjs');
+    let config;
+    try { config = lib.loadConfig(); } catch { config = { projects: {}, defaults: {} }; }
+    const arg = argAfter(argv, '--project');
+    const project = resolveNamedProject(arg, config, { lib });
+    if (!project) {
+      console.error(`unknown project ${JSON.stringify(arg)}; known: ${Object.keys(config.projects || {}).join(', ') || '(none)'}`);
+      process.exit(1);
+    }
+    if (mode === '--carry') {
+      console.log(JSON.stringify({ project: project.name, slug: project.slug, carried: carriedEntries(project.slug, { lib }) }, null, 2));
+    } else {
+      let body;
+      try { body = await readJsonArg(argv); } catch (e) { console.error(`--settle: bad JSON: ${e.message}`); process.exit(1); }
+      const map = body && typeof body === 'object' && body.settlements && typeof body.settlements === 'object' ? body.settlements : null;
+      if (!map) {
+        console.error('--settle: a JSON { "settlements": { "<carry_id>": { "disposition": "…", "proposed": "…" } } } is required (via --json or stdin)');
+        process.exit(1);
+      }
+      // A bare string is { disposition, proposed: null } — so a bare "ok" has
+      // nothing to accept and is reported as skipped, never silently settled.
+      // Only the persistent kinds are /briefing's to settle: an advisor or
+      // recolor id (or an unknown one) is reported, never resolved here.
+      const persistent = new Set(carriedEntries(project.slug, { lib }).map((c) => c.carry_id));
+      const known = new Map(lib.readCarry(project.slug).entries.map((e) => [e.id, e]));
+      const refused = [];
+      const items = [];
+      for (const [carry_id, v] of Object.entries(map)) {
+        const e = known.get(carry_id);
+        if (e && !e.resolved && !persistent.has(carry_id)) {
+          refused.push({ carry_id, reason: `kind ${e.kind} is not settled in /briefing — stays as it is` });
+          continue;
+        }
+        items.push(v && typeof v === 'object'
+          ? { carry_id, disposition: v.disposition, proposed: v.proposed ?? null }
+          : { carry_id, disposition: v, proposed: null });
+      }
+      const out = settleCarry(project.slug, items, {
+        session_id: argAfter(argv, '--session-id'), by: 'briefing', resolveMany: lib.resolveCarryEntries,
+      });
+      out.skipped.push(...refused);
+      console.log(JSON.stringify({ project: project.name, slug: project.slug, ...out }, null, 2));
+    }
   } else {
     const sessionId = argAfter(argv, '--session-id');
     if (!sessionId) { console.error(USAGE); process.exit(2); }
@@ -485,14 +629,19 @@ if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
       const stored = {
         ...(prior || {}),
         session_id: sessionId,
-        project_path: receipt.project_path || (prior && prior.project_path) || null,
+        // Fall back to --cwd, then the process cwd (act:b94d21b0): a receipt
+        // with no project_path left --record-answer unable to find the carry
+        // ledger, and every carried line was skipped while exit was 0.
+        project_path: receipt.project_path || (prior && prior.project_path) || argAfter(argv, '--cwd') || process.cwd(),
         // The carry ledger is keyed by the RESOLVED project's slug (a
         // registered project's name; a worktree resolves to its main repo) —
         // the same slug --residue and Ring 3 use, so --record-answer finds
         // the entries --residue listed.
         project_slug: receipt.project_slug
           || (receipt.project_path ? resolveResidueProject(receipt.project_path, config, { lib, path }).slug : null)
-          || (prior && prior.project_slug) || null,
+          || (prior && prior.project_slug)
+          || resolveResidueProject((prior && prior.project_path) || argAfter(argv, '--cwd') || process.cwd(), config, { lib, path }).slug
+          || null,
         advisor_findings: [...priorAdvisor, ...incomingAdvisor],
       };
       if (hasFindings) {
@@ -529,17 +678,21 @@ if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
       const slugSource = receipt.project_path || argAfter(argv, '--cwd') || null;
       const slug = receipt.project_slug
         || (slugSource ? resolveResidueProject(slugSource, config, { lib, path }).slug : null);
-      const result = { session_id: sessionId, answered: true, resolved: [], noop: [], skipped: [] };
-      for (const f of receipt.findings || []) {
-        if (!f || !f.carry_id) continue;
-        const d = dispositions[String(f.n)] ?? dispositions[f.n];
-        if (d === undefined || d === null) { result.skipped.push({ carry_id: f.carry_id, reason: 'no disposition — stays carried' }); continue; }
-        const outcome = carryOutcomeFor(d, f.proposed);
-        if (!outcome || !slug) { result.skipped.push({ carry_id: f.carry_id, reason: outcome ? 'no project slug' : `unrecognized disposition ${JSON.stringify(d)} — stays carried` }); continue; }
-        const r = lib.resolveCarryEntry(slug, f.carry_id, { ...outcome, session_id: sessionId });
-        if (r.ok) result.resolved.push({ carry_id: f.carry_id, outcome: outcome.outcome });
-        else result.noop.push({ carry_id: f.carry_id, reason: r.reason });
+      const carriedFindings = (receipt.findings || []).filter((f) => f && f.carry_id);
+      if (carriedFindings.length > 0 && !slug) {
+        // Refuse BEFORE any write (act:b94d21b0): the receipt stays unanswered,
+        // so a retry with --cwd works. This used to skip every carried line
+        // with "no project slug" and exit 0 — a silent loss.
+        console.error(`--record-answer: cannot resolve the project for session ${sessionId}'s carried lines — re-run with --cwd <project dir>`);
+        process.exit(1);
       }
+      const settled = carriedFindings.length > 0
+        ? settleCarry(slug, carriedFindings.map((f) => ({
+          carry_id: f.carry_id, proposed: f.proposed,
+          disposition: dispositions[String(f.n)] ?? dispositions[f.n],
+        })), { session_id: sessionId, by: 'close', resolveMany: lib.resolveCarryEntries })
+        : { resolved: [], deferred: [], noop: [], skipped: [] };
+      const result = { session_id: sessionId, answered: true, ...settled };
       receipt.answered = true;
       receipt.answered_at = new Date().toISOString();
       receipt.dispositions = dispositions;

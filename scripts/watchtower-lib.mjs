@@ -24,7 +24,7 @@ export { createItem, listPending, getItem, resolveItem } from './watchtower-queu
 export {
   slugify, resolveCcSourceRepo,
   RETIRED_CATEGORIES, NARROWED_CATEGORIES, redirectHomeFor,
-  carryLedgerPath, appendCarryEntry, readCarry, markCarryShown, resolveCarryEntry,
+  carryLedgerPath, appendCarryEntry, readCarry, markCarryShown, resolveCarryEntry, resolveCarryEntries, carryKindFor,
   CARRY_KINDS, CARRY_PERSISTENT_KINDS,
   feedbackOutboxPath, appendFeedbackOutboxEntry, frictionOutboxEntry, redirectLedgerPath,
   findFeedbackDuplicateCandidates,
@@ -250,7 +250,7 @@ export const INBOX_DETECTOR_REGISTRY = {
       + '(deduplicated against the outbox, feedback/ and feedback/resolved/; Ring 1 '
       + 'delivers it, triage-at-arrival in the CC repo is the human duty); '
       + 'project-tracker → the session record\'s ## Friction section + one friction carry '
-      + 'entry, shown every start block in that project until a /close settles it (EP2). '
+      + 'entry, shown every start block in that project until /briefing settles it (or a session fixes it at /close; EP2, act:b94d21b0). '
       + 'A stray non-config-change filing is redirected by createItem '
       + '(NARROWED_CATEGORIES, EP4).',
   },
