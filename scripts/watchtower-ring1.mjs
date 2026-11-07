@@ -197,7 +197,7 @@ function isMergedInto(exec, branch, compareRef) {
 // replaced (act:a152cf6c): a squash-merge leaves `branch` a NON-ancestor of
 // main with different commit hashes but an IDENTICAL tree, so `isMergedInto`
 // (ancestry) and `aheadCount` both report phantom unmerged work — permanently,
-// since main never gains `branch` as an ancestor. ~40 of 48 maginnis worktree
+// since main never gains `branch` as an ancestor. ~40 of 48 northwind worktree
 // false positives were squash-merged branches that no ahead-check could clear.
 //
 // A two-dot `compareRef..branch` diff is NOT a valid content test: it is a
@@ -1352,7 +1352,7 @@ function scanWorktrees(projectName, projectPath) {
   //   2. the window-name match this code has always used. mux names a window
   //      from the worktree basename with the project prefix stripped, and
   //      `tmux list-windows -a` is GLOBAL — so `reflow-internal-notes` and
-  //      `maginnis-internal-notes` both yield `internal-notes`, and a window
+  //      `northwind-internal-notes` both yield `internal-notes`, and a window
   //      open in ANY desk suppresses the item in EVERY project.
   const paneRaw = safeExec('tmux list-panes -a -F "#{pane_current_path}" 2>/dev/null');
   const panePaths = paneRaw ? paneRaw.split('\n').map(p => p.trim()).filter(Boolean) : [];

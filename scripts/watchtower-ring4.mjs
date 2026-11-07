@@ -21,7 +21,7 @@
 //
 // Scope (ledger §C doc-staleness + §D dropped embedded-pulse spot-checks):
 //   1. Missing-path reconciliation — backtick-fenced repo-relative paths in a
-//      document that no longer exist on disk (the maginnis "Layer 4 Not built"
+//      document that no longer exist on disk (the northwind "Layer 4 Not built"
 //      and the memory-to-codebase "references a renamed/removed file" cases).
 //   2. Count-claim reconciliation — config-declared count rules ("N cabinet
 //      members", "N specs") checked against a mechanical file count. The

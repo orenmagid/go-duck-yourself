@@ -2550,7 +2550,7 @@ export function detectStaleBriefings(briefingFiles, referenceMtimeMs, staleDays 
  *  used to be both: the title was built from `dead.length` AFTER slicing to
  *  ROSTER_DORMANT_LIST_CAP, so every project ever measured reported exactly
  *  "12 dead" — go-duck-yourself, claude-cabinet, article-rewriter, reflow,
- *  maginnis, flow, theater-cheater, all identical, forever. A saturated
+ *  northwind, flow, theater-cheater, all identical, forever. A saturated
  *  constant wearing the costume of a measurement is worse than no number, and
  *  moving one into seven per-project state files would have given it the
  *  authority of a fact. */

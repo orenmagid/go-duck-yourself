@@ -19,7 +19,7 @@
 // Resolution, per phantom key: (a) any live project_path resolves via the
 // canonical resolver (git walks a worktree back to its main repo); (b) an
 // alias map for deleted worktrees, where no tool can derive the project
-// ("maginnis-*" shares no prefix with "claudeconsult-maginnis" — the
+// ("northwind-*" shares no prefix with "claudeconsult-northwind" — the
 // operator has to say it); (c) neither → the items get project_unresolved
 // and land in the residue report. The dry-run recomputes everything from
 // the files — it never asserts prior counts.
@@ -31,7 +31,7 @@
 // Usage:
 //   watchtower-migrate-keys.mjs                       dry-run report
 //   watchtower-migrate-keys.mjs --apply               backup, then rewrite
-//   watchtower-migrate-keys.mjs --alias maginnis-=claudeconsult-maginnis
+//   watchtower-migrate-keys.mjs --alias northwind-=claudeconsult-northwind
 //                                                     (repeatable; prefix=key)
 
 import {
@@ -56,7 +56,7 @@ const THREADS_DIR = join(WATCHTOWER_DIR, 'state', 'threads');
 // ---------------------------------------------------------------------------
 const DEFAULT_ALIASES = {
   'cabinet-': 'claude-cabinet',
-  'maginnis-': 'claudeconsult-maginnis',
+  'northwind-': 'claudeconsult-northwind',
   'flow-': 'flow',
 };
 

@@ -1043,10 +1043,10 @@ async function threadCapture(compressed, projectSlug, sessionId, summary, transc
   const instruction = `You identify which LINES OF WORK a session contributed to, so future sessions can pick up where this one left off.
 
 A thread is a durable work stream that spans multiple sessions — not a task, not a routine operation. Threads exist at DIFFERENT ZOOM LEVELS, and a session normally touches several at once:
-- Initiative level (REQUIRED when real work happened): the specific line of work — "maginnis-email-system", "watchtower-threading", "mux-dx". This is the level that matters most and the one most often missed. Always name it.
-- Project-area level (optional): the broader area the initiative sits in — "maginnis", "watchtower".
+- Initiative level (REQUIRED when real work happened): the specific line of work — "northwind-email-system", "watchtower-threading", "mux-dx". This is the level that matters most and the one most often missed. Always name it.
+- Project-area level (optional): the broader area the initiative sits in — "northwind", "watchtower".
 - Cross-cutting level (optional): a CONCRETE line of work that spans projects — "audit-methodology", "worktree-infrastructure", "engagement-system". Still a real initiative, just one no single project owns.
-These are NOT competing categories; they are zoom levels on the same work. A session building a Maginnis email feature touches "maginnis-email-system" AND "maginnis" — list every one that genuinely applies, at whatever levels apply.
+These are NOT competing categories; they are zoom levels on the same work. A session building a Northwind email feature touches "northwind-email-system" AND "northwind" — list every one that genuinely applies, at whatever levels apply.
 
 Every thread, at every zoom level, is a CONCRETE LINE OF WORK. Bad thread names are task-specific ("fix-sdk-loading-bug"), routine ("running-orient"), or abstract DIMENSIONS ("code-quality", "security", "performance") — those are evaluation lenses cabinet members apply, not lines of work. If you reach for an abstract quality word, find the concrete initiative underneath it instead ("audit-methodology", not "code-quality"). If a session just ran orient/debrief/status checks without doing real work, return an empty array.
 
@@ -1569,13 +1569,13 @@ function extractMemoryFileTitle(content, maxLines = 10) {
 //
 //   MEASUREMENT (2026-07-30, against the live queue). Feeding every on-disk
 //   memory title + description into the ordinary 3-token overlap pass
-//   suppressed 72% of maginnis's 134 untriaged drafts, up from 17%. Reading the
+//   suppressed 72% of northwind's 134 untriaged drafts, up from 17%. Reading the
 //   matches settled it: ~2 of 14 sampled were real duplicates; the rest were
 //   topically adjacent and distinct ("Email recolor migration: freeze target
 //   hex values" blocked by "{{firm_name}} in stored email template bodies bakes
 //   at build time"). Raising the token threshold did not help — it destroyed
 //   true positives faster than false ones (30%→11% of known re-files caught
-//   while maginnis only fell 72%→30%). Normalizing to an overlap RATIO did not
+//   while northwind only fell 72%→30%). Normalizing to an overlap RATIO did not
 //   separate them either: over 76 known re-files and 141 presumed-novel drafts
 //   the two distributions overlap almost entirely, and the NEGATIVES score
 //   higher on median (0.38 vs 0.25) — because a consolidated theme memory is
@@ -2603,7 +2603,7 @@ Output as markdown with ## headers for each pattern found. Include **Evidence:**
 // parseAuditPatterns reads the stamp back and scopes the rule classifier to
 // that project's rules + global, attributing the instance to that project —
 // before the stamp the file carried a date and nothing else, so a cabinet
-// pattern was classified against maginnis's rules too. The date still opens
+// pattern was classified against northwind's rules too. The date still opens
 // the header, so the stale-section sweep reads it unchanged. A part with no
 // value is omitted; `·` and line breaks are stripped from values so a name
 // can never forge another field or end the header.

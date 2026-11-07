@@ -235,7 +235,7 @@ if (asJson) {
       console.log(`\nStale (${stale.length} — installed copy differs from its CURRENT template; the manifest agrees with the copy, so cc-drift-check reads clean):`);
       for (const f of stale) console.log(`  ${f}`);
     }
-    console.log('\nFix: reinstall on the MAIN checkout — npx create-claude-cabinet --yes  (source repo: node bin/create-claude-cabinet.js --yes).');
+    console.log(`\nFix: reinstall on the MAIN checkout — npx -y "github:orenmagid/claude-cabinet#v${packageVersion}" --yes  (source repo: node bin/create-claude-cabinet.js --yes).`);
     console.log('An install run inside a linked worktree adopts into that lane\'s gitignored .ccrc.json and never reaches main (act:565b3c0c).');
   }
   if (templateMissing.length) {

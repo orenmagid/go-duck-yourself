@@ -78,7 +78,7 @@ export const CUE_HISTORY_DAYS = 7;
 // C4a (act:83592c63, operator ruling 2026-10-30). Machine prompts arrive on
 // UserPromptSubmit too — subagent hand-backs, system reminders, task
 // notifications, cross-session messages, interrupt notices — and in shadow
-// week 1 they were 82% of flow's and 87% of maginnis's would-fires. The cue
+// week 1 they were 82% of flow's and 87% of northwind's would-fires. The cue
 // classifies the TRIMMED prompt before any search: a match ⇒ `skipped` with
 // `reason: 'machine-prompt'`, no index open, no search. ANCHORED at the start
 // on purpose — a human prompt that quotes a hand-back mid-text is a prompt.

@@ -84,7 +84,7 @@ function today() {
 //  13 — container nesting: projects.parent_fid, so an AREA contains PROJECTs
 //       (base v11 twin — act:e567d724; plan §17). Numbered 13 here because
 //       the patch runs two ahead — RENUMBERED, never copy-pasted. This is the
-//       tier that matters most for this migration: the live Maginnis tracker
+//       tier that matters most for this migration: the live Northwind tracker
 //       sits at user_version 12 on THIS lineage, so v13 is the number that
 //       actually reaches it.
 //  14 — what an item NEEDS: actions.needs, a CLOSED vocabulary (base v12
@@ -132,7 +132,7 @@ export const SCHEMA_VERSION = 15;
 // meeting code from the other reads the bare integer, skips migrations whose
 // numbers fall at or below it, and stamps itself fully migrated anyway. That
 // fired on two live consumers during the v0.56.0 walk (reflow and the
-// maginnis tracker: user_version 10, no projects.kind, dead trackers, the
+// northwind tracker: user_version 10, no projects.kind, dead trackers, the
 // installer reporting success). The defenses here are:
 //
 //   1. SHAPE VERIFICATION BEFORE TRUST. Every migration entry that produces

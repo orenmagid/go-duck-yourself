@@ -6,7 +6,7 @@
 // Why it exists. The consumer scan found real per-project customs that lived
 // as orient/debrief phases and now need a home at the ring seams: Flow's
 // Railway DB pull and machine-drift check, article-rewriter's reMarkable sync
-// and Sentry check, maginnis's timelog collection. Their non-interactive
+// and Sentry check, northwind's timelog collection. Their non-interactive
 // LOGIC was already a script (or trivially becomes one); what differs is the
 // invocation convention — those scripts expect to run in the project root
 // with an ambient environment, not "JSON on stdin from a ring." The shim is

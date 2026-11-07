@@ -1899,19 +1899,19 @@ export function resolveProjectIdentity(cwdOrPath, config, opts = {}) {
 // leaves NO live path to resolve, and Ring 3's reprocess path fell back to
 // the runner's cwd project: 302 of 510 recovered extractions were confidently
 // misattributed (dec-bdadfd3c carried project claude-cabinet while its own
-// transcript_ref was a maginnis worktree slug).
+// transcript_ref was a northwind worktree slug).
 //
 // This sibling decodes the transcript DIRECTORY SLUG instead (the basename of
 // ~/.claude/projects/<slug>, which encodes the session cwd with '/' and '.'
 // both collapsed to '-'):
 //
-//   /Users/o/.mux/worktrees/maginnis-accounts
-//     → -Users-o--mux-worktrees-maginnis-accounts
+//   /Users/o/.mux/worktrees/northwind-accounts
+//     → -Users-o--mux-worktrees-northwind-accounts
 //
 // Everything after the '--mux-worktrees-' marker is the worktree basename,
 // which mux names `<mux-project-name>-<task>` — and the mux project name is
-// NOT the registered project key (mux "maginnis" → registered
-// "claudeconsult-maginnis"), so the decode goes through mux's own
+// NOT the registered project key (mux "northwind" → registered
+// "claudeconsult-northwind"), so the decode goes through mux's own
 // name→path registry (~/.config/mux/projects.json, the one place the
 // worktree→project convention lives) and then hands the MAIN-CHECKOUT path
 // to the canonical resolver above. Matching is LONGEST-match on a '-'
