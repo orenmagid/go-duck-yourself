@@ -19,8 +19,8 @@
     "date": "2026-05-28T14:40:48.357Z",
     "sunset_at": "2026-06-01"
   },
-  "version": "0.63.0",
-  "installedAt": "2026-11-09T14:39:47.527Z",
+  "version": "0.63.1",
+  "installedAt": "2026-11-09T14:56:18.585Z",
   "upstreamPackage": "create-claude-cabinet",
   "modules": {
     "session-loop": true,
@@ -314,7 +314,7 @@
     ".claude/engagement/secure-input.mjs": "48ebb9153f785ede",
     ".claude/engagement/sql-constants.mjs": "cf0246a3aa829561",
     "scripts/watchtower-validate.mjs": "a43bb8bf1f021756",
-    "scripts/watchtower-lib.mjs": "2c2b3a0b1d178cfb",
+    "scripts/watchtower-lib.mjs": "6d347142b9641f47",
     "scripts/watchtower-queue.mjs": "092c89184b7a7345",
     "scripts/watchtower-commitments.mjs": "9f7889c7fed7d9c7",
     "scripts/watchtower-routines.mjs": "6c27d7794c079558",

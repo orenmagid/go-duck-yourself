@@ -1905,8 +1905,8 @@ export function resolveProjectIdentity(cwdOrPath, config, opts = {}) {
 // ~/.claude/projects/<slug>, which encodes the session cwd with '/' and '.'
 // both collapsed to '-'):
 //
-//   /Users/o/.mux/worktrees/northwind-accounts
-//     → -Users-o--mux-worktrees-northwind-accounts
+//   /home/o/.mux/worktrees/northwind-accounts
+//     → -home-o--mux-worktrees-northwind-accounts
 //
 // Everything after the '--mux-worktrees-' marker is the worktree basename,
 // which mux names `<mux-project-name>-<task>` — and the mux project name is
