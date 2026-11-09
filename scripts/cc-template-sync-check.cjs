@@ -97,10 +97,10 @@ const located = locatePackageRoot(projectRoot);
 if (typeof located !== 'string') blind(located.error);
 const packageRoot = located;
 
-let MODULES, classifyFileOwnership, templateDestPath, manifestPath, skipsPhases, instructionPhasesFor, expandFrozenClosure, packageVersion;
+let MODULES, classifyFileOwnership, globalRuleCovers, templateDestPath, manifestPath, skipsPhases, instructionPhasesFor, expandFrozenClosure, packageVersion;
 try {
   ({ MODULES } = require(path.join(packageRoot, 'lib', 'modules.js')));
-  ({ classifyFileOwnership } = require(path.join(packageRoot, 'lib', 'copy.js')));
+  ({ classifyFileOwnership, globalRuleCovers } = require(path.join(packageRoot, 'lib', 'copy.js')));
   ({ templateDestPath, manifestPath, skipsPhases, instructionPhasesFor, expandFrozenClosure } = require(path.join(packageRoot, 'lib', 'cli.js')));
   packageVersion = require(path.join(packageRoot, 'package.json')).version;
 } catch (e) {
@@ -136,6 +136,7 @@ const templateMissing = [];
 let inSync = 0;
 let projectOwned = 0;
 let frozen = 0;
+let globalCovered = 0;
 const seen = new Set();
 
 function walk(dir, relBase, visit, skipPhases) {
@@ -156,6 +157,18 @@ function classify({ key, srcPath, destPath, relPath, isPhaseFile, isInstructionP
   const incoming = fs.readFileSync(srcPath, 'utf8');
   const destExists = fs.existsSync(destPath);
   const existingContent = destExists ? fs.readFileSync(destPath, 'utf8') : null;
+  // A rule the global layer already delivers byte-for-byte is deliberately
+  // NOT planted in the project (act:8b2ff4d5) — same helper the installer
+  // uses, so it is never reported missing. Optional: an older package that
+  // predates the helper simply has no dedupe to mirror.
+  if (
+    typeof globalRuleCovers === 'function' &&
+    (!destExists || existingContent === incoming) &&
+    globalRuleCovers({ tmpl: relPath, incoming, projectDir: projectRoot })
+  ) {
+    globalCovered++;
+    return;
+  }
   const decision = classifyFileOwnership({
     relPath,
     destExists,
@@ -220,9 +233,9 @@ stale.sort();
 const red = missing.length > 0 || stale.length > 0;
 
 if (asJson) {
-  console.log(JSON.stringify({ missing, stale, inSync, projectOwned, frozen, overlaid, templateMissing, packageRoot, packageVersion, installedModules }, null, 2));
+  console.log(JSON.stringify({ missing, stale, inSync, projectOwned, frozen, globalCovered, overlaid, templateMissing, packageRoot, packageVersion, installedModules }, null, 2));
 } else {
-  const tally = `${inSync} in sync, ${projectOwned} project-owned, ${frozen} frozen` + (overlaid.length ? `, ${overlaid.length} compared against the engagement overlay` : '');
+  const tally = `${inSync} in sync, ${projectOwned} project-owned, ${frozen} frozen` + (globalCovered ? `, ${globalCovered} delivered by the global rules layer` : "") + (overlaid.length ? `, ${overlaid.length} compared against the engagement overlay` : '');
   if (!red) {
     console.log(`Template sync: all installed copies match their current templates (${tally}; package v${packageVersion} at ${packageRoot}).`);
   } else {
