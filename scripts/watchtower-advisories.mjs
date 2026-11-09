@@ -26,7 +26,7 @@
 import { readFileSync, readdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import { atomicWrite } from './watchtower-lib.mjs';
 
 const STATE_REL = join('.claude', 'cabinet', 'advisories-state.json');
@@ -237,9 +237,27 @@ function applyRule(prev, { signal, kind, installed }, today) {
 
 // --- main entry ---
 
+// The project ROOT for a session cwd (act:50528512). The context builder
+// passes the session's raw cwd, and a session opened in a subfolder wrote
+// <subfolder>/.claude/cabinet/advisories-state.json — a stray .claude/ that
+// a consumer's own pre-commit check refuses. Ask git for the toplevel (a
+// linked worktree resolves to the worktree's own root, which is where its
+// cwd-level state always lived); outside git, keep the path as given.
+export function projectRootOf(projectPath) {
+  try {
+    const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: projectPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000,
+    }).trim();
+    return top || projectPath;
+  } catch {
+    return projectPath;
+  }
+}
+
 export function runAdvisoryPass({ projectPath, pluginProbe = defaultPluginProbe, homeDir = homedir(), now = todayUTC() } = {}) {
   try {
     if (!projectPath) return [];
+    projectPath = projectRootOf(projectPath);
 
     const today = now;
     const statePath = join(projectPath, STATE_REL);
