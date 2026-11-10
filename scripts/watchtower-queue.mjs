@@ -5,7 +5,7 @@
 // Queue uses directory listing, not index files (no-index convention).
 
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, renameSync, unlinkSync, realpathSync, appendFileSync, statSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, isAbsolute } from 'path';
 import { randomBytes } from 'crypto';
 import { pathToFileURL } from 'url';
 import { execFileSync } from 'child_process';
@@ -396,6 +396,15 @@ export function verifyMergedAncestry(projectPath, mergedCommit) {
   if (typeof projectPath !== 'string' || !projectPath || !existsSync(projectPath)) {
     return { state: 'unverifiable', reason: 'project_path missing or not on disk' };
   }
+  // A RELATIVE project_path is resolved by existsSync and `git -C` against the
+  // CALLER's cwd — the watchtower runtime dir, a cron cwd, some other repo —
+  // so git answers for the wrong repository: "unverifiable" for a real merge,
+  // or worse, a confident verdict about an unrelated repo (act:87fe8fe4).
+  // The item's project_path is the only repository the claim is about; a
+  // relative one cannot name it, so it is can't-determine, never guessed.
+  if (!isAbsolute(projectPath)) {
+    return { state: 'unverifiable', reason: `project_path ${JSON.stringify(projectPath)} is not absolute — it would be resolved against the caller's cwd, not the project` };
+  }
   // resolveAncestryRef never throws (every git call inside it is caught
   // per-candidate) — a git-absent ENOENT surfaces here as a null ref, so
   // this one reason covers both no-ref and no-git.
@@ -439,6 +448,12 @@ export function verifyCommitExists(projectPath, sha) {
   }
   if (typeof projectPath !== 'string' || !projectPath || !existsSync(projectPath)) {
     return { state: 'unverifiable', reason: 'project_path missing or not on disk' };
+  }
+  // Same relative-path hazard as verifyMergedAncestry (act:87fe8fe4): a
+  // relative path would ask the caller's cwd repo, and a "no such object"
+  // there would REJECT a real verdict.
+  if (!isAbsolute(projectPath)) {
+    return { state: 'unverifiable', reason: `project_path ${JSON.stringify(projectPath)} is not absolute` };
   }
   try {
     const full = runGit(projectPath, ['rev-parse', '--verify', '--quiet', `${sha.trim()}^{commit}`]).trim();
@@ -1165,6 +1180,18 @@ export function buildFoldClusters(pairs, {
  * @returns {{item: object, changed: boolean}|null}
  */
 export function annotateItemEvidence(id, patch) {
+  // A patch that cannot land must fail LOUD, never vanish (act:558c895c):
+  // a string or array patch would be spread into evidence as index keys, and
+  // an `undefined` value is dropped by JSON serialization on the write — both
+  // returned success while the caller's text went nowhere. Checked before the
+  // item read so a bad call fails whatever the item's state.
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+    throw new Error(`annotateItemEvidence: patch must be a plain object of evidence fields (got ${Array.isArray(patch) ? 'array' : patch === null ? 'null' : typeof patch}) — e.g. annotateItemEvidence(id, { notes_for_qa: "..." })`);
+  }
+  const dropped = Object.keys(patch).filter((k) => patch[k] === undefined);
+  if (dropped.length) {
+    throw new Error(`annotateItemEvidence: evidence field(s) ${dropped.map((k) => JSON.stringify(k)).join(', ')} are undefined and would be silently dropped on write — pass a value (null clears explicitly)`);
+  }
   const fp = itemPath(id);
   if (!existsSync(fp)) return null;
   const item = readItem(fp);
@@ -2010,7 +2037,33 @@ function writeToHome(home, { project, project_path, category, title, summary, ev
  * @param {object} params
  * @returns {string|{redirected: true, to: string, path: string}} The generated item id, or the redirect record
  */
-export function createItem({
+export function createItem(params) {
+  // An unrecognized top-level field is REFUSED, naming it and the accepted
+  // set (act:558c895c). The destructuring below silently ignored any key it
+  // did not list, so a handoff whose narrative rode under an unaccepted name
+  // (`narrative`, `body`, `notes`) filed "successfully" without its prose.
+  // Free-form detail belongs INSIDE `evidence` (any key is kept there); the
+  // top level is the item envelope. Same posture as the resolve CLI's
+  // unknown-key refusal.
+  if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+    throw new Error('createItem: expects one object of item fields');
+  }
+  const unknown = Object.keys(params).filter((k) => !CREATE_ITEM_FIELDS.includes(k));
+  if (unknown.length) {
+    throw new Error(`createItem: unrecognized field(s) ${unknown.map((k) => JSON.stringify(k)).join(', ')} would be silently dropped — accepted top-level fields: ${CREATE_ITEM_FIELDS.join(', ')}. Put free-form detail (a narrative, notes for QA) inside \`evidence\`, where any key is kept.`);
+  }
+  return createItemChecked(params);
+}
+
+/** The accepted top-level createItem fields — the item envelope. Exported so
+ *  skills and tests name the same list (act:558c895c). */
+export const CREATE_ITEM_FIELDS = Object.freeze([
+  'project', 'project_path', 'category', 'urgency', 'title', 'summary',
+  'context_anchor', 'evidence', 'options', 'draft_artifact', 'transcript_ref',
+  'filed_by', 'plan_fid', 'thread_ids', 'confidence', 'project_unresolved', 'desk',
+]);
+
+function createItemChecked({
   project,
   project_path,
   category,

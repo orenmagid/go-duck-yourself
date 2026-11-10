@@ -161,6 +161,27 @@ export function parseSurfaceArea(text) {
   return { found: true, entries };
 }
 
+/**
+ * Files that many unrelated commits touch — the directory indexes and the
+ * CLAUDE.md docs. Listed in a Surface Area without `(shared)`, every edit
+ * to them by unrelated work stales the refute pass (measured: a research
+ * write-up touching .claude/plans/README.md cost a phase two extra delta
+ * reviews). The checker WARNS on these, never fails: a phase that really
+ * owns one of them may leave it unmarked on purpose.
+ */
+export const WELL_KNOWN_SHARED = [
+  '.claude/plans/README.md',
+  '.claude/methodology/README.md',
+  'CLAUDE.md',
+  'lib/CLAUDE.md',
+  'templates/CLAUDE.md',
+];
+
+/** unmarkedSharedEntries(entries) → paths of well-known shared files listed without `(shared)`. */
+export function unmarkedSharedEntries(entries) {
+  return entries.filter((e) => !e.shared && WELL_KNOWN_SHARED.includes(e.path)).map((e) => e.path);
+}
+
 function parseRange(range, phase, mode) {
   if (range === 'none') return [];
   const m = range.match(RE_RANGE_PARTS);
@@ -377,6 +398,9 @@ export function run(argv, cwd = process.cwd()) {
     if (!sa.entries.length) fail('the plan\'s ## Surface Area lists no files:/dirs: entries');
     result.shared = sa.entries.filter((e) => e.shared).map((e) => e.path);
     result.notChecked = sa.entries.filter((e) => !e.trackable).map((e) => e.path);
+    for (const p of unmarkedSharedEntries(sa.entries)) {
+      result.notes.push(`warning: ${p} is listed without (shared) — unrelated commits to it will stale this pass; mark it "- files: ${p} (shared)" unless this phase really owns it`);
+    }
     const surface = sa.entries.filter((e) => e.path !== plan);
     const specs = toPathspecs(surface);
 

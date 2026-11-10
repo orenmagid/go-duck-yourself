@@ -141,6 +141,126 @@ function parseFlags(args) {
 }
 
 /**
+ * The flags each verb accepts — the ONE allowlist (act:7497dd9b).
+ *
+ * parseFlags accepts any `--key value`, and each verb spreads the result into
+ * a library call that destructures only the names it knows. Without this
+ * table a misspelled flag vanished silently: `create-action … --project prj:X`
+ * printed "Created action" and filed the action UNFILED (the real spelling is
+ * --projectFid), invisible to every container view. A verb listed here
+ * REFUSES any other flag by name before the database is opened, so nothing is
+ * written. Every flag in the usage text must appear in its verb's list —
+ * test/pib-db-cli-flags/ parses the usage block and fails on a gap, so a new
+ * flag cannot ship without its entry. Names beyond the usage text (text,
+ * flagged, parentFid, client_*) are spellings the spread has always accepted;
+ * they stay so existing callers keep working. The engagement overlay carries
+ * this table byte-identical, plus its own event verbs.
+ */
+const KNOWN_FLAGS = {
+  'create-action': ['projectFid', 'due', 'notes', 'needs', 'text'],
+  'get-action': [],
+  'list-actions': ['status', 'project', 'scope', 'unfiled'],
+  'update-action': ['status', 'text', 'tags', 'notes', 'due', 'flagged', 'projectFid', 'needs', 'client_title', 'client_body', 'client_generated_at', 'client_generated_status'],
+  'complete-action': [],
+  'write-breadcrumb': ['summary'],
+  'defer-with-trigger': ['trigger', 'cascade'],
+  'list-triggered': ['include-done', 'include-released'],
+  'mark-trigger-checked': ['result', 'notes'],
+  'create-project': ['kind', 'notes', 'tags', 'parent', 'due', 'parentFid'],
+  'update-project': ['kind', 'tags', 'name', 'status', 'notes', 'due', 'parent', 'parentFid', 'client_title', 'client_body', 'client_generated_at', 'client_generated_status'],
+  'complete-project': ['map-file', 'map'],
+  'add-dependency': [],
+  'remove-dependency': [],
+  'list-dependencies': [],
+  'next-actions': ['project', 'limit', 'scope'],
+  'list-blocked': ['project', 'scope'],
+  // Engagement overlay verbs (not in the base CLI).
+  'add-event': ['engagement', 'target', 'packet-id', 'kind', 'author', 'verdict', 'body', 'allowed-authors'],
+  'list-events': ['engagement', 'target', 'unaddressed-only', 'exclude-soft-deleted'],
+  'mark-event-addressed': [],
+};
+
+function editDistance(a, b) {
+  const row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cur = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+  }
+  return row[b.length];
+}
+
+/**
+ * The known flag an unknown one most likely meant, or null. Flag names are
+ * single identifiers, so title-token matching does not fit them; a shared
+ * prefix of 4+ characters (`project` → projectFid, `projet` → projectFid) or
+ * an edit distance of 2 or less (`sumary` → summary) counts as a match, the
+ * closest edit distance winning.
+ */
+function nearestFlag(name, known) {
+  const n = name.toLowerCase();
+  let best = null;
+  for (const k of known) {
+    const kl = k.toLowerCase();
+    let prefix = 0;
+    while (prefix < n.length && prefix < kl.length && n[prefix] === kl[prefix]) prefix++;
+    const dist = editDistance(n, kl);
+    if (prefix < 4 && dist > 2) continue;
+    if (!best || dist < best.dist) best = { k, dist };
+  }
+  return best ? best.k : null;
+}
+
+/**
+ * A due date must be a real calendar day in YYYY-MM-DD form. The column has
+ * no CHECK at all, so `--due 2026-13-45` used to be stored as typed. An empty
+ * value stays legal: it means "no due date" on create and clears it on update.
+ */
+function dueError(value) {
+  if (value === undefined || value === '') return null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return `--due must be a date written YYYY-MM-DD (got ${value === true ? 'no value' : `\`${value}\``})`;
+  }
+  const d = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== value) {
+    return `--due ${value} is not a real calendar date`;
+  }
+  return null;
+}
+
+/**
+ * parseFlags, then refuse — before any database is opened — a flag this verb
+ * does not know, or a malformed --due. Exits 1; nothing is written.
+ */
+function parseVerbFlags(args) {
+  const parsed = parseFlags(args);
+  const known = KNOWN_FLAGS[command];
+  if (known) {
+    const unknown = Object.keys(parsed.flags).filter((k) => !known.includes(k));
+    if (unknown.length) {
+      for (const k of unknown) {
+        const guess = nearestFlag(k, known);
+        console.error(`Unknown flag --${k} for ${command}${guess ? ` (did you mean --${guess}?)` : ''}. Nothing was written.`);
+      }
+      console.error(known.length
+        ? `  ${command} accepts: ${known.map((k) => `--${k}`).join(' ')}`
+        : `  ${command} takes no flags.`);
+      process.exit(1);
+    }
+  }
+  const dueMsg = dueError(parsed.flags.due);
+  if (dueMsg) {
+    console.error(`${command}: ${dueMsg}. Nothing was written.`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
+/**
  * Read a BARE BOOLEAN switch straight from argv, before parseFlags sees it.
  *
  * parseFlags assigns the NEXT TOKEN as any flag's value (it has to — an empty
@@ -230,7 +350,7 @@ switch (command) {
     printResult(lib.query(getDb(), { sql: args.join(' ') }));
     break;
   case 'create-action': {
-    const { flags, positional } = parseFlags(args);
+    const { flags, positional } = parseVerbFlags(args);
     const result = lib.createAction(getDb(), { text: positional[0], ...flags });
     printResult(result);
     break;
@@ -241,7 +361,7 @@ switch (command) {
     // default-flags open of a missing file CREATES it (measured: a wrong
     // PIB_DB_PATH materialised pib.db + -wal + -shm before failing). A lookup
     // must be able to say "not there" without changing anything.
-    const { positional } = parseFlags(args);
+    const { positional } = parseVerbFlags(args);
     const fid = positional[0];
     if (!fid) {
       console.error('get-action: a fid is required (e.g. get-action act:df8e90e7)');
@@ -267,23 +387,25 @@ switch (command) {
       console.error(`list-actions: ${unfiled.error}`);
       process.exit(1);
     }
-    const { flags } = parseFlags(withoutBareSwitch(args, 'unfiled'));
+    const { flags } = parseVerbFlags(withoutBareSwitch(args, 'unfiled'));
     printResult(lib.listActions(getDb(), { ...flags, ...(unfiled.value ? { unfiled: true } : {}) }));
     break;
   }
   case 'update-action': {
-    const { flags, positional } = parseFlags(args);
+    const { flags, positional } = parseVerbFlags(args);
     printResult(lib.updateAction(getDb(), { fid: positional[0], ...flags }));
     break;
   }
-  case 'complete-action':
-    printResult(lib.completeAction(getDb(), { fid: args[0] }));
+  case 'complete-action': {
+    const { positional } = parseVerbFlags(args);
+    printResult(lib.completeAction(getDb(), { fid: positional[0] }));
     break;
+  }
   case 'write-breadcrumb': {
     // The path is COMPUTED from the fid and resolved to the MAIN checkout —
     // the spelling the completion gate reads (act:c17510a8). The caller types
     // the fid and the summary, never the filename.
-    const { flags, positional } = parseFlags(args);
+    const { flags, positional } = parseVerbFlags(args);
     printResult(lib.writeBreadcrumb(getDb(), {
       fid: positional[0],
       summary: typeof flags.summary === 'string' ? flags.summary : undefined,
@@ -292,7 +414,7 @@ switch (command) {
     break;
   }
   case 'defer-with-trigger': {
-    const { flags, positional } = parseFlags(args);
+    const { flags, positional } = parseVerbFlags(args);
     printResult(lib.deferWithTrigger(getDb(), {
       fid: positional[0],
       triggerCondition: flags.trigger,
@@ -301,12 +423,12 @@ switch (command) {
     break;
   }
   case 'list-triggered': {
-    const { flags } = parseFlags(args);
+    const { flags } = parseVerbFlags(args);
     printResult(lib.listTriggered(getDb(), { includeDone: flags['include-done'] === true, includeReleased: flags['include-released'] === true }));
     break;
   }
   case 'mark-trigger-checked': {
-    const { flags, positional } = parseFlags(args);
+    const { flags, positional } = parseVerbFlags(args);
     printResult(lib.markTriggerChecked(getDb(), {
       fid: positional[0],
       result: flags.result,
@@ -315,7 +437,7 @@ switch (command) {
     break;
   }
   case 'add-event': {
-    const { flags } = parseFlags(args);
+    const { flags } = parseVerbFlags(args);
     // allowedAuthors comes from the caller (the engagement-sync skill reads
     // engagement.yaml and passes the recipient ids + 'consultant' here). The
     // CLI itself stays config-agnostic. Absent flag → undefined → fail-closed.
@@ -334,7 +456,7 @@ switch (command) {
     break;
   }
   case 'list-events': {
-    const { flags } = parseFlags(args);
+    const { flags } = parseVerbFlags(args);
     printResult(lib.listEngagementEvents(getDb(), {
       engagement: typeof flags.engagement === 'string' ? flags.engagement : undefined,
       target_fid: typeof flags.target === 'string' ? flags.target : undefined,
@@ -344,12 +466,12 @@ switch (command) {
     break;
   }
   case 'mark-event-addressed': {
-    const { positional } = parseFlags(args);
+    const { positional } = parseVerbFlags(args);
     printResult(lib.markEventAddressed(getDb(), { id: positional[0] }));
     break;
   }
   case 'create-project': {
-    const { flags, positional } = parseFlags(args);
+    const { flags, positional } = parseVerbFlags(args);
     // --parent is the operator-facing spelling of parentFid (the AREA this
     // project serves). Spread alone would only accept --parentFid.
     const parentFid = typeof flags.parent === 'string' ? flags.parent : undefined;
@@ -358,7 +480,7 @@ switch (command) {
   }
   case 'update-project': {
     const fid = args[0];
-    const { flags } = parseFlags(args.slice(1));
+    const { flags } = parseVerbFlags(args.slice(1));
     // --parent <area-fid> names the area; --parent "" CLEARS it. The empty
     // string must stay distinguishable from "not mentioned", because clearing
     // the parent is exactly what demoting a nested project back to an area
@@ -371,7 +493,7 @@ switch (command) {
     // The walk (plan §16). A disposition map for a large project cannot ride
     // argv, so it arrives as a JSON file (--map-file) or an inline JSON
     // string (--map). No flag = sheet mode, which mutates nothing.
-    const { flags, positional } = parseFlags(args);
+    const { flags, positional } = parseVerbFlags(args);
     let map;
     if (typeof flags['map-file'] === 'string') {
       let raw;
@@ -405,22 +527,22 @@ switch (command) {
     printResult(lib.listProjects(getDb()));
     break;
   case 'add-dependency': {
-    const { positional } = parseFlags(args);
+    const { positional } = parseVerbFlags(args);
     printResult(lib.addDependency(getDb(), { blockerFid: positional[0], blockedFid: positional[1] }));
     break;
   }
   case 'remove-dependency': {
-    const { positional } = parseFlags(args);
+    const { positional } = parseVerbFlags(args);
     printResult(lib.removeDependency(getDb(), { blockerFid: positional[0], blockedFid: positional[1] }));
     break;
   }
   case 'list-dependencies': {
-    const { positional } = parseFlags(args);
+    const { positional } = parseVerbFlags(args);
     printFull(lib.listDependencies(getDb(), { fid: positional[0] }));
     break;
   }
   case 'next-actions': {
-    const { flags } = parseFlags(args);
+    const { flags } = parseVerbFlags(args);
     printFull(lib.listStartable(getDb(), {
       project: typeof flags.project === 'string' ? flags.project : undefined,
       limit: flags.limit !== undefined ? parseInt(flags.limit, 10) : undefined,
@@ -429,7 +551,7 @@ switch (command) {
     break;
   }
   case 'list-blocked': {
-    const { flags } = parseFlags(args);
+    const { flags } = parseVerbFlags(args);
     printFull(lib.listBlocked(getDb(), {
       project: typeof flags.project === 'string' ? flags.project : undefined,
       scope: typeof flags.scope === 'string' ? flags.scope : undefined,
